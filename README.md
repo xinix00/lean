@@ -15,6 +15,7 @@ that one.
 | | |
 |---|---|
 | [`leanhttp`](leanhttp/) | HTTP/1.1 without TLS — small client and server, chunked reading and writing |
+| [`leandhcp`](leandhcp/) | DHCPv4 (RFC 2131) on raw ethernet frames — a lease before any netstack exists |
 
 ## The rule
 
@@ -34,11 +35,17 @@ A package belongs here when all three hold:
 What does not belong here: anything that only becomes useful once you take
 three more along with it.
 
-## Where leanhttp came from
+## Where these came from
 
 `leanhttp` comes from HopOS (`metal/app/applib/apphttp`), written there because
 an app image should not carry 2.9 MB of TLS for traffic that is plain http. The
 measurements in the package doc are from that work and have not been redone;
 they carry their date, so it is clear what was tested and when.
+
+`leandhcp` comes from HopOS too (`metal/net/dhcp`), written there because a
+freshly booted node needs a lease before it has a network stack to get one
+with. It speaks raw ethernet frames through a two-method NIC contract, so any
+driver fits. The DISCOVER/OFFER half was proven on hardware (Pi 5, 2026-07-10:
+an OFFER from a FRITZ!Box through our own PCIe→RP1→GEM chain).
 
 The package documentation is in Dutch, as it was written.
