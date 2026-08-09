@@ -165,15 +165,15 @@ func Get(raw string) (*Response, error) {
 	switch {
 	case resp.StatusCode != StatusOK:
 		resp.Body.Close()
-		return nil, fmt.Errorf("apphttp: HTTP %s", resp.Status)
+		return nil, fmt.Errorf("leanhttp: HTTP %s", resp.Status)
 	case resp.chunked:
 		// Een image zónder lengte kon de apploader nooit stagen (hij weigerde
 		// ContentLength <= 0): luid falen i.p.v. half werk.
 		resp.Body.Close()
-		return nil, fmt.Errorf("apphttp: chunked/encoded transfer is not supported here — serve the artifact with a Content-Length")
+		return nil, fmt.Errorf("leanhttp: chunked/encoded transfer is not supported here — serve the artifact with a Content-Length")
 	case resp.Length < 0:
 		resp.Body.Close()
-		return nil, fmt.Errorf("apphttp: no Content-Length in response")
+		return nil, fmt.Errorf("leanhttp: no Content-Length in response")
 	}
 	return resp, nil
 }
@@ -203,31 +203,31 @@ func Do(c Call) (*Response, error) {
 		resp.Body.Close()
 		base, err := url.Parse(loc)
 		if err != nil {
-			return nil, fmt.Errorf("apphttp: bad URL %q: %w", loc, err)
+			return nil, fmt.Errorf("leanhttp: bad URL %q: %w", loc, err)
 		}
 		ref, err := url.Parse(next)
 		if err != nil {
-			return nil, fmt.Errorf("apphttp: bad Location %q: %w", next, err)
+			return nil, fmt.Errorf("leanhttp: bad Location %q: %w", next, err)
 		}
 		loc = base.ResolveReference(ref).String() // een relatieve Location mag
 	}
-	return nil, fmt.Errorf("apphttp: too many redirects (>%d) starting at %s", maxRedirects, c.URL)
+	return nil, fmt.Errorf("leanhttp: too many redirects (>%d) starting at %s", maxRedirects, c.URL)
 }
 
 // do doet één ronde: verbinden, verzoek schrijven, antwoordkop lezen.
 func do(c Call, raw string) (_ *Response, err error) {
 	u, err := url.Parse(raw)
 	if err != nil {
-		return nil, fmt.Errorf("apphttp: bad URL %q: %w", raw, err)
+		return nil, fmt.Errorf("leanhttp: bad URL %q: %w", raw, err)
 	}
 	// Luid, niet stil: dit pakket bestaat juist om TLS niet te linken, dus een
 	// https-URL is een configuratiefout die je op de console hoort te zien.
 	if u.Scheme != "http" {
-		return nil, fmt.Errorf("apphttp: only http:// is supported, got %q — "+
-			"this app links no TLS (use a plain-http URL on the LAN, or build the app with net/http)", u.Scheme)
+		return nil, fmt.Errorf("leanhttp: only http:// is supported, got %q — "+
+			"this package links no TLS (use a plain-http URL, or use net/http)", u.Scheme)
 	}
 	if u.Host == "" {
-		return nil, fmt.Errorf("apphttp: URL %q has no host", raw)
+		return nil, fmt.Errorf("leanhttp: URL %q has no host", raw)
 	}
 	addr := u.Host
 	if u.Port() == "" {
@@ -241,7 +241,7 @@ func do(c Call, raw string) (_ *Response, err error) {
 
 	conn, err := net.DialTimeout("tcp4", addr, dialTimeout)
 	if err != nil {
-		return nil, fmt.Errorf("apphttp: dial %s: %w", addr, err)
+		return nil, fmt.Errorf("leanhttp: dial %s: %w", addr, err)
 	}
 	// Elk faalpad hierna sluit de verbinding; het succespad geeft hem als Body
 	// aan de aanroeper mee.
@@ -259,11 +259,11 @@ func do(c Call, raw string) (_ *Response, err error) {
 	}
 
 	if _, err := conn.Write(req); err != nil {
-		return nil, fmt.Errorf("apphttp: write request: %w", err)
+		return nil, fmt.Errorf("leanhttp: write request: %w", err)
 	}
 	if len(c.Body) > 0 {
 		if _, err := conn.Write(c.Body); err != nil {
-			return nil, fmt.Errorf("apphttp: write body: %w", err)
+			return nil, fmt.Errorf("leanhttp: write body: %w", err)
 		}
 	}
 
@@ -272,7 +272,7 @@ func do(c Call, raw string) (_ *Response, err error) {
 
 	line, err := readLine(br, &budget)
 	if err != nil {
-		return nil, fmt.Errorf("apphttp: read status line: %w", err)
+		return nil, fmt.Errorf("leanhttp: read status line: %w", err)
 	}
 	code, err := statusCode(line)
 	if err != nil {
@@ -286,14 +286,14 @@ func do(c Call, raw string) (_ *Response, err error) {
 	for {
 		line, err := readLine(br, &budget)
 		if err != nil {
-			return nil, fmt.Errorf("apphttp: read headers: %w", err)
+			return nil, fmt.Errorf("leanhttp: read headers: %w", err)
 		}
 		if line == "" {
 			break // lege regel: einde headers
 		}
 		k, v, found := strings.Cut(line, ":")
 		if !found {
-			return nil, fmt.Errorf("apphttp: malformed header %q", line)
+			return nil, fmt.Errorf("leanhttp: malformed header %q", line)
 		}
 		v = strings.TrimSpace(v)
 		switch {
@@ -301,10 +301,10 @@ func do(c Call, raw string) (_ *Response, err error) {
 			// Een tweede, andere lengte is een smokkel-signaal, geen
 			// laatste-wint-geval: falen.
 			if length >= 0 {
-				return nil, fmt.Errorf("apphttp: duplicate Content-Length")
+				return nil, fmt.Errorf("leanhttp: duplicate Content-Length")
 			}
 			if length, err = strconv.ParseInt(v, 10, 64); err != nil || length < 0 {
-				return nil, fmt.Errorf("apphttp: bad Content-Length %q", v)
+				return nil, fmt.Errorf("leanhttp: bad Content-Length %q", v)
 			}
 		case strings.EqualFold(k, "Transfer-Encoding"):
 			chunked = !strings.EqualFold(v, "identity")
@@ -353,14 +353,14 @@ func requestBytes(c Call, u *url.URL) ([]byte, error) {
 	for k, v := range c.Header {
 		switch {
 		case strings.ContainsAny(k, "\r\n: ") || k == "":
-			return nil, fmt.Errorf("apphttp: illegal header name %q", k)
+			return nil, fmt.Errorf("leanhttp: illegal header name %q", k)
 		case strings.ContainsAny(v, "\r\n"):
-			return nil, fmt.Errorf("apphttp: illegal value for header %q", k)
+			return nil, fmt.Errorf("leanhttp: illegal value for header %q", k)
 		// De vier hierboven zijn van ons; stil laten overschrijven zou het
 		// verzoek onbegrijpelijk maken.
 		case strings.EqualFold(k, "Host"), strings.EqualFold(k, "Content-Length"),
 			strings.EqualFold(k, "Connection"), strings.EqualFold(k, "Transfer-Encoding"):
-			return nil, fmt.Errorf("apphttp: header %q is set by the package, not by the caller", k)
+			return nil, fmt.Errorf("leanhttp: header %q is set by the package, not by the caller", k)
 		}
 		fmt.Fprintf(&b, "%s: %s\r\n", k, v)
 	}
@@ -391,12 +391,12 @@ func readLine(br *bufio.Reader, budget *int) (string, error) {
 func statusCode(line string) (int, error) {
 	proto, rest, found := strings.Cut(line, " ")
 	if !found || !strings.HasPrefix(proto, "HTTP/") {
-		return 0, fmt.Errorf("apphttp: malformed status line %q", line)
+		return 0, fmt.Errorf("leanhttp: malformed status line %q", line)
 	}
 	num, _, _ := strings.Cut(rest, " ")
 	code, err := strconv.Atoi(num)
 	if err != nil || code < 100 || code > 599 {
-		return 0, fmt.Errorf("apphttp: malformed status line %q", line)
+		return 0, fmt.Errorf("leanhttp: malformed status line %q", line)
 	}
 	return code, nil
 }
@@ -448,7 +448,7 @@ func (c *chunkReader) Read(p []byte) (int, error) {
 			return n, err
 		}
 		if crlf != "" {
-			return n, fmt.Errorf("apphttp: chunk not terminated by CRLF")
+			return n, fmt.Errorf("leanhttp: chunk not terminated by CRLF")
 		}
 	}
 	return n, err
@@ -473,7 +473,7 @@ func (c *chunkReader) next() error {
 	size, _, _ := strings.Cut(line, ";")
 	n, err := strconv.ParseInt(strings.TrimSpace(size), 16, 64)
 	if err != nil || n < 0 {
-		return fmt.Errorf("apphttp: malformed chunk size %q", line)
+		return fmt.Errorf("leanhttp: malformed chunk size %q", line)
 	}
 	if n == 0 {
 		c.done = true
