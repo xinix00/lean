@@ -16,6 +16,7 @@ that one.
 |---|---|
 | [`leanhttp`](leanhttp/) | HTTP/1.1 without TLS — small client and server, chunked reading and writing |
 | [`leandhcp`](leandhcp/) | DHCPv4 (RFC 2131) on raw ethernet frames — a lease before any netstack exists |
+| [`leannet`](leannet/) | TCP/IP for bare-metal Go — ethernet, ARP, IPv4, ICMP echo, UDP, TCP, and `net.Conn`/`Listener`/`PacketConn` on top. One memory knob, buffers that grow with use instead of with configuration |
 
 ## The rule
 
