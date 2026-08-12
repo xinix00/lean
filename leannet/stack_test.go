@@ -616,29 +616,45 @@ func TestStackListenerBacklogOverflow(t *testing.T) {
 // TestStackBudgetRecovery: een pot van precies één verbinding weigert de
 // tweede en accepteert weer zodra de eerste zijn geheugen teruggaf — de
 // kringloop die het OOM-probleem verving.
+//
+// De server houdt zijn verbinding vast tot de test hem vrijgeeft. Dat is geen
+// omslachtigheid maar de fix van een flaky variant: sloot hij meteen na
+// Accept, dan hing "is het slot nog bezet?" aan de vraag of TIME-WAIT (~1s) al
+// verstreken was voordat de tweede dial startte — en onder de race-detector is
+// alles langzamer, dus viel de test daar soms door.
 func TestStackBudgetRecovery(t *testing.T) {
 	a, b := newStackPair(t, 1<<20, tcpFloorRing) // b: exact één verbinding
 	l, err := b.Listen(89)
 	if err != nil {
 		t.Fatal(err)
 	}
+	accepted := make(chan net.Conn, 4)
+	release := make(chan struct{})
 	go func() {
 		for {
 			c, err := l.Accept()
 			if err != nil {
 				return
 			}
-			c.Close() // meteen netjes dicht: b wordt de actieve sluiter
+			accepted <- c
+			<-release // vasthouden tot de test het slot wil terug
+			c.Close()
 		}
 	}()
 	c1, err := a.DialTCP([4]byte{10, 0, 0, 2}, 89, time.Now().Add(3*time.Second))
 	if err != nil {
 		t.Fatal(err)
 	}
-	// De pot is vol: de tweede dial krijgt een luide RST.
+	select {
+	case <-accepted:
+	case <-time.After(3 * time.Second):
+		t.Fatal("server never accepted the first connection")
+	}
+	// De pot is nu aantoonbaar vol: de tweede dial krijgt een luide RST.
 	if _, err := a.DialTCP([4]byte{10, 0, 0, 2}, 89, time.Now().Add(2*time.Second)); err == nil {
 		t.Fatal("second dial succeeded against a full pot")
 	}
+	close(release)
 	c1.Close()
 	// b's kant loopt door TIME-WAIT (~1s) en dan is de floor terug.
 	deadline := time.Now().Add(5 * time.Second)
@@ -955,5 +971,180 @@ func TestStackFastReaderKeepsFullWindow(t *testing.T) {
 			t.Fatalf("server receive window is %d bytes; a 10-segment initial burst (%d) does not fit, so bulk RX degrades to stop-and-wait",
 				w, 10*1460)
 		}
+	}
+}
+
+// TestStackSelfDial: een wereld moet bij zichzelf kunnen. Zonder de
+// loopback-naad vroeg een dial naar het eigen IP op de draad "who has
+// <mijzelf>" — een vraag die geen switch beantwoordt (broadcast gaat naar
+// iedereen BEHALVE de bron), dus kwam er na vijf pogingen "no route to host".
+// GEMETEN 12-08 op ijzer: na een rolling update stond cloudflared op het
+// slot-IP dat zijn eigen config als origin noemde, en die fout wees vijf lagen
+// weg van de oorzaak. Zelfde klasse als de watchdog-canary die zijn eigen
+// agent-poort niet kon bereiken.
+func TestStackSelfDial(t *testing.T) {
+	a, _ := newStackPair(t, 1<<20, 1<<20)
+	self := [4]byte{10, 0, 0, 1} // a's eigen adres
+
+	l, err := a.Listen(7000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := make(chan error, 1)
+	go func() {
+		c, err := l.Accept()
+		if err != nil {
+			srv <- err
+			return
+		}
+		_, err = io.Copy(c, c) // echo tot de peer sluit
+		c.Close()
+		srv <- err
+	}()
+
+	c, err := a.DialTCP(self, 7000, time.Now().Add(3*time.Second))
+	if err != nil {
+		t.Fatalf("self-dial failed: %v", err)
+	}
+	if la, ra := c.LocalAddr().String(), c.RemoteAddr().String(); la == ra {
+		t.Fatalf("self-dial reused the same port on both ends: %s", la)
+	}
+	msg := []byte("talking to myself")
+	c.SetDeadline(time.Now().Add(3 * time.Second))
+	if _, err := c.Write(msg); err != nil {
+		t.Fatal(err)
+	}
+	got := make([]byte, len(msg))
+	if _, err := io.ReadFull(c, got); err != nil {
+		t.Fatalf("read back: %v", err)
+	}
+	if !bytes.Equal(got, msg) {
+		t.Fatalf("echo over loopback = %q", got)
+	}
+	c.Close()
+	if err := <-srv; err != nil {
+		t.Fatalf("server side: %v", err)
+	}
+
+	// En geen enkel zelf-frame mag de draad op zijn gegaan.
+	da := a.dev.(*memDevice)
+	da.mu.Lock()
+	queries := da.arpQueries
+	da.mu.Unlock()
+	if queries != 0 {
+		t.Errorf("self-dial produced %d ARP queries on the wire; nobody answers 'who has myself'", queries)
+	}
+}
+
+// TestStackSelfDialRefused: is er niets dat luistert op de eigen poort, dan
+// hoort dat "refused" te zijn — niet vijf seconden stilte en dan een
+// route-fout die de operator naar de switch stuurt. Dat was letterlijk de
+// verkeerde diagnose-richting op 12-08.
+func TestStackSelfDialRefused(t *testing.T) {
+	a, _ := newStackPair(t, 1<<20, 1<<20)
+	start := time.Now()
+	_, err := a.DialTCP([4]byte{10, 0, 0, 1}, 7001, time.Now().Add(3*time.Second))
+	if err == nil {
+		t.Fatal("dial to an unbound own port succeeded")
+	}
+	if err == errUnreachable {
+		t.Fatalf("self-dial reported %v; that points the operator at ARP and the switch", err)
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Errorf("refusal took %v — should be immediate, not an ARP timeout", elapsed)
+	}
+}
+
+// TestStackSelfDialUDP: zelfde naad voor datagrammen (de SNTP/DNS-vorm).
+func TestStackSelfDialUDP(t *testing.T) {
+	a, _ := newStackPair(t, 1<<20, 1<<20)
+	srv, err := a.ListenUDP(7002)
+	if err != nil {
+		t.Fatal(err)
+	}
+	go func() {
+		buf := make([]byte, 256)
+		n, addr, err := srv.ReadFrom(buf)
+		if err == nil {
+			srv.WriteTo(append([]byte("echo:"), buf[:n]...), addr)
+		}
+	}()
+	cl, err := a.DialUDP([4]byte{10, 0, 0, 1}, 7002)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cl.SetDeadline(time.Now().Add(3 * time.Second))
+	if _, err := cl.Write([]byte("ping")); err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, 256)
+	n, err := cl.Read(buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(buf[:n]) != "echo:ping" {
+		t.Fatalf("udp loopback = %q", buf[:n])
+	}
+}
+
+// TestStackClosedPortRefusesFast: het algemene geval van de refused-fix — een
+// dial naar een dichte poort op een ANDERE node hoort ook meteen "nee" te
+// krijgen (RFC 9293 §3.10.7.1), niet de deadline uit te zitten.
+func TestStackClosedPortRefusesFast(t *testing.T) {
+	a, b := newStackPair(t, 1<<20, 1<<20)
+	if _, err := b.Listen(6000); err != nil { // een ándere poort dan we dialen
+		t.Fatal(err)
+	}
+	start := time.Now()
+	_, err := a.DialTCP([4]byte{10, 0, 0, 2}, 6001, time.Now().Add(3*time.Second))
+	if err == nil {
+		t.Fatal("dial to a closed port succeeded")
+	}
+	if elapsed := time.Since(start); elapsed > 1*time.Second {
+		t.Fatalf("closed port took %v to refuse — the peer sent no RST", elapsed)
+	}
+}
+
+// TestStackRSTStormResistance: een RST naar een onbekende verbinding mag
+// nooit een RST uitlokken (dat is een storm tussen twee nodes die elkaar
+// beide niet kennen).
+func TestStackRSTStormResistance(t *testing.T) {
+	da, db := &memDevice{}, &memDevice{}
+	da.peer, db.peer = db, da
+	s := NewStack(da, Config{
+		IP: [4]byte{10, 0, 0, 1}, Prefix: 24, MAC: [6]byte{2, 0, 0, 0, 0, 1},
+		Budget: 1 << 20,
+	}, 5)
+	t.Cleanup(s.Close)
+	s.arp.seed([4]byte{10, 0, 0, 9}, [6]byte{2, 0, 0, 0, 0, 9})
+
+	// Een kale RST voor een verbinding die hier niet bestaat.
+	frame := make([]byte, 60)
+	eth, _ := ParseEth(frame)
+	eth.SetDst(s.cfg.MAC)
+	eth.SetSrc([6]byte{2, 0, 0, 0, 0, 9})
+	eth.SetEtherType(EtherTypeIPv4)
+	n, _ := PutTCP(frame[EthernetHeaderSize+sizeIPv4:], 1234, 80, 500, 0, FlagRST, 0, nil,
+		[4]byte{10, 0, 0, 9}, [4]byte{10, 0, 0, 1}, 0)
+	PutIPv4(frame[EthernetHeaderSize:], ProtoTCP, [4]byte{10, 0, 0, 9}, [4]byte{10, 0, 0, 1}, n)
+	drainWire(db) // wire leegmaken
+	s.RecvInboundPacket(frame)
+
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		for _, fr := range drainWire(db) {
+			f, err := ParseEth(fr)
+			if err != nil || f.EtherType() != EtherTypeIPv4 {
+				continue
+			}
+			ip, err := ParseIPv4(f.Payload())
+			if err != nil || ip.Proto() != ProtoTCP {
+				continue
+			}
+			if tf, err := ParseTCP(ip.Payload()); err == nil && tf.Flags().Has(FlagRST) {
+				t.Fatal("answered a RST with a RST — that is a storm between two strangers")
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }

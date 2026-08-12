@@ -112,15 +112,65 @@ func TestRedirectLusStopt(t *testing.T) {
 	}
 }
 
-// De kern van het pakket: https moet luid weigeren, want er is geen TLS
-// gelinkt. Stil doorgaan zou een onbegrijpelijke verbindingsfout geven.
+// De kern van het pakket: https ZONDER dialer moet luid weigeren, want er is
+// geen TLS gelinkt. Stil doorgaan zou een onbegrijpelijke verbindingsfout
+// geven — en een fout die niet zegt wat te doen kost een zoektocht, dus de
+// melding noemt beide uitwegen.
 func TestHTTPSWeigertLuid(t *testing.T) {
 	_, err := Get("https://example.com/app.elf")
 	if err == nil {
 		t.Fatal("https werd geaccepteerd")
 	}
-	if !strings.Contains(err.Error(), "only http://") || !strings.Contains(err.Error(), "TLS") {
-		t.Fatalf("err = %v — de melding moet http-only én TLS noemen", err)
+	for _, want := range []string{"TLS", "Dial", "leanhttps"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("err = %v — de melding moet %q noemen", err, want)
+		}
+	}
+}
+
+// De dialer-naad is ALGEMEEN, niet TLS-specifiek: hier stuurt hij een
+// https-URL naar een gewone testserver. Daarmee is bewezen dat het mechanisme
+// werkt zonder dat deze test (of dit pakket) TLS aanraakt — precies waarom de
+// naad zo mag bestaan.
+func TestDialHookStuurtOm(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Host != "artifacts.example" {
+			t.Errorf("Host-header = %q, want de URL-host (niet het dial-adres)", r.Host)
+		}
+		w.Write([]byte("payload"))
+	}))
+	defer srv.Close()
+
+	var dialedTo string
+	resp, err := Do(Call{
+		URL: "https://artifacts.example/app.elf",
+		Dial: func(network, addr string) (net.Conn, error) {
+			dialedTo = addr // moet de hostnaam + 443 zijn, niet een IP
+			return net.Dial(network, strings.TrimPrefix(srv.URL, "http://"))
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if dialedTo != "artifacts.example:443" {
+		t.Errorf("Dial kreeg %q, want artifacts.example:443 (hostnaam voor SNI, https-poort)", dialedTo)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if string(body) != "payload" {
+		t.Errorf("body = %q", body)
+	}
+}
+
+// Een dialer die niets teruggeeft (en ook geen fout) mag geen nil-pointer
+// verderop worden.
+func TestDialHookNilConn(t *testing.T) {
+	_, err := Do(Call{
+		URL:  "https://x.example/y",
+		Dial: func(string, string) (net.Conn, error) { return nil, nil },
+	})
+	if err == nil {
+		t.Fatal("nil-verbinding zonder fout werd geaccepteerd")
 	}
 }
 

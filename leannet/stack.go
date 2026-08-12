@@ -47,6 +47,10 @@ const (
 	ephemeralEnd  = 65535
 )
 
+// loopbackMax begrenst de zelf-verkeer-wachtrij. Ruim voor een handshake plus
+// een venster aan segmenten; vol = droppen zoals elke ring dropt.
+const loopbackMax = 64
+
 // Buffer-floors per TCP-verbinding: waar de ringen beginnen vóór budgetgroei.
 // Ze zijn asymmetrisch, en dat is het enige getal in leannet dat niet uit
 // "groeien op druk" volgt maar uit hoe de tegenpartij begint.
@@ -118,6 +122,11 @@ type Stack struct {
 	// Verbindingsloze uitgaande wachtrijen; de pomp werkt ze af.
 	rstOut  []rstPending
 	icmpOut []icmpPending
+
+	// Loopback: frames aan ons eigen MAC (zie sendEthLocked). lbFree recyclet
+	// de buffers.
+	loopback [][]byte
+	lbFree   [][]byte
 
 	gwMAC    [6]byte // statisch geplande gateway (SeedNeighbor-equivalent)
 	hasGwMAC bool
@@ -237,26 +246,31 @@ func (s *Stack) RecvInboundPacket(frame []byte) error {
 	if s.closed {
 		return errStackClosed
 	}
-	now := s.now()
+	s.ingressLocked(eth, s.now())
+	return nil
+}
 
+// ingressLocked is de demux zelf, los van het slot zodat de pomp
+// loopback-frames langs hetzelfde pad kan voeren (zie sendEthLocked).
+func (s *Stack) ingressLocked(eth EthFrame, now int64) {
 	toUs := [6]byte(eth.Dst()) == s.cfg.MAC
 	switch eth.EtherType() {
 	case EtherTypeARP:
 		f, err := ParseARP(eth.Payload())
 		if err != nil {
 			s.CntDropBadFrame++
-			return nil
+			return
 		}
 		s.arp.recv(f, now)
 		s.notify() // een resolve kan nu klaar zijn; ook de pomp wil kijken (reply)
 	case EtherTypeIPv4:
 		if !toUs {
-			return nil // niet voor ons (broadcast-IP doen we niet aan)
+			return // niet voor ons (broadcast-IP doen we niet aan)
 		}
 		ip, err := ParseIPv4(eth.Payload())
 		if err != nil || !ip.ChecksumOK() || ip.Dst() != s.cfg.IP {
 			s.CntDropBadFrame++
-			return nil
+			return
 		}
 		// Passief buurleren, alleen van unicast aan óns (zie arp.learn).
 		if sameSubnet(ip.Src(), s.cfg.IP, s.cfg.Prefix) {
@@ -264,7 +278,6 @@ func (s *Stack) RecvInboundPacket(frame []byte) error {
 		}
 		s.recvIPv4(ip, now)
 	}
-	return nil
 }
 
 func (s *Stack) recvIPv4(ip IPv4Frame, now int64) {
@@ -321,10 +334,32 @@ func (s *Stack) recvTCP(f TCPFrame, src [4]byte, now int64) {
 		s.notify()
 		return
 	}
-	// Geen verbinding: een SYN voor een listener opent een embryo.
+	// Geen verbinding: een SYN voor een listener opent een embryo. Al het
+	// andere krijgt een RST (RFC 9293 §3.10.7.1) — behalve een RST zelf, want
+	// daarop antwoorden is een storm.
+	//
+	// Dat "behalve" was er eerst niet en daarmee ontbrak élke weigering: een
+	// dial naar een dichte poort wachtte zijn volle deadline uit in plaats van
+	// meteen "connection refused" te krijgen. Voor een health-check of een
+	// origin die net verhuisd is, is het verschil tussen 3 seconden stilte en
+	// een onmiddellijk antwoord het verschil tussen zoeken en weten (12-08:
+	// een verkeerd origin-adres leek een netwerkprobleem).
 	l, listening := s.listeners[f.DstPort()]
 	if !listening || !seg.flags.Has(FlagSYN) || seg.flags.Has(FlagACK) {
-		return // geen RST-generatie in v1; de peer time-out
+		if !seg.flags.Has(FlagRST) {
+			// SEQ/ACK per RFC: een segment mét ACK spiegelt dat nummer als
+			// SEQ, anders is SEQ 0 en bevestigen we de sequence-ruimte die de
+			// peer beweert te hebben gebruikt.
+			r := rstPending{dst: src, sport: f.DstPort(), dport: f.SrcPort()}
+			if seg.flags.Has(FlagACK) {
+				r.seq = seg.ack
+			} else {
+				r.ack = seg.seq + uint32(len(seg.data)) + 1 // +1 voor de SYN
+			}
+			s.rstOut = append(s.rstOut, r)
+			s.notify()
+		}
+		return
 	}
 	c, err := s.newConnLocked(key)
 	if err != nil {
@@ -452,11 +487,14 @@ func (s *Stack) pump() {
 			s.mu.Unlock()
 			return
 		}
-		s.drainLocked()
+		again := s.drainLocked()
 		deadline := s.nextDeadlineLocked()
 		ch := s.wake
 		s.mu.Unlock()
 
+		if again {
+			continue // zelf-verkeer verwerkt: er staat mogelijk antwoord klaar
+		}
 		if deadline == 0 {
 			<-ch
 			continue
@@ -479,7 +517,7 @@ func (s *Stack) pump() {
 // drainLocked schrijft alle klaarstaande frames. De transmit gebeurt onder de
 // lock (Device.Transmit is bij alle HopOS-drivers een korte ring-schrijf);
 // als dat ooit knelt is een dubbele buffer de uitweg, niet een fijner slot.
-func (s *Stack) drainLocked() {
+func (s *Stack) drainLocked() (again bool) {
 	now := s.now()
 
 	for _, r := range s.rstOut {
@@ -526,6 +564,24 @@ func (s *Stack) drainLocked() {
 		}
 		s.reap(key, c)
 	}
+
+	// Zelf-verkeer: door de eigen ingress, niet de draad op. Wat hier
+	// binnenkomt kan een antwoord opleveren (een SYN wil een SYN-ACK), dus
+	// vraagt de pomp om nog een ronde in plaats van te gaan slapen — anders
+	// zou de notify die recvIPv4 zet net te laat komen (de pomp leest zijn
+	// wake-kanaal ná deze functie).
+	if len(s.loopback) == 0 {
+		return false
+	}
+	lb := s.loopback
+	s.loopback = s.loopback[:0]
+	for _, fr := range lb {
+		if eth, err := ParseEth(fr); err == nil {
+			s.ingressLocked(eth, now)
+		}
+		s.lbFree = append(s.lbFree, fr)
+	}
+	return true
 }
 
 // nextDeadlineLocked geeft de vroegste wektijd van alle machines, of 0 als
@@ -569,6 +625,16 @@ func (s *Stack) nextDeadlineLocked() int64 {
 // routeLocked beslist het volgende-hop-MAC: binnen het subnet direct via ARP,
 // daarbuiten de gateway (statisch plan of ARP).
 func (s *Stack) routeLocked(dst [4]byte, now int64) ([6]byte, bool) {
+	// Ons eigen adres: nooit ARP'en, nooit de draad op. Zonder deze regel
+	// vraagt een wereld die zijn eigen IP dialt op de draad "who has <mijzelf>"
+	// — een vraag die niemand hoort te beantwoorden (een switch floodt naar
+	// iedereen BEHALVE de bron), dus gaf dat na vijf pogingen "no route to
+	// host". GEMETEN 12-08 op ijzer: cloudflared stond na een rolling update op
+	// het slot-IP dat zijn eigen config als origin noemde, en de fout wees vijf
+	// lagen weg van de oorzaak. Zie sendEthLocked voor de loopback-naad.
+	if dst == s.cfg.IP {
+		return s.cfg.MAC, true
+	}
 	if !sameSubnet(dst, s.cfg.IP, s.cfg.Prefix) {
 		if s.hasGwMAC {
 			return s.gwMAC, true
@@ -597,7 +663,41 @@ func (s *Stack) sendEthLocked(dst [6]byte, etherType uint16, payloadLen int) {
 		}
 		n = 60
 	}
+	// Loopback: een frame aan onszelf gaat niet de draad op maar de eigen
+	// ingress in. Dat is wat "127.0.0.1" elders doet, hier op het enige adres
+	// dat we hebben — een agent die zijn eigen poort belt en een app die per
+	// ongeluk zijn eigen slot-IP als origin heeft, komen beide netjes uit
+	// (verbinding of connection refused, niet "no route to host").
+	//
+	// De kopie is nodig omdat txBuf de volgende regel al hergebruikt wordt.
+	// Bewust geen bulk-pad: dit draagt agent↔leader-verkeer, geen downloads.
+	// Loopt de wachtrij vol (een lokale peer die niet leest), dan dropt dit
+	// zoals elke volle ring dropt — TCP herzendt.
+	if dst == s.cfg.MAC {
+		if len(s.loopback) < loopbackMax {
+			s.loopback = append(s.loopback, append(s.lbBuf(), s.txBuf[:n]...))
+			// Wakker maken, want niet elke zender is de pomp: een UDP-Write
+			// schrijft rechtstreeks vanuit de socket-call, en zonder notify
+			// bleef zijn datagram in de wachtrij tot er iets ánders gebeurde
+			// (i/o timeout op een loopback-vraag, gemeten in de eerste versie
+			// van deze naad).
+			s.notify()
+		}
+		return
+	}
 	_ = s.dev.Transmit(s.txBuf[:n])
+}
+
+// lbBuf geeft een lege buffer voor de loopback-wachtrij: hergebruikt wat
+// drainLocked teruggaf, zodat een levendige lokale gesprekspartner niet elke
+// ronde nieuwe frames alloceert.
+func (s *Stack) lbBuf() []byte {
+	if n := len(s.lbFree); n > 0 {
+		b := s.lbFree[n-1]
+		s.lbFree = s.lbFree[:n-1]
+		return b[:0]
+	}
+	return make([]byte, 0, MTU+EthernetMaximumSize)
 }
 
 func (s *Stack) sendIPv4Locked(dstMAC [6]byte, dstIP [4]byte, proto byte, payload []byte) {

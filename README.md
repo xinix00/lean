@@ -17,6 +17,9 @@ that one.
 | [`leanhttp`](leanhttp/) | HTTP/1.1 without TLS — small client and server, chunked reading and writing |
 | [`leandhcp`](leandhcp/) | DHCPv4 (RFC 2131) on raw ethernet frames — a lease before any netstack exists |
 | [`leannet`](leannet/) | TCP/IP for bare-metal Go — ethernet, ARP, IPv4, ICMP echo, UDP, TCP, and `net.Conn`/`Listener`/`PacketConn` on top. One memory knob, buffers that grow with use instead of with configuration |
+| [`leancookie`](leancookie/) | A cookie jar (RFC 6265) on `net/url` and strings — domain, path, expiry and Secure, without dragging `net/http/cookiejar` (and with it 3.2 MB of `net/http`) into the image. Host-only by default, because a public-suffix list is not something a bare-metal image should carry |
+| [`leanhttps`](leanhttps/) | **A composition:** `leanhttp` over `leantls`, and nothing else. Sets SNI per connection so it follows a redirect to another host. **2.01 MB** lighter than `net/http` + `crypto/tls` with a real chain, 3.12 MB with a pinned peer |
+| [`leantls`](leantls/) | TLS 1.3 for a network you own — one version, one suite, and a peer you recognise by pinned Ed25519 key instead of by certificate chain — **1.57 MB** lighter than `crypto/tls`. With a real chain (`leantls/x509verify`) it is what finally makes `leanhttp` usable for https: that stack is **1.73 MB** lighter than `net/http` with `crypto/tls`. Refuses to connect without a trust model |
 
 ## The rule
 
@@ -29,12 +32,73 @@ A package belongs here when all three hold:
 2. **It fails loudly.** What it cannot do, it refuses with a clear message. A
    package that avoids linking TLS and then quietly tries an https URL is worse
    than `net/http`, not lighter.
-3. **It stands alone.** Standard library only. A lean package that needs
-   another lean package is no longer a building block; it is a framework in
+3. **It stands alone.** Standard library only. A building block that needs
+   another building block is no longer a building block; it is a framework in
    the making.
 
 What does not belong here: anything that only becomes useful once you take
 three more along with it.
+
+## The one exception: compositions
+
+Some things are two blocks by nature. `https` is exactly `http` over `tls` —
+there is no third thing to invent, and a package that "does https" without
+importing a TLS implementation would have to carry its own copy of one. So there
+is a second, narrower kind of package here: a **composition**, which may import
+the blocks it joins and nothing else.
+
+The point is not convenience, it is that the joint is where the mistakes live.
+Sending SNI for the wrong host after a redirect, picking port 443 but verifying
+nothing, forgetting to close the connection on a 3xx: every user of two blocks
+writes that same glue, and every one of them can write it subtly wrong. A
+composition writes it once, out in the open, with tests on it.
+
+**lean + lean = leaner**, and that is meant literally: a composition makes the
+*use* thinner without making the blocks thicker. Whoever imports `leanhttp`
+still links no TLS. That is the property that keeps this from sliding into a
+framework, and it is the first thing to check when adding one.
+
+Four rules keep a composition honest:
+
+1. **It only joins.** It adds no protocol, no format, no behaviour that is not
+   already in its parts. If it has features of its own, it is a block — hold it
+   to the three rules above instead.
+2. **It stays smaller than its smallest part.** Glue that outgrows the thing it
+   glues is not glue any more. This is a number you can check.
+3. **One level deep.** A composition imports blocks, never other compositions.
+   Otherwise the import graph becomes a tree, and a tree is a framework.
+4. **The blocks stay usable alone.** If joining two blocks required changing one
+   of them into something only the composition can use, the seam is wrong.
+   (A block may grow a *general* seam for this — `leanhttp` takes any dialer,
+   which is useful for a proxy or a test long before TLS enters the picture.)
+
+`leantls` was written here rather than lifted from HopOS, because HopOS never had
+it: that core still links `crypto/tls` for one https download. It exists because
+the same measurement kept coming back — TLS/PKI is the second-largest block in a
+bare-metal Go image after the network stack — and because almost all of that
+weight buys one thing we do not need between our own machines: validating a
+certificate from an arbitrary certificate authority. What it does need, a peer
+you already know the key of, costs 0.82 MB instead of 2.40 MB.
+
+Handling real certificate chains brings back crypto/x509 and the arithmetic it
+needs, and on its own that is only 0.63 MB lighter than crypto/tls. The first
+version of this note concluded from that number that the chain mode was not worth
+having, which was the wrong baseline: nobody fetches a file with crypto/tls
+alone, they use `net/http`. Measured as the stack it actually replaces, it is
+1.73 MB — and `leanhttp` contributes 1.10 MB of that, which was unreachable for
+https before, because it refuses an https URL without a dialer and the only
+dialer available was crypto/tls. Two packages that each looked marginal are worth
+almost 2 MB together. That is an argument for measuring the whole path rather
+than the piece you happen to be working on.
+
+The scope is the safety argument, not a limitation to work around. Version
+downgrade, renegotiation, compression, CBC padding and RSA PKCS#1v1.5 are the
+recurring holes in TLS implementations, and none of them exist in TLS 1.3 with a
+single suite. Chain validation, the richest source of homegrown TLS bugs, is not
+carefully implemented here — it is absent. What is left is a key schedule, a
+record layer and a transcript, and all three are checked against known answers:
+the schedule against the worked handshake in RFC 8448, the rest against
+`crypto/tls` itself as the peer.
 
 ## Where these came from
 

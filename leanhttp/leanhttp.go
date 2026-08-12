@@ -25,11 +25,17 @@
 //
 //   - geen https. Een https-URL faalt LUID met een duidelijke melding -- nooit
 //     stil, want dit pakket bestaat juist om geen TLS te linken.
-//   - geen keep-alive aan de clientkant, geen connection pool: één verzoek per
-//     verbinding (Connection: close). De serverkant hergebruikt wél (zie
+//   - de package-level Do/Get doen één verzoek per verbinding (Connection:
+//     close). Wie een reeks verzoeken naar dezelfde host doet, gebruikt
+//     [Client]: die poolt verbindingen (keep-alive) en geeft ze alleen terug
+//     als de body helemaal gelezen is. De serverkant hergebruikt altijd (zie
 //     serve.go): een pagina die frames pollt hoort niet elke keer een
 //     TCP-handdruk te betalen.
-//   - geen HTTP/2, geen compressie (Accept-Encoding: identity), geen cookies.
+//   - geen HTTP/2. Geen compressie in het pakket: de default is
+//     Accept-Encoding: identity, maar wie hem zelf zet krijgt hem doorgegeven
+//     en leest in Response.Encoding wat er terugkwam (zo blijft compress/gzip
+//     buiten dit pakket). Geen cookies: die wonen in leancookie, dat niets van
+//     HTTP weet en dus ook niets meelinkt.
 //
 // Chunked transfer kan dit pakket wél lezen (Do) en schrijven (Flush) -- dat is
 // niet optioneel zodra je een SSE-staart of een frame-stream wilt, en het is
@@ -134,10 +140,32 @@ func (h Header) add(key, value string) {
 // Accept-Encoding zet Do zelf — die staan niet ter discussie.
 type Call struct {
 	Method  string        // "" = GET
-	URL     string        // moet http:// zijn
+	URL     string        // http://, of https:// mét Dial (zie daar)
 	Header  Header        // extra verzoekheaders (mag nil zijn)
 	Body    []byte        // nil = geen body
 	Timeout time.Duration // totaaltermijn incl. body-lezen; 0 = geen (blijvende streams)
+
+	// Dial maakt de verbinding. nil = net.DialTimeout op tcp4, en dan blijft
+	// dit pakket wat het is: plain http zonder één byte TLS.
+	//
+	// De naad is er voor álles wat een andere verbinding wil zijn dan een kale
+	// TCP-dial: een proxy, een unix-socket, een testdubbel dat nooit het net
+	// op gaat — en een versleutelde verbinding. In dat laatste geval hoort de
+	// aanroeper hier een TLS-dialer neer te zetten; dit pakket weet daar niets
+	// van en linkt er niets voor (leanhttps doet die knoop voor je).
+	//
+	// addr is "host:poort" met de hostnaam er nog in (niet opgelost naar een
+	// IP), zodat een TLS-dialer zijn SNI kan zetten. Bij een redirect naar een
+	// andere host wordt Dial opnieuw geroepen met die nieuwe host — wie SNI uit
+	// addr haalt, volgt dus automatisch mee.
+	Dial func(network, addr string) (net.Conn, error)
+
+	// keepAlive wordt door [Client] gezet: dan vraagt het verzoek om een
+	// verbinding die blijft staan, en geeft de body hem terug aan de pool.
+	// Niet exported — een losse Do heeft geen pool om iets aan terug te geven.
+	keepAlive bool
+	pool      *Client
+	addrKey   string
 }
 
 // Response is één antwoord. Body is de ongelezen responsebody; sluit hem (dat
@@ -150,6 +178,20 @@ type Response struct {
 	Body       io.ReadCloser
 	Length     int64
 
+	// Encoding is de Content-Encoding van het antwoord ("" = geen). Dit pakket
+	// pakt niets uit; wie Accept-Encoding zet, leest hier wat hij terugkreeg en
+	// wikkelt Body zelf (bijvoorbeeld in gzip.NewReader).
+	Encoding string
+
+	// SetCookie zijn de Set-Cookie-regels, één per element en ONGEVOUWEN.
+	// Ze staan apart omdat ze de uitzondering van de HTTP-specificatie zijn:
+	// herhaalde headers mogen als komma-lijst samengevoegd worden (RFC 9110
+	// §5.3) — behalve deze, want een cookie-waarde en een Expires-datum
+	// bevatten zelf komma's ("Expires=Mon, 02 Jan 2026 ..."). Gevouwen is die
+	// lijst niet betrouwbaar terug te splitsen, en dan lees je één cookie waar
+	// er twee stonden. Header bevat ze dus NIET; leancookie eet dit veld.
+	SetCookie []string
+
 	chunked bool // voor Get: het onderscheid tussen "chunked" en "geen lengte"
 }
 
@@ -157,8 +199,14 @@ type Response struct {
 // Volgt redirects (tot maxRedirects) en eist een 200 mét Content-Length: wie
 // Get gebruikt wil een bestand van bekende omvang, geen half antwoord. Voor al
 // het andere is er [Do].
-func Get(raw string) (*Response, error) {
-	resp, err := Do(Call{URL: raw})
+func Get(raw string) (*Response, error) { return GetCall(Call{URL: raw}) }
+
+// GetCall is Get met de rest van de Call erbij — headers, een termijn, of een
+// eigen [Call.Dial]. Zelfde eisen: een 200 mét Content-Length. Dit is wat Get
+// is voor Do: dezelfde ronde, maar met de controles die een bestand-ophaler
+// wil.
+func GetCall(c Call) (*Response, error) {
+	resp, err := Do(c)
 	if err != nil {
 		return nil, err
 	}
@@ -220,18 +268,27 @@ func do(c Call, raw string) (_ *Response, err error) {
 	if err != nil {
 		return nil, fmt.Errorf("leanhttp: bad URL %q: %w", raw, err)
 	}
-	// Luid, niet stil: dit pakket bestaat juist om TLS niet te linken, dus een
-	// https-URL is een configuratiefout die je op de console hoort te zien.
-	if u.Scheme != "http" {
-		return nil, fmt.Errorf("leanhttp: only http:// is supported, got %q — "+
-			"this package links no TLS (use a plain-http URL, or use net/http)", u.Scheme)
+	// Luid, niet stil: zonder Dial linkt dit pakket geen TLS, dus is een
+	// https-URL een configuratiefout die je op de console hoort te zien — mét
+	// de twee uitwegen erin, want een fout die niet zegt wat te doen kost een
+	// zoektocht.
+	port := "80"
+	switch {
+	case u.Scheme == "http":
+	case u.Scheme == "https" && c.Dial != nil:
+		port = "443"
+	case u.Scheme == "https":
+		return nil, fmt.Errorf("leanhttp: https:// needs a Call.Dial that returns an "+
+			"encrypted connection (this package links no TLS) — use leanhttps, or set Dial yourself: %s", raw)
+	default:
+		return nil, fmt.Errorf("leanhttp: only http:// and https:// are supported, got %q", u.Scheme)
 	}
 	if u.Host == "" {
 		return nil, fmt.Errorf("leanhttp: URL %q has no host", raw)
 	}
 	addr := u.Host
 	if u.Port() == "" {
-		addr = net.JoinHostPort(addr, "80")
+		addr = net.JoinHostPort(addr, port)
 	}
 
 	req, err := requestBytes(c, u)
@@ -239,9 +296,18 @@ func do(c Call, raw string) (_ *Response, err error) {
 		return nil, err
 	}
 
-	conn, err := net.DialTimeout("tcp4", addr, dialTimeout)
+	dial := c.Dial
+	if dial == nil {
+		dial = func(network, addr string) (net.Conn, error) {
+			return net.DialTimeout(network, addr, dialTimeout)
+		}
+	}
+	conn, err := dial("tcp4", addr)
 	if err != nil {
 		return nil, fmt.Errorf("leanhttp: dial %s: %w", addr, err)
+	}
+	if conn == nil {
+		return nil, fmt.Errorf("leanhttp: Call.Dial returned no connection and no error for %s", addr)
 	}
 	// Elk faalpad hierna sluit de verbinding; het succespad geeft hem als Body
 	// aan de aanroeper mee.
@@ -267,7 +333,17 @@ func do(c Call, raw string) (_ *Response, err error) {
 		}
 	}
 
-	br := bufio.NewReaderSize(conn, bufSize)
+	// Een verbinding uit de pool draagt zijn eigen bufio.Reader mee: daar kunnen
+	// bytes in staan die al van de socket gelezen zijn (de server stuurde kop en
+	// body in één pakket). Een nieuwe Reader maken zou die bytes weggooien en
+	// het volgende antwoord half laten beginnen.
+	var br *bufio.Reader
+	if pc, ok := conn.(*pooledConn); ok && pc.br != nil {
+		br = pc.br
+	} else {
+		br = bufio.NewReaderSize(conn, bufSize)
+	}
+	c.addrKey = addr
 	budget := maxHeaderBytes
 
 	line, err := readLine(br, &budget)
@@ -281,6 +357,7 @@ func do(c Call, raw string) (_ *Response, err error) {
 	_, status, _ := strings.Cut(line, " ") // "HTTP/1.1 404 Not Found" → "404 Not Found"
 
 	hdr := Header{}
+	var setCookie []string
 	var length int64 = -1
 	var chunked bool
 	for {
@@ -308,6 +385,10 @@ func do(c Call, raw string) (_ *Response, err error) {
 			}
 		case strings.EqualFold(k, "Transfer-Encoding"):
 			chunked = !strings.EqualFold(v, "identity")
+		case strings.EqualFold(k, "Set-Cookie"):
+			// Niet vouwen, niet in Header: zie Response.SetCookie.
+			setCookie = append(setCookie, v)
+			continue
 		}
 		hdr.add(k, v)
 	}
@@ -324,13 +405,25 @@ func do(c Call, raw string) (_ *Response, err error) {
 		rd = br // geen lengte, geen chunks: de body loopt tot EOF
 	}
 
+	// Hergebruik mag alleen als we het einde van de body kunnen vinden EN de
+	// server de verbinding openhoudt. Zonder lengte en zonder chunks loopt de
+	// body tot EOF, en dan IS de verbinding het einde — die kan nooit terug.
+	reuse := c.keepAlive && (chunked || length >= 0) &&
+		!strings.EqualFold(hdr.Get("Connection"), "close")
+
 	handedOff = true
+	b := body{r: rd, c: conn}
+	if reuse {
+		b.pool, b.key, b.br = c.pool, c.addrKey, br
+	}
 	return &Response{
 		StatusCode: code,
 		Status:     status,
 		Header:     hdr,
-		Body:       body{rd, conn},
+		Body:       &b,
 		Length:     length,
+		Encoding:   hdr.Get("Content-Encoding"),
+		SetCookie:  setCookie,
 		chunked:    chunked,
 	}, nil
 }
@@ -343,10 +436,22 @@ func requestBytes(c Call, u *url.URL) ([]byte, error) {
 		method = "GET"
 	}
 	var b bytes.Buffer
-	// Accept-Encoding: identity — wij pakken niets uit, dus vraag het ook niet.
+	// Accept-Encoding: identity is de DEFAULT, niet een wet — wij pakken niets
+	// uit, dus vragen we niets. Wie wél gecomprimeerd wil (een browser: 2-5×
+	// minder bytes over de lijn) zet de header zelf en pakt Response.Body zelf
+	// uit; Response.Encoding zegt wat er terugkwam. Zo blijft compress/gzip
+	// buiten dit pakket en betaalt niemand ervoor die het niet vraagt.
+	enc := "identity"
+	if v := c.Header.Get("Accept-Encoding"); v != "" {
+		enc = v
+	}
+	conn := "close"
+	if c.keepAlive {
+		conn = "keep-alive"
+	}
 	// Host zonder poort-default, net als net/http.
-	fmt.Fprintf(&b, "%s %s HTTP/1.1\r\nHost: %s\r\nAccept-Encoding: identity\r\nConnection: close\r\n",
-		method, u.RequestURI(), u.Host)
+	fmt.Fprintf(&b, "%s %s HTTP/1.1\r\nHost: %s\r\nAccept-Encoding: %s\r\nConnection: %s\r\n",
+		method, u.RequestURI(), u.Host, enc, conn)
 	if c.Body != nil {
 		fmt.Fprintf(&b, "Content-Length: %d\r\n", len(c.Body))
 	}
@@ -361,6 +466,8 @@ func requestBytes(c Call, u *url.URL) ([]byte, error) {
 		case strings.EqualFold(k, "Host"), strings.EqualFold(k, "Content-Length"),
 			strings.EqualFold(k, "Connection"), strings.EqualFold(k, "Transfer-Encoding"):
 			return nil, fmt.Errorf("leanhttp: header %q is set by the package, not by the caller", k)
+		case strings.EqualFold(k, "Accept-Encoding"):
+			continue // al in de statusregel geschreven; niet dubbel
 		}
 		fmt.Fprintf(&b, "%s: %s\r\n", k, v)
 	}
@@ -406,13 +513,42 @@ func statusCode(line string) (int, error) {
 // de body moet dóór die reader gelezen worden en niet rechtstreeks van de conn.
 // Close is tevens het afbreek-signaal van een blijvende stream: een lezer die
 // in Read hangt komt eruit zodra de fd dicht is.
+// body is de responsebody plus de verbinding eronder. Sluit hij, dan gaat de
+// verbinding dicht — tenzij er een pool is EN de body helemaal gelezen is.
+//
+// Die laatste voorwaarde is de hele veiligheid van keep-alive: een verbinding
+// met ongelezen bytes erin teruggeven betekent dat het volgende verzoek de
+// staart van dit antwoord als zijn statusregel leest. Dan lees je de body van
+// pagina A als de headers van pagina B, en dat is precies het soort fout dat
+// jaren onopgemerkt blijft. Twijfel = sluiten.
 type body struct {
-	r io.Reader
-	c net.Conn
+	r    io.Reader
+	c    net.Conn
+	br   *bufio.Reader
+	pool *Client
+	key  string
+	done bool // de body is tot het einde gelezen
+	shut bool // Close is al geweest
 }
 
-func (b body) Read(p []byte) (int, error) { return b.r.Read(p) }
-func (b body) Close() error               { return b.c.Close() }
+func (b *body) Read(p []byte) (int, error) {
+	n, err := b.r.Read(p)
+	if err == io.EOF {
+		b.done = true
+	}
+	return n, err
+}
+
+func (b *body) Close() error {
+	if b.shut {
+		return nil
+	}
+	b.shut = true
+	if b.pool != nil && b.done && b.pool.put(b.key, b.c, b.br) {
+		return nil // de verbinding leeft door in de pool
+	}
+	return b.c.Close()
+}
 
 // chunkReader ontleedt chunked transfer-encoding: per chunk een hex-lengte,
 // die bytes, CRLF; lengte 0 sluit af (gevolgd door optionele trailers). Nodig
