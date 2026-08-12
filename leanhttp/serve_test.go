@@ -440,3 +440,62 @@ func TestServeNeverSpins(t *testing.T) {
 		t.Fatal("Serve keerde niet terug — de accept-lus tolt rond (de bug van 27-07)")
 	}
 }
+
+// TestServeDoneZegtGeenKeepAlive: een handler die Done() vraagt zet een
+// wachthond op de verbinding, dus die is na dit antwoord op. De KOP moet dat dan
+// ook zeggen.
+//
+// GEMETEN 12-08 op ijzer: hij zei het niet. De kop belooft keep-alive (die
+// beslissing valt vóór de handler), een client met een pool legt de verbinding
+// netjes weg, en het volgende verzoek loopt op een dode socket — 200/502/200/502
+// door hop's agent-proxy, die per verzoek een context uit Done() bouwde.
+func TestServeDoneZegtGeenKeepAlive(t *testing.T) {
+	for _, tc := range []struct {
+		naam  string
+		vraag bool
+		want  string
+	}{
+		{"zonder Done()", false, "keep-alive"},
+		{"met Done()", true, "close"},
+	} {
+		l, err := net.Listen("tcp4", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		go Serve(l, func(w ResponseWriter, r *Request) {
+			if tc.vraag {
+				_ = r.Done()
+			}
+			w.Write([]byte("ok"))
+		})
+
+		// Via een Client, want alleen die vraagt om keep-alive.
+		var pool Client
+		resp, err := pool.Do(Call{URL: "http://" + l.Addr().String() + "/"})
+		if err != nil {
+			l.Close()
+			t.Fatalf("%s: %v", tc.naam, err)
+		}
+		io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if got := resp.Header.Get("Connection"); got != tc.want {
+			t.Errorf("%s: Connection = %q, want %q", tc.naam, got, tc.want)
+		}
+
+		// En de tweede ronde moet lukken: precies dit deed hij niet op ijzer.
+		// Zonder wachthond komt hij uit de pool, mét wachthond vers — beide
+		// horen een antwoord te geven in plaats van EOF.
+		resp2, err := pool.Do(Call{URL: "http://" + l.Addr().String() + "/"})
+		if err != nil {
+			l.Close()
+			t.Fatalf("%s: tweede ronde: %v", tc.naam, err)
+		}
+		body, rerr := io.ReadAll(resp2.Body)
+		resp2.Body.Close()
+		if rerr != nil || string(body) != "ok" {
+			t.Errorf("%s: tweede ronde gaf %q (%v)", tc.naam, body, rerr)
+		}
+		pool.CloseIdle()
+		l.Close()
+	}
+}

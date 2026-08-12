@@ -3,6 +3,7 @@ package leannet
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"net"
 	"os"
@@ -1239,6 +1240,73 @@ func TestIsBroadcastIP(t *testing.T) {
 	} {
 		if got := isBroadcastIP(tc.dst, ip, tc.prefix); got != tc.want {
 			t.Errorf("isBroadcastIP(%v, /%d) = %v, want %v", tc.dst, tc.prefix, got, tc.want)
+		}
+	}
+}
+
+// TestStackSelfDialMeerdereRondes: MEERDERE vraag-antwoord-rondes over ÉÉN
+// loopback-verbinding, want dat is wat keep-alive doet en het bestaande
+// self-dial-geval deed maar één ronde.
+//
+// GEMETEN 12-08 op ijzer (LicheeRV op 192.168.99.2): hop's agent proxyt naar de
+// leader op dezelfde node, dus over loopback, met een verbinding uit de
+// keep-alive-pool. Uitkomst: 200, 502, 200, 502 — perfect om en om. De eerste
+// ronde van een verse verbinding lukte, de tweede over dezelfde verbinding niet.
+func TestStackSelfDialMeerdereRondes(t *testing.T) {
+	a, _ := newStackPair(t, 1<<20, 1<<20)
+	self := [4]byte{10, 0, 0, 1}
+
+	l, err := a.Listen(7100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := make(chan error, 1)
+	go func() {
+		c, err := l.Accept()
+		if err != nil {
+			srv <- err
+			return
+		}
+		defer c.Close()
+		buf := make([]byte, 64)
+		for {
+			n, err := c.Read(buf)
+			if n > 0 {
+				if _, werr := c.Write(append([]byte("re:"), buf[:n]...)); werr != nil {
+					srv <- werr
+					return
+				}
+			}
+			if err != nil {
+				srv <- nil
+				return
+			}
+		}
+	}()
+
+	c, err := a.DialTCP(self, 7100, time.Now().Add(3*time.Second))
+	if err != nil {
+		t.Fatalf("self-dial: %v", err)
+	}
+	defer c.Close()
+
+	// Tien rondes: elke ronde ontstaat er tijdens de verwerking van het
+	// binnenkomende frame een uitgaand frame (het antwoord plus zijn ACK), en
+	// dat is precies de situatie waarin een gedeelde wachtrij-array zichzelf
+	// overschrijft.
+	for i := range 10 {
+		c.SetDeadline(time.Now().Add(3 * time.Second))
+		msg := fmt.Appendf(nil, "ronde-%d", i)
+		if _, err := c.Write(msg); err != nil {
+			t.Fatalf("ronde %d: write: %v", i, err)
+		}
+		want := append([]byte("re:"), msg...)
+		got := make([]byte, len(want))
+		if _, err := io.ReadFull(c, got); err != nil {
+			t.Fatalf("ronde %d: lezen na %d geslaagde rondes: %v", i, i, err)
+		}
+		if !bytes.Equal(got, want) {
+			t.Fatalf("ronde %d: %q, want %q", i, got, want)
 		}
 	}
 }

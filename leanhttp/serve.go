@@ -442,7 +442,13 @@ func (w *respWriter) writeHead() {
 	if w.chunked {
 		w.hdr.Set("Transfer-Encoding", "chunked")
 	}
-	if w.keepAlive {
+	// De wachthond van Done() leest mee op deze verbinding, dus hij is na dit
+	// antwoord op — en dan mag de kop géén keep-alive beloven. Deed hij dat
+	// wel, dan legt een client met een pool hem netjes weg en loopt het
+	// VOLGENDE verzoek op een dode verbinding: GEMETEN 12-08 op ijzer als
+	// 200/502/200/502 door hop's agent-proxy, want die bouwde per verzoek een
+	// context uit Done().
+	if w.keepAlive && !w.c.watched {
 		w.hdr.Set("Connection", "keep-alive")
 	} else {
 		w.hdr.Set("Connection", "close")
