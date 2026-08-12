@@ -19,6 +19,7 @@ that one.
 | [`leannet`](leannet/) | TCP/IP for bare-metal Go — ethernet, ARP, IPv4, ICMP echo, UDP, TCP, and `net.Conn`/`Listener`/`PacketConn` on top. One memory knob, buffers that grow with use instead of with configuration |
 | [`leancookie`](leancookie/) | A cookie jar (RFC 6265) on `net/url` and strings — domain, path, expiry and Secure, without dragging `net/http/cookiejar` (and with it 3.2 MB of `net/http`) into the image. Host-only by default, because a public-suffix list is not something a bare-metal image should carry |
 | [`leanhttps`](leanhttps/) | **A composition:** `leanhttp` over `leantls`, and nothing else. Sets SNI per connection so it follows a redirect to another host. **2.01 MB** lighter than `net/http` + `crypto/tls` with a real chain, 3.12 MB with a pinned peer |
+| [`leans3`](leans3/) | S3: SigV4 signing plus the object operations, including the streaming and the conditional (If-Match/ETag) ones. It exists because one stack already carried **two** hand-written SigV4 implementations, and the second one skipped URI escaping — so a key with a space in it signed a different string than the server read |
 | [`leantls`](leantls/) | TLS 1.3 for a network you own — one version, one suite, and a peer you recognise by pinned Ed25519 key instead of by certificate chain — **1.57 MB** lighter than `crypto/tls`. With a real chain (`leantls/x509verify`) it is what finally makes `leanhttp` usable for https: that stack is **1.73 MB** lighter than `net/http` with `crypto/tls`. Refuses to connect without a trust model |
 
 ## The rule
@@ -72,6 +73,16 @@ Four rules keep a composition honest:
    (A block may grow a *general* seam for this — `leanhttp` takes any dialer,
    which is useful for a proxy or a test long before TLS enters the picture.)
 
+`leans3` is the one package here that is neither: it has a protocol of its own
+(SigV4 and the S3 object API), so it is a block, but it cannot be standard
+library only — an S3 client needs an HTTP client, and reaching for `net/http`
+would defeat the purpose. It imports `leanhttps`, which rule 3 forbids a
+composition from doing, and the reason it is right here is the same reason
+compositions exist: the alternative is to rewrite the joint `leanhttps` already
+tests. The cost is stated in its package doc — someone who talks plain http to a
+MinIO on a LAN still links the PKI chain, because the scheme choice is reachable
+from every call and the linker cannot drop it.
+
 `leantls` was written here rather than lifted from HopOS, because HopOS never had
 it: that core still links `crypto/tls` for one https download. It exists because
 the same measurement kept coming back — TLS/PKI is the second-largest block in a
@@ -111,6 +122,8 @@ they carry their date, so it is clear what was tested and when.
 freshly booted node needs a lease before it has a network stack to get one
 with. It speaks raw ethernet frames through a two-method NIC contract, so any
 driver fits. The DISCOVER/OFFER half was proven on hardware (Pi 5, 2026-07-10:
-an OFFER from a FRITZ!Box through our own PCIe→RP1→GEM chain).
+an OFFER from a FRITZ!Box through our own PCIe→RP1→GEM chain). Keeping the lease
+alive is a second half that runs over the stack instead of the NIC, because
+after bring-up the receive loop has exactly one owner.
 
 The package documentation is in Dutch, as it was written.

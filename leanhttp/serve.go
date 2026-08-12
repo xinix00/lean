@@ -352,7 +352,8 @@ func readRequest(c *conn) (*Request, error) {
 	return r, nil
 }
 
-// emptyBody is de body van een verzoek dat er geen heeft: leesbaar, meteen op.
+// emptyBody is de body van een bericht dat er geen heeft: leesbaar, meteen op.
+// Aan de serverkant een verzoek zonder body, aan de clientkant een 204/304.
 type emptyBody struct{}
 
 func (emptyBody) Read([]byte) (int, error) { return 0, io.EOF }

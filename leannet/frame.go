@@ -32,6 +32,13 @@ const (
 	ProtoUDP  byte = 17
 )
 
+// De broadcast-adressen. bcastIP is het "limited broadcast" van RFC 919; het
+// subnet-gerichte adres hangt van de config af (zie isBroadcastIP).
+var (
+	bcastMAC = [6]byte{0xff, 0xff, 0xff, 0xff, 0xff, 0xff}
+	bcastIP  = [4]byte{255, 255, 255, 255}
+)
+
 // Vaste headermaten (zonder opties).
 const (
 	sizeEth  = 14

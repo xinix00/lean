@@ -40,6 +40,17 @@ suite met `-race` groen.
       health-check of een net verhuisd origin is dat het verschil tussen zoeken
       en weten. Een RST lokt nooit een RST uit (storm-test).
 
+**Na v0.3.0 gebouwd (12-08, ongecommit):**
+
+- [x] **Broadcast de deur uit.** De routelaag deed er iets stils-fouts mee:
+      255.255.255.255 valt buiten élk subnet, dus ging het als *unicast* naar de
+      gateway (die het terecht negeert), en een subnet-gericht adres (x.x.x.255)
+      ging de ARP-molen in naar een adres dat niemand bezit — vijf pogingen, dan
+      "no route to host". Nu gaan beide naar `ff:ff:ff:ff:ff:ff` zonder ARP. De
+      klant is de DHCP-rebind hieronder; zonder deze regel bestond die fase
+      alleen op papier. Inkomende broadcast blijft dicht, met de reden in
+      DESIGN.md.
+
 **Eerst, en het is de enige echte open vraag:**
 
 - [ ] **Op ijzer verifiëren.** LicheeRV Nano (RISC-V, 100Mbit dwmac) en Radxa
@@ -103,6 +114,44 @@ Ja, en het legde onderweg een echte bug bloot.
       niet blijft plakken. Nu apart en per regel.
 - [x] **GetCall** — Get met de rest van de Call erbij (headers, termijn, Dial),
       zoals Do dat voor Get al was.
+- [ ] **De clientkant kent de bodyless-regel niet (204/304).** De serverkant wel
+      (serve_test.go toetst hem), maar `do` geeft een antwoord zonder
+      Content-Length en zonder chunks een body die tot EOF leest — en op een
+      keep-alive-verbinding komt dat EOF pas als de server zijn idle-timeout
+      haalt. Gevonden door leans3: een S3-DELETE en een hoplockserver-DELETE
+      antwoorden béide met 204, dus élke delete bleef staan tot de server hem
+      verveeld dichtgooide (in de test: een `go test` die zijn timeout haalde).
+      RFC 9112 §6.3 zegt dat 204 en 304 nooit een body hebben; drie regels in
+      `do` (lengte 0 in plaats van "tot EOF") lossen het op voor iedereen. Nu
+      omzeild in leans3 en in hoplockserver/client met een eigen `emptyBody` —
+      dat hoort niet in twee aanroepers te staan.
+
+## leans3 (nieuw 12-08)
+
+Verhuisd uit hoplock/s3, en de reden was een dubbeling: er stonden twee eigen
+SigV4's in één stapel (`hoplock/s3/sigv4.go` volledig, `hop
+internal/runner/download_s3.go` alleen-GET en zonder URI-escaping). De
+signeercode zelf is niet nieuw — hij heeft tegen AWS, R2, MinIO en Hetzner/Ceph
+RGW gelopen — maar hij staat hier voor het eerst als blok.
+
+- [ ] **hop's tweede signeerder opruimen.** `internal/runner/download_s3.go` kan
+      `leans3` gebruiken (of alleen zijn signeerder): dat haalt de zwakkere kopie
+      weg, en daarmee de klasse fouten die hij nu heeft — een key met een spatie
+      of een '+' signeert fout, geen sessietoken, alleen virtual-hosted. Alleen
+      vastgesteld, nog niet gedaan.
+- [ ] **De meting staat, maar op een HOST.** 5,68 → 3,95 MB voor dezelfde
+      getekende https-GET (darwin/arm64, `-ldflags=-w`); wat het in een
+      tamago-image doet is nog niet gemeten, want daarvoor moet er een board
+      onder de link staan. Verwachting: hetzelfde bedrag, want het is dezelfde
+      1,73 MB die x509verify op riscv64 meet.
+- [ ] **Niet op ijzer geweest** in deze vorm. hoplock/s3 en HopOS bouwen erop en
+      de host-tests zijn groen, maar sinds de verhuizing heeft er geen echte
+      provider aan de andere kant gestaan.
+- [ ] Bewust NIET: streaming signatures (STREAMING-AWS4-HMAC-SHA256-PAYLOAD),
+      multipart upload, presigned URL's, sigv4a, credentials uit IMDS/IAM,
+      HEAD/CopyObject. Voor dat laatste is `Client.URLFor` de naad: wie een
+      operatie nodig heeft die hier niet in zit, signeert hem zelf op de juiste
+      URL in plaats van de adresseringsstijl na te bouwen.
 
 ## leancookie (nieuw 12-08)
 
@@ -119,22 +168,53 @@ Ja, en het legde onderweg een echte bug bloot.
       alleen een client; https serveren vraagt leantls' serverhelft (die er nog
       niet is).
 
-## leandhcp
+## leandhcp — beide punten gedaan 12-08, en het pakket heeft nu tests
 
-- [ ] `StateRenewing`/`StateRebinding` netjes scheiden: `KeepAlive` doet nu de
-      T1-renew, maar de rebinding-fase (T2, broadcast naar een andere server)
-      is samengevouwen. Nog nooit een probleem gemeten op onze netten; wél een
-      RFC-2131-gat.
-- [ ] De klasse-les uit de lneto-review die hier wél geldt: een lease die in de
-      *laatste* tick binnenkomt mag niet als deadline-fout gerapporteerd worden.
-      Nakijken of `Acquire` dat goed doet (in lneto's DHCP-client was dat
-      bevinding #16).
+Het had er nul. Nu 30 tests, 95% coverage, `-race` groen; de hele
+DORA-handshake en de hele lease-cyclus draaien op een nep-NIC en een nep-socket,
+dus in microseconden in plaats van in uren.
+
+- [x] **`StateRenewing`/`StateRebinding` gescheiden.** Het gat was groter dan
+      "een RFC-punt": `KeepAlive` probeerde zes keer een unicast-renew met 30s
+      ertussen, en dat getal sloeg op niets uit de lease. Juist als de lessor
+      wég is (verhuisde router, nieuwe DHCP-server) kan die renew per definitie
+      niet slagen — en dan verloor de node zijn adres terwijl er een andere
+      server op het segment staat die de lease zou verlengen. Nu: optie 59 (T2)
+      wordt gevraagd en gelezen, `Lease.timers` geeft T1/T2/einde (met de
+      RFC-verhoudingen 0.5/0.875 als de server onzin stuurt — T1 = T2 = lease
+      bestaat in het veld), de pogingen halveren de resttijd met een vloer van
+      60s (§4.4.5) en stoppen exact op de fasegrens, en op T2 stapt hij over op
+      broadcast. Verloopt de lease alsnog, dan zegt hij dat luid
+      (`HOPOS_DHCP_EXPIRED`) in plaats van stil te stoppen.
+- [x] **Laatste tick (lneto-bevinding #16) — er zát een gat.** `await` keek naar
+      de klok vóór hij las, dus een antwoord dat al in de ring lag ging verloren
+      zodra het window dicht was. De duurste vorm: de server heeft het IP aan
+      onze MAC vergeven, wij melden "no server answered", de node boot zonder
+      net en de router houdt een binding voor een adres dat niemand gebruikt.
+      Nu wordt de klok alleen bekeken als de ring LEEG is (begrensd, want een
+      druk segment houdt de ring nooit leeg), en een REQUEST krijgt bovendien
+      een minimum-window omdat híj bindt waar een DISCOVER niets bindt. Twee
+      tests die tegen de oude code aantoonbaar falen.
+- [x] Onderweg meegekomen: een DHCPNAK werd genegeerd (nu `errRefused` → meteen
+      stoppen met `HOPOS_DHCP_NAK`, want doorpraten op een geweigerd adres is
+      actief fout), en een karige ACK kon `LeaseSecs` op nul zetten en daarmee
+      het hele onderhoud stilzwijgend uitzetten (`merge` draagt nu ook de
+      timers door).
+- [ ] Een rebind die bij een ándere server uitkomt kan een ánder adres geven, en
+      dat kunnen we niet toepassen: de stack staat sinds bring-up op één IP. Nu
+      meldt hij het luid en stopt (`HOPOS_DHCP_MOVED`) — de node hangt dan aan
+      een reboot. Netter zou zijn: de stack ter plekke herconfigureren. Dat is
+      een naad in hopnet, geen leandhcp-werk.
+- [ ] Servers die een rebind-antwoord tóch als broadcast terugsturen zien we
+      niet (leannet negeert inkomende broadcast-IP's, zie leannet/DESIGN.md).
+      RFC-conform hoeft dat niet te gebeuren zolang wij de broadcast-flag uit
+      laten, en dat doen we. Pas repareren als een echte router het doet.
 
 ## Repo-breed
 
-- [ ] **Taggen zodra HopOS er tegen aan wil bouwen zonder replace.** In
-      `hop-os/metal/go.mod` staat nu een dev-`replace` naar deze werkboom; die
-      mag niet gecommit worden. Volgorde: hier committen + taggen (v0.2.0 — nieuw
-      pakket, geen breuk), dan in hop-os de replace weg en de require bumpen.
-- [ ] De README-tabel krijgt een `leannet`-regel bij het taggen (met het
-      gemeten probleem in één zin, zoals de andere twee).
+- [x] Taggen: v0.3.0 staat, `hop-os/metal/go.mod` require't hem zonder replace,
+      en de README-tabel heeft zijn `leannet`-regel.
+- [ ] **Volgende tag** (v0.4.0: nieuwe exports `State`, `Rebind`, `Lease.T2Secs`
+      — geen breuk). Daarna in hop-os de require bumpen. Tijdens het werken
+      hoort er een dev-`replace` in `hop-os/metal/go.mod` te staan; die mag niet
+      mee in een commit.

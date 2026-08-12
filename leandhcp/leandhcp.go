@@ -5,6 +5,14 @@
 // aanroeper bepaalt het geduld. Het NIC-contract is twee methodes (rauwe
 // frames in en uit), dus élke driver of tap past erop.
 //
+// Het pakket heeft twee helften, en de scheiding is de netstack:
+//
+//   - leandhcp.go — de bring-up. Rauwe frames op de NIC, want er is nog niets
+//     anders. Dit is Acquire.
+//   - keepalive.go — de lease levend houden, ná de bring-up. Dat gaat over de
+//     stack (een UDP-socket), want de RX-lus van de NIC heeft dan één eigenaar.
+//     Dit is de staatmachine van RFC 2131 §4.4.5: bound, renewing, rebinding.
+//
 // De DISCOVER/OFFER-helft is boardvast bewezen op de Pi 5 (probe6 run 5,
 // 2026-07-10: OFFER 192.168.178.33 van een FRITZ!Box door onze eigen
 // PCIe→RP1→GEM-keten).
@@ -13,7 +21,6 @@ package leandhcp
 import (
 	"fmt"
 	"math/bits"
-	"net"
 	"time"
 )
 
@@ -24,6 +31,23 @@ type NIC interface {
 	Transmit(buf []byte) error
 }
 
+// DHCP-boodschapstypes (optie 53) die deze client kent.
+const (
+	msgDiscover = 1
+	msgOffer    = 2
+	msgRequest  = 3
+	msgACK      = 5
+	msgNAK      = 6
+)
+
+// Tijden van het boot-pad. roundWindow is hoe lang één DORA-ronde op antwoord
+// wacht; ackGrace is de minimum-tijd die een REQUEST krijgt, óók voorbij de
+// deadline (zie await).
+const (
+	roundWindow = 3 * time.Second
+	ackGrace    = time.Second
+)
+
 // Lease is het resultaat van een geslaagde handshake.
 type Lease struct {
 	IP     [4]byte
@@ -33,10 +57,12 @@ type Lease struct {
 	Server [4]byte // optie 54 (de lessor)
 
 	// Lease-timers uit de ACK (seconden). LeaseSecs = optie 51 (totale duur;
-	// 0xFFFFFFFF = oneindig). T1Secs = optie 58 (renew-tijd); afwezig (0) →
-	// val terug op 0.5·LeaseSecs voor de vernieuwing (KeepAlive).
+	// 0xFFFFFFFF = oneindig), T1Secs = optie 58 (renew-tijd), T2Secs = optie 59
+	// (rebind-tijd). Ontbreken ze of zijn ze onzin, dan gelden de RFC-2131
+	// -verhoudingen 0.5 en 0.875 — zie Lease.timers.
 	LeaseSecs uint32
 	T1Secs    uint32
+	T2Secs    uint32
 
 	// Acquired markeert een echt uit een ACK verkregen lease (vs. de nulwaarde);
 	// KeepAlive draait alleen op een verkregen lease.
@@ -81,10 +107,12 @@ func Acquire(nic NIC, mac [6]byte, timeout time.Duration) (Lease, error) {
 		}
 		xid := 0x484F5000 | ronde // "HOP" + ronde
 
-		if err := nic.Transmit(packet(mac, xid, 1, nil)); err != nil { // DISCOVER
+		if err := nic.Transmit(packet(mac, xid, msgDiscover, nil)); err != nil {
 			return Lease{}, fmt.Errorf("dhcp: TX: %w", err)
 		}
-		offer, ok, err := await(nic, mac, xid, 2, deadline) // OFFER
+		// Een DISCOVER bindt niets: loopt de deadline hier af, dan is er niets
+		// verloren en is "geen server" het eerlijke antwoord (least = 0).
+		offer, ok, err := await(nic, mac, xid, msgOffer, deadline, 0)
 		if err != nil {
 			rxErr = err
 		}
@@ -97,10 +125,16 @@ func Acquire(nic NIC, mac [6]byte, timeout time.Duration) (Lease, error) {
 			50, 4, offer.IP[0], offer.IP[1], offer.IP[2], offer.IP[3],
 			54, 4, offer.Server[0], offer.Server[1], offer.Server[2], offer.Server[3],
 		}
-		if err := nic.Transmit(packet(mac, xid, 3, req)); err != nil {
+		if err := nic.Transmit(packet(mac, xid, msgRequest, req)); err != nil {
 			return Lease{}, fmt.Errorf("dhcp: TX: %w", err)
 		}
-		ack, ok, err := await(nic, mac, xid, 5, deadline) // ACK
+		// Een REQUEST bindt WEL: de server reserveert het IP op onze MAC zodra
+		// hij hem ziet. Daarom krijgt de ACK een minimum-window, ook als de
+		// deadline er middenin valt — anders melden we een timeout voor een
+		// lease die we hebben gekregen, en houdt de router een binding voor een
+		// adres dat de node niet gebruikt. De overschrijding is begrensd
+		// (ackGrace) en dus geen open eind.
+		ack, ok, err := await(nic, mac, xid, msgACK, deadline, ackGrace)
 		if err != nil {
 			rxErr = err
 		}
@@ -111,125 +145,18 @@ func Acquire(nic NIC, mac [6]byte, timeout time.Duration) (Lease, error) {
 	}
 }
 
-// Renew vernieuwt de lease met een unicast RFC-2131-RENEW (ciaddr = lease-IP,
-// een REQUEST rechtstreeks naar de lessor, géén optie 50/54) — maar via de
-// gVisor-netstack (het net-pakket), niet via rauwe frames. Dat is de kern van de
-// RX-veiligheid: na bring-up bezit hopnet's rxLoop de NIC-RX (de driverringen
-// zijn lock-vrij, dus een tweede Receive-lus zou ze desynchroniseren), maar de
-// stack doet zelf de RX-demux (UDP-poort 68) én de TX-serialisatie. Renew leent
-// dus geen NIC — het opent een UDP-socket op de stack. Vereist dat hopnet de
-// stack al in net.SocketFunc hing (Up doet dat vóór het KeepAlive start).
-func Renew(l Lease, mac [6]byte, timeout time.Duration) (Lease, error) {
-	conn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IP(l.IP[:]), Port: 68})
-	if err != nil {
-		return Lease{}, fmt.Errorf("dhcp renew: bind :68: %w", err)
-	}
-	defer conn.Close()
-
-	xid := uint32(time.Now().UnixNano()) | 1
-	req := bootp(mac, xid, 3, l.IP, false, nil) // REQUEST, ciaddr = lease-IP, unicast
-	if _, err := conn.WriteToUDP(req, &net.UDPAddr{IP: net.IP(l.Server[:]), Port: 67}); err != nil {
-		return Lease{}, fmt.Errorf("dhcp renew: TX: %w", err)
-	}
-
-	conn.SetReadDeadline(time.Now().Add(timeout))
-	buf := make([]byte, 1536)
-	for {
-		n, _, err := conn.ReadFromUDP(buf)
-		if err != nil {
-			return Lease{}, fmt.Errorf("dhcp renew: no ACK within %v: %w", timeout, err)
-		}
-		nl, ok := parseBootp(buf[:n], mac, xid, 5) // ACK
-		if !ok {
-			continue // ander of laat pakket op :68 — binnen de deadline doorlezen
-		}
-		nl.Acquired = true
-		// Een RENEW-ACK herhaalt masker/router/DNS/server soms niet; draag de
-		// bestaande waarde dan door (de lease-tijden komen wél altijd mee).
-		if nl.Mask == ([4]byte{}) {
-			nl.Mask = l.Mask
-		}
-		if nl.GW == ([4]byte{}) {
-			nl.GW = l.GW
-		}
-		if nl.DNS == ([4]byte{}) {
-			nl.DNS = l.DNS
-		}
-		if nl.Server == ([4]byte{}) {
-			nl.Server = l.Server
-		}
-		return nl, nil
-	}
-}
-
-// KeepAlive houdt de lease levend in een eigen goroutine: het slaapt tot T1
-// (optie 58, of anders 0.5·lease-tijd) en doet dan een unicast-RENEW via de
-// netstack (Renew). Lukt dat niet, dan blijft het tot ~T2 kort proberen; daarna
-// geeft het luid op (de node behoudt zijn IP tot de router het heruitdeelt — een
-// reboot re-acquire't; een broadcast-rebind op T2 is de nette vervolgstap).
+// await polt tot msgtype (OFFER of ACK) voor onze xid binnenkomt, of tot het
+// ronde-window (roundWindow, begrensd door de totale deadline) sluit. least
+// tilt het window op tot minstens die duur vanaf nu, óók voorbij de deadline:
+// de aanroeper zegt daarmee "dit antwoord is te belangrijk om af te kappen".
 //
-// RX-veilig: Renew loopt volledig over de netstack, dus KeepAlive raakt de
-// NIC-RX niet en mag náást hopnet's rxLoop draaien. Start het PAS nadat hopnet
-// de stack in net.SocketFunc hing (hopnet.Up doet dat op het juiste moment).
-func KeepAlive(mac [6]byte, lease Lease) {
-	for {
-		wait := lease.renewAfter()
-		if wait <= 0 {
-			return // onbekende of oneindige lease: niets te timen
-		}
-		sleepChunked(wait)
-
-		renewed := false
-		for attempt := 0; attempt < 6; attempt++ {
-			l, err := Renew(lease, mac, 10*time.Second)
-			if err == nil {
-				lease = l
-				renewed = true
-				fmt.Printf("dhcp: lease renewed — %s (%ds remaining) HOPOS_DHCP_RENEW\n",
-					lease.IPString(), lease.LeaseSecs)
-				break
-			}
-			fmt.Printf("dhcp: renew attempt %d failed (%v)\n", attempt+1, err)
-			time.Sleep(30 * time.Second)
-		}
-		if !renewed {
-			fmt.Printf("dhcp: lease NOT renewed — keeping %s until the router reclaims it HOPOS_DHCP_RENEW_FAIL\n",
-				lease.IPString())
-			return
-		}
-	}
-}
-
-// sleepChunked slaapt d in plakken van een minuut en telt zelf: tamago heeft
-// ÉÉN tijdbasis, dus een SNTP-kloksprong (epoch→nu bij boot) laat een kale
-// Sleep(d) in één keer aflopen — dat wás de "renewal bij boot" (gemeten
-// 2026-07-11). Geplakt kost een sprong hooguit één plak.
-func sleepChunked(d time.Duration) {
-	const chunk = time.Minute
-	for ; d > chunk; d -= chunk {
-		time.Sleep(chunk)
-	}
-	time.Sleep(d)
-}
-
-// renewAfter geeft de wachttijd tot de eerstvolgende vernieuwing: T1 (optie 58)
-// indien bekend, anders de helft van de lease-tijd. 0 = geen timing (onbekende
-// of oneindige lease → geen vernieuwing).
-func (l Lease) renewAfter() time.Duration {
-	switch {
-	case l.LeaseSecs == 0xFFFFFFFF:
-		return 0 // oneindige lease: nooit vernieuwen
-	case l.T1Secs > 0:
-		return time.Duration(l.T1Secs) * time.Second
-	case l.LeaseSecs > 0:
-		return time.Duration(l.LeaseSecs/2) * time.Second
-	default:
-		return 0
-	}
-}
-
-// await polt tot msgtype (2=OFFER, 5=ACK) voor onze xid binnenkomt, of tot
-// het ronde-window (3s, begrensd door de totale deadline) sluit.
+// De klok wordt alleen bekeken als de ring LEEG is. Dat is de laatste-tick-regel
+// (lneto-bevinding #16): een antwoord dat er al ligt, is een antwoord — ook als
+// het window net dichtging. Anders is de duurste uitkomst mogelijk die er is:
+// de server heeft het IP aan onze MAC vergeven, wij rapporteren "geen server
+// antwoordde", en de operator gaat naar zijn router kijken terwijl de lease daar
+// gewoon staat. De grace-drain is wél begrensd, want op een druk segment blijft
+// de ring vollopen en zou "leegmaken" nooit klaar zijn.
 //
 // De fout van Receive gaat MEE naar boven. Hij werd hier weggegooid, en dat maakte
 // van elke kapotte NIC een "geen DHCP-server": drie seconden stil pollen op een
@@ -238,28 +165,44 @@ func (l Lease) renewAfter() time.Duration {
 // RX-fout is bovendien niet per definitie fataal (een enkel frame kan best
 // afketsen), dus de ronde loopt door en de LAATSTE fout gaat mee — de aanroeper
 // kiest of hij hem noemt.
-func await(nic NIC, mac [6]byte, xid uint32, msgtype byte, deadline time.Time) (Lease, bool, error) {
-	window := time.Now().Add(3 * time.Second)
+func await(nic NIC, mac [6]byte, xid uint32, msgtype byte, deadline time.Time, least time.Duration) (Lease, bool, error) {
+	window := time.Now().Add(roundWindow)
 	if window.After(deadline) {
 		window = deadline
 	}
+	if floor := time.Now().Add(least); window.Before(floor) {
+		window = floor
+	}
 	buf := make([]byte, 1536)
 	var lastErr error
-	for time.Now().Before(window) {
+	for grace := graceFrames; ; {
 		n, err := nic.Receive(buf)
 		if err != nil {
 			lastErr = err
 		}
-		if n == 0 {
-			time.Sleep(time.Millisecond)
+		if n > 0 {
+			if l, ok := parse(buf[:n], mac, xid, msgtype); ok {
+				return l, true, nil
+			}
+		}
+		if !time.Now().Before(window) {
+			if n == 0 || grace == 0 {
+				return Lease{}, false, lastErr
+			}
+			grace-- // het window is dicht, maar er lág nog een frame: doorlezen
 			continue
 		}
-		if l, ok := parse(buf[:n], mac, xid, msgtype); ok {
-			return l, true, nil
+		if n == 0 {
+			time.Sleep(time.Millisecond)
 		}
 	}
-	return Lease{}, false, lastErr
 }
+
+// graceFrames begrenst hoeveel frames await na het sluiten van zijn window nog
+// uit de ring haalt. Ruim voor het handjevol frames dat op een normaal segment
+// naast ons antwoord staat, en klein genoeg dat een broadcast-storm de
+// bring-up niet kan ophouden.
+const graceFrames = 64
 
 // packet bouwt één DHCP-frame: ethernet-broadcast, IPv4 0.0.0.0 →
 // 255.255.255.255, UDP 68→67 (checksum 0 = uit, mag bij IPv4), BOOTP met
@@ -308,7 +251,7 @@ func bootp(mac [6]byte, xid uint32, msgtype byte, ciaddr [4]byte, bcast bool, ex
 	copy(bp[12:16], ciaddr[:]) // ciaddr: gezet bij RENEW (RFC 2131 §4.3.2)
 	copy(bp[28:34], mac[:])
 	copy(bp[236:240], []byte{99, 130, 83, 99}) // DHCP-magic
-	o := append([]byte{53, 1, msgtype, 55, 5, 1, 3, 6, 51, 58}, extra...)
+	o := append([]byte{53, 1, msgtype, 55, 6, 1, 3, 6, 51, 58, 59}, extra...)
 	copy(bp[240:], append(o, 255))
 	return bp
 }
@@ -402,6 +345,10 @@ func parseBootp(bp []byte, mac [6]byte, xid uint32, msgtype byte) (Lease, bool) 
 		case 58: // T1 (renew-tijd)
 			if ln >= 4 {
 				l.T1Secs = be32(d)
+			}
+		case 59: // T2 (rebind-tijd)
+			if ln >= 4 {
+				l.T2Secs = be32(d)
 			}
 		}
 		i += 2 + ln

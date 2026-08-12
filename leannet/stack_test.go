@@ -1148,3 +1148,97 @@ func TestStackRSTStormResistance(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 }
+
+// TestStackBroadcastGaatNaarFFFF: een datagram aan 255.255.255.255 of aan het
+// subnet-broadcastadres gaat naar ff:ff:ff:ff:ff:ff en lokt GEEN ARP uit. Dit
+// is het pad van een DHCP-rebind (RFC 2131 §4.4.5): als de lessor weg is, is
+// broadcast de enige manier om de lease te houden. Vóór deze regel ging een
+// limited broadcast als unicast naar de gateway en ARP'de een subnet-broadcast
+// zich vijf keer dood.
+func TestStackBroadcastGaatNaarFFFF(t *testing.T) {
+	for _, tc := range []struct {
+		naam string
+		dst  [4]byte
+	}{
+		{"limited", [4]byte{255, 255, 255, 255}},
+		{"subnet-directed", [4]byte{10, 0, 0, 255}},
+	} {
+		t.Run(tc.naam, func(t *testing.T) {
+			da, db := &memDevice{}, &memDevice{}
+			da.peer, db.peer = db, da
+			s := NewStack(da, Config{
+				IP: [4]byte{10, 0, 0, 1}, Prefix: 24, MAC: [6]byte{2, 0, 0, 0, 0, 1},
+				GW: [4]byte{10, 0, 0, 254}, Budget: 1 << 20,
+			}, 7)
+			t.Cleanup(s.Close)
+
+			u, err := s.ListenUDP(68)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := u.WriteTo([]byte("REQUEST"), &net.UDPAddr{IP: net.IP(tc.dst[:]), Port: 67}); err != nil {
+				t.Fatalf("broadcast weigerde: %v", err)
+			}
+
+			var seen bool
+			deadline := time.Now().Add(2 * time.Second)
+			for !seen && time.Now().Before(deadline) {
+				for _, fr := range drainWire(db) {
+					f, err := ParseEth(fr)
+					if err != nil {
+						continue
+					}
+					if f.EtherType() == EtherTypeARP {
+						a, err := ParseARP(f.Payload())
+						if err == nil && a.Op() == ARPRequest {
+							t.Fatalf("stack ARP'de voor %v — een broadcastadres bezit niemand", a.TargetProto())
+						}
+						continue
+					}
+					if f.EtherType() != EtherTypeIPv4 {
+						continue
+					}
+					ip, err := ParseIPv4(f.Payload())
+					if err != nil || ip.Proto() != ProtoUDP || ip.Dst() != tc.dst {
+						continue
+					}
+					if [6]byte(f.Dst()) != bcastMAC {
+						t.Fatalf("broadcast ging naar %x, want ff:ff:ff:ff:ff:ff", f.Dst())
+					}
+					seen = true
+				}
+				time.Sleep(5 * time.Millisecond)
+			}
+			if !seen {
+				t.Fatal("geen broadcast-datagram op de draad")
+			}
+		})
+	}
+}
+
+// TestIsBroadcastIP dekt de randen die de routelaag zelf niet laat zien: een
+// /31 en /32 hebben GEEN broadcastadres (RFC 3021), en een adres met alle
+// hostbits aan in een ánder subnet is gewoon een unicast-adres elders.
+func TestIsBroadcastIP(t *testing.T) {
+	ip := [4]byte{10, 0, 0, 1}
+	for _, tc := range []struct {
+		dst    [4]byte
+		prefix int
+		want   bool
+	}{
+		{[4]byte{255, 255, 255, 255}, 24, true},
+		{[4]byte{255, 255, 255, 255}, 32, true}, // limited kan altijd
+		{[4]byte{10, 0, 0, 255}, 24, true},
+		{[4]byte{10, 0, 255, 255}, 16, true},
+		{[4]byte{10, 0, 0, 255}, 16, false}, // hostbits niet allemaal aan
+		{[4]byte{10, 0, 0, 2}, 24, false},
+		{[4]byte{10, 0, 1, 255}, 24, false}, // broadcast van een ánder subnet
+		{[4]byte{10, 0, 0, 1}, 31, false},   // /31: geen broadcast (RFC 3021)
+		{[4]byte{10, 0, 0, 1}, 32, false},   // /32: idem
+		{[4]byte{192, 168, 1, 255}, 24, false},
+	} {
+		if got := isBroadcastIP(tc.dst, ip, tc.prefix); got != tc.want {
+			t.Errorf("isBroadcastIP(%v, /%d) = %v, want %v", tc.dst, tc.prefix, got, tc.want)
+		}
+	}
+}

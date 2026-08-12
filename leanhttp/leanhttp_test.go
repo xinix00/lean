@@ -391,3 +391,286 @@ func rauweServer(t *testing.T, antwoord string) string {
 	}()
 	return "http://" + ln.Addr().String()
 }
+
+// TestResponseURLNaRedirect: de URL waar het antwoord vandaan komt, niet de URL
+// die je vroeg. Zonder dit lost een browser elke relatieve link op een verhuisde
+// pagina tegen het oude pad op — en verhuizen doet het halve web (http→https,
+// /pad→/pad/).
+func TestResponseURLNaRedirect(t *testing.T) {
+	var srv *httptest.Server
+	srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/start":
+			http.Redirect(w, r, "/hier/", http.StatusFound)
+		default:
+			w.Write([]byte("aangekomen"))
+		}
+	}))
+	defer srv.Close()
+
+	resp, err := Do(Call{URL: srv.URL + "/start"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if want := srv.URL + "/hier/"; resp.URL != want {
+		t.Errorf("Response.URL = %q, want %q", resp.URL, want)
+	}
+}
+
+// TestNoFollowGeeftDe3xx: wie een cookie-jar heeft moet de keten zelf aflopen,
+// want op elke stap kan een Set-Cookie staan die de volgende stap nodig heeft.
+// Do kan die stap niet zetten, dus moet hij de 3xx kunnen teruggeven.
+func TestNoFollowGeeftDe3xx(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/start" {
+			http.SetCookie(w, &http.Cookie{Name: "consent", Value: "1", Path: "/"})
+			http.Redirect(w, r, "/verder", http.StatusFound)
+			return
+		}
+		w.Write([]byte("niet hier komen"))
+	}))
+	defer srv.Close()
+
+	resp, err := Do(Call{URL: srv.URL + "/start", NoFollow: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != StatusFound {
+		t.Fatalf("StatusCode = %d, want 302 — NoFollow volgde alsnog", resp.StatusCode)
+	}
+	if got := resp.Header.Get("Location"); got != "/verder" {
+		t.Errorf("Location = %q", got)
+	}
+	if len(resp.SetCookie) != 1 {
+		t.Fatalf("SetCookie = %v — de cookie van de 3xx-stap hoort hier te zijn", resp.SetCookie)
+	}
+	if resp.URL != srv.URL+"/start" {
+		t.Errorf("Response.URL = %q, want de gevraagde URL", resp.URL)
+	}
+}
+
+// TestBodyReaderStreamt: een upload gaat als stroom de deur uit, met de
+// Content-Length die de aanroeper belooft. Dit is de vorm die een
+// object-store-upload nodig heeft: een app-image door []byte duwen betekent hem
+// in het geheugen hebben op een node die 64MB heeft.
+func TestBodyReaderStreamt(t *testing.T) {
+	const payload = "dit-zijn-de-bytes-van-een-artifact"
+	var gotLen string
+	var got []byte
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotLen = r.Header.Get("Content-Length")
+		got, _ = io.ReadAll(r.Body)
+		w.WriteHeader(http.StatusCreated)
+	}))
+	defer srv.Close()
+
+	resp, err := Do(Call{
+		Method:     "PUT",
+		URL:        srv.URL + "/object",
+		BodyReader: strings.NewReader(payload),
+		BodyLen:    int64(len(payload)),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != StatusCreated {
+		t.Errorf("status = %d", resp.StatusCode)
+	}
+	if string(got) != payload {
+		t.Errorf("server kreeg %q, want %q", got, payload)
+	}
+	if gotLen != fmt.Sprint(len(payload)) {
+		t.Errorf("Content-Length = %q, want %d", gotLen, len(payload))
+	}
+}
+
+// TestBodyReaderTeKort: een reader die minder levert dan de Content-Length
+// belooft, laat de server op de rest wachten en de verbinding hangen. Dat is
+// hier een fout, geen korte upload.
+func TestBodyReaderTeKort(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.Copy(io.Discard, r.Body)
+	}))
+	defer srv.Close()
+
+	_, err := Do(Call{
+		Method:     "PUT",
+		URL:        srv.URL + "/object",
+		BodyReader: strings.NewReader("kort"),
+		BodyLen:    100,
+	})
+	if err == nil {
+		t.Fatal("een te korte stroom werd geaccepteerd")
+	}
+	if !strings.Contains(err.Error(), "stream body") {
+		t.Errorf("err = %v — hij hoort te zeggen waar het misging", err)
+	}
+}
+
+// TestBodyReaderEnBodySamen: twee bodies is een programmeerfout, en die hoort
+// luid te falen in plaats van er stil één te kiezen.
+func TestBodyReaderEnBodySamen(t *testing.T) {
+	_, err := Do(Call{
+		Method:     "PUT",
+		URL:        "http://127.0.0.1:1/x",
+		Body:       []byte("a"),
+		BodyReader: strings.NewReader("b"),
+		BodyLen:    1,
+	})
+	if err == nil || !strings.Contains(err.Error(), "not both") {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+// TestBodyReaderVolgtGeenRedirect: een stroom is niet opnieuw te versturen, dus
+// de 3xx komt bij de aanroeper terecht in plaats van dat Do hem stil volgt met
+// een lege body.
+func TestBodyReaderVolgtGeenRedirect(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/oud" {
+			http.Redirect(w, r, "/nieuw", http.StatusFound)
+			return
+		}
+		t.Error("Do volgde de redirect met een gestroomde body")
+	}))
+	defer srv.Close()
+
+	resp, err := Do(Call{
+		Method:     "PUT",
+		URL:        srv.URL + "/oud",
+		BodyReader: strings.NewReader("data"),
+		BodyLen:    4,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != StatusFound {
+		t.Errorf("status = %d, want 302", resp.StatusCode)
+	}
+}
+
+// TestHeaderTimeoutRaaktBodyNiet: een download wil géén totaaltermijn (die kapt
+// een groot bestand af) maar ook niet oneindig wachten op een server die de
+// verbinding aanneemt en dan zwijgt. Dat zijn twee deadlines, en de tweede mag
+// de eerste niet opeten.
+func TestHeaderTimeoutRaaktBodyNiet(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", "4")
+		w.WriteHeader(http.StatusOK)
+		w.(http.Flusher).Flush()
+		// De kop is er ruim binnen de grens; de body komt láng daarna. Zonder
+		// het terugzetten van de deadline zou dit de download doden.
+		time.Sleep(400 * time.Millisecond)
+		w.Write([]byte("data"))
+	}))
+	defer srv.Close()
+
+	resp, err := Do(Call{URL: srv.URL, HeaderTimeout: 150 * time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("de body liep op de kop-grens stuk: %v", err)
+	}
+	if string(body) != "data" {
+		t.Errorf("body = %q", body)
+	}
+}
+
+// TestHeaderTimeoutSlaatToe: een server die aanneemt en zwijgt loopt op de
+// kop-grens vast in plaats van eeuwig te hangen.
+func TestHeaderTimeoutSlaatToe(t *testing.T) {
+	l, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	go func() {
+		c, err := l.Accept()
+		if err != nil {
+			return
+		}
+		defer c.Close()
+		time.Sleep(5 * time.Second) // aannemen en zwijgen
+	}()
+
+	start := time.Now()
+	_, err = Do(Call{URL: "http://" + l.Addr().String() + "/", HeaderTimeout: 200 * time.Millisecond})
+	if err == nil {
+		t.Fatal("een zwijgende server gaf toch een antwoord")
+	}
+	if d := time.Since(start); d > 3*time.Second {
+		t.Errorf("Do wachtte %v op een kop-grens van 200ms", d)
+	}
+}
+
+// TestBodylessStatusBlokkeertNiet is de regel van RFC 9112 §6.3 aan de
+// CLIENTkant: 204 en 304 hebben geen body, ook niet als de server een lengte of
+// een Transfer-Encoding meestuurt. Zonder die regel valt zo'n antwoord in het
+// "tot EOF"-geval, en op een keep-alive-verbinding komt dat EOF pas als de
+// server zijn idle-timeout haalt — dus bleef élke DELETE staan (gevonden door
+// leans3: S3 én hoplockserver antwoorden met 204).
+func TestBodylessStatusBlokkeertNiet(t *testing.T) {
+	for _, code := range []int{StatusNoContent, 304} {
+		// Een server die de verbinding OPENHOUDT: valt de client terug op
+		// "lees tot EOF", dan hangt hij hier tot de test omvalt.
+		l, err := net.Listen("tcp4", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		go func() {
+			c, err := l.Accept()
+			if err != nil {
+				return
+			}
+			defer c.Close()
+			bufio.NewReader(c).ReadString('\n') // verzoekregel wegnemen
+			fmt.Fprintf(c, "HTTP/1.1 %d Geen\r\nConnection: keep-alive\r\n\r\n", code)
+			time.Sleep(3 * time.Second) // openhouden
+		}()
+
+		done := make(chan error, 1)
+		go func() {
+			resp, err := Do(Call{Method: "DELETE", URL: "http://" + l.Addr().String() + "/x"})
+			if err != nil {
+				done <- err
+				return
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode != code {
+				done <- fmt.Errorf("status = %d, want %d", resp.StatusCode, code)
+				return
+			}
+			b, err := io.ReadAll(resp.Body)
+			if err != nil {
+				done <- err
+				return
+			}
+			if len(b) != 0 {
+				done <- fmt.Errorf("body = %q, want leeg", b)
+				return
+			}
+			if resp.Length != 0 {
+				done <- fmt.Errorf("Length = %d, want 0", resp.Length)
+				return
+			}
+			done <- nil
+		}()
+
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Errorf("status %d: %v", code, err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Errorf("status %d: de body bleef hangen op een verbinding die openbleef", code)
+		}
+		l.Close()
+	}
+}

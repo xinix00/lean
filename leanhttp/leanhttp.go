@@ -57,6 +57,7 @@ package leanhttp
 import (
 	"bufio"
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -145,6 +146,29 @@ type Call struct {
 	Body    []byte        // nil = geen body
 	Timeout time.Duration // totaaltermijn incl. body-lezen; 0 = geen (blijvende streams)
 
+	// HeaderTimeout begrenst ALLEEN het wachten op de antwoordkop, niet de body.
+	//
+	// Die twee zijn verschillende vragen, en een download laat dat zien: een
+	// artifact van 30MB wil géén totaaltermijn (die kapt het bestand af) maar ook
+	// niet oneindig wachten op een server die de verbinding aanneemt en dan
+	// zwijgt. Eén deadline kan dat niet, dus zijn het twee velden. 0 = geen
+	// aparte grens.
+	HeaderTimeout time.Duration
+
+	// BodyReader stuurt de body als STROOM in plaats van als []byte, en dan is
+	// BodyLen verplicht (dit pakket chunkt niet: een Content-Length is de hele
+	// afspraak met de server). Body en BodyReader sluiten elkaar uit.
+	//
+	// Waarom dit bestaat: een object-store-upload is de ene body die niet in het
+	// geheugen hoort. Een app-image door []byte duwen betekent hem twee keer in
+	// het geheugen hebben op een node die 64MB heeft — precies de OOM die HopOS
+	// op 11-08 al eens doodde. Een stroom kost één buffer, ongeacht de maat.
+	//
+	// Een gestroomde body kan niet opnieuw verstuurd worden, dus [Do] volgt geen
+	// redirect: de 3xx komt bij de aanroeper terecht, net als bij Body.
+	BodyReader io.Reader
+	BodyLen    int64
+
 	// Dial maakt de verbinding. nil = net.DialTimeout op tcp4, en dan blijft
 	// dit pakket wat het is: plain http zonder één byte TLS.
 	//
@@ -159,6 +183,16 @@ type Call struct {
 	// andere host wordt Dial opnieuw geroepen met die nieuwe host — wie SNI uit
 	// addr haalt, volgt dus automatisch mee.
 	Dial func(network, addr string) (net.Conn, error)
+
+	// NoFollow geeft de 3xx aan de aanroeper in plaats van hem te volgen.
+	//
+	// Wie een cookie-jar heeft MOET dit zetten. Redirects volgen is namelijk
+	// niet één ronde maar een keten, en op elke stap kan een Set-Cookie staan
+	// die de vólgende stap nodig heeft — dat is precies hoe een consent- of
+	// login-muur werkt. [Do] kent geen jar en kan die stap dus niet zetten;
+	// wie er wel een heeft, loopt de keten zelf af en past per stap zijn
+	// cookies toe.
+	NoFollow bool
 
 	// keepAlive wordt door [Client] gezet: dan vraagt het verzoek om een
 	// verbinding die blijft staan, en geeft de body hem terug aan de pool.
@@ -177,6 +211,12 @@ type Response struct {
 	Header     Header
 	Body       io.ReadCloser
 	Length     int64
+
+	// URL is de URL waar dit antwoord vandaan kwam: ná de redirects, dus niet
+	// per se de URL die je vroeg. Wie iets relatiefs oplost tegen de aangevraagde
+	// URL in plaats van tegen deze, mist elke link op een pagina die verhuisd is
+	// — en dat is de helft van het web (http→https, /pad→/pad/).
+	URL string
 
 	// Encoding is de Content-Encoding van het antwoord ("" = geen). Dit pakket
 	// pakt niets uit; wie Accept-Encoding zet, leest hier wat hij terugkreeg en
@@ -229,8 +269,9 @@ func GetCall(c Call) (*Response, error) {
 // Do voert één verzoek uit en geeft het antwoord — óók een 404 of een 500: een
 // foutstatus is geen transportfout, de aanroeper leest hem zelf (en zijn body,
 // die vaak zegt wat er mis is). Redirects worden gevolgd zolang het verzoek
-// geen body heeft; met body krijgt de aanroeper de 3xx zelf te zien, want een
-// POST opnieuw afvuren op een ander pad is niet aan dit pakket.
+// geen body heeft; met body (of BodyReader) krijgt de aanroeper de 3xx zelf te
+// zien, want een POST opnieuw afvuren op een ander pad is niet aan dit pakket —
+// en een stroom is niet eens opnieuw te versturen.
 func Do(c Call) (*Response, error) {
 	loc := c.URL
 	for range maxRedirects + 1 {
@@ -239,7 +280,7 @@ func Do(c Call) (*Response, error) {
 			return nil, err
 		}
 		next := ""
-		if c.Body == nil && resp.StatusCode >= 300 && resp.StatusCode < 400 {
+		if c.Body == nil && c.BodyReader == nil && !c.NoFollow && resp.StatusCode >= 300 && resp.StatusCode < 400 {
 			next = resp.Header.Get("Location")
 		}
 		if next == "" {
@@ -320,12 +361,35 @@ func do(c Call, raw string) (_ *Response, err error) {
 	// De termijn dekt álles tot en met het lezen van de body — dat is wat een
 	// aanroeper met een timeout bedoelt. Geen timeout = een blijvende stream
 	// (een SSE-staart hoort niet af te lopen).
+	// total is het ENE moment waarop de hele call om is (nulwaarde = nooit). De
+	// kop mag daarbinnen zijn eigen, kortere grens hebben; na de kop gaat de
+	// deadline terug naar total, zodat de body de RESTERENDE tijd krijgt en niet
+	// een verse termijn.
+	var total time.Time
 	if c.Timeout > 0 {
-		conn.SetDeadline(time.Now().Add(c.Timeout))
+		total = time.Now().Add(c.Timeout)
+		conn.SetDeadline(total)
+	}
+	if c.HeaderTimeout > 0 {
+		if head := time.Now().Add(c.HeaderTimeout); total.IsZero() || head.Before(total) {
+			conn.SetDeadline(head)
+		}
 	}
 
 	if _, err := conn.Write(req); err != nil {
 		return nil, fmt.Errorf("leanhttp: write request: %w", err)
+	}
+	if c.BodyReader != nil {
+		// Precies BodyLen bytes: dat is wat de Content-Length de server belooft.
+		// Een reader die minder levert laat de server op de rest wachten en de
+		// verbinding hangen — dus dat is hier een fout, niet een korte upload.
+		n, err := io.CopyN(conn, c.BodyReader, c.BodyLen)
+		switch {
+		case err != nil:
+			return nil, fmt.Errorf("leanhttp: stream body after %d of %d bytes: %w", n, c.BodyLen, err)
+		case n != c.BodyLen:
+			return nil, fmt.Errorf("leanhttp: BodyReader gave %d bytes, Content-Length promised %d", n, c.BodyLen)
+		}
 	}
 	if len(c.Body) > 0 {
 		if _, err := conn.Write(c.Body); err != nil {
@@ -397,12 +461,30 @@ func do(c Call, raw string) (_ *Response, err error) {
 	// beide is smokkel-verdacht, dus de lengte gaat overboord.
 	var rd io.Reader
 	switch {
+	case !bodyAllowed(code):
+		// 204 en 304 hebben per definitie geen body (RFC 9112 §6.3), ook niet
+		// als de server een lengte of Transfer-Encoding meestuurde. Zonder deze
+		// regel valt zo'n antwoord in het "tot EOF"-geval hieronder, en op een
+		// keep-alive-verbinding komt dat EOF pas als de server zijn idle-timeout
+		// haalt. GEMETEN 12-08 door leans3: een S3-DELETE en een
+		// hoplockserver-DELETE antwoorden béide met 204, dus élke delete bleef
+		// staan tot de tegenpartij hem verveeld dichtgooide (in de test: een
+		// `go test` die zijn eigen timeout haalde). De serverkant kende deze
+		// regel al; de clientkant niet.
+		rd, length, chunked = emptyBody{}, 0, false
 	case chunked:
 		rd, length = &chunkReader{br: br}, -1
 	case length >= 0:
 		rd = io.LimitReader(br, length)
 	default:
 		rd = br // geen lengte, geen chunks: de body loopt tot EOF
+	}
+
+	// De kop is binnen: terug naar de totaal-deadline. Is die er niet (total is
+	// de nulwaarde), dan wist dit de deadline en mag de body zo lang duren als
+	// hij duurt — een artifact van 30MB hoort niet af te lopen.
+	if c.HeaderTimeout > 0 {
+		conn.SetDeadline(total)
 	}
 
 	// Hergebruik mag alleen als we het einde van de body kunnen vinden EN de
@@ -422,6 +504,7 @@ func do(c Call, raw string) (_ *Response, err error) {
 		Header:     hdr,
 		Body:       &b,
 		Length:     length,
+		URL:        raw,
 		Encoding:   hdr.Get("Content-Encoding"),
 		SetCookie:  setCookie,
 		chunked:    chunked,
@@ -452,7 +535,15 @@ func requestBytes(c Call, u *url.URL) ([]byte, error) {
 	// Host zonder poort-default, net als net/http.
 	fmt.Fprintf(&b, "%s %s HTTP/1.1\r\nHost: %s\r\nAccept-Encoding: %s\r\nConnection: %s\r\n",
 		method, u.RequestURI(), u.Host, enc, conn)
-	if c.Body != nil {
+	switch {
+	case c.Body != nil && c.BodyReader != nil:
+		return nil, errors.New("leanhttp: set Body or BodyReader, not both")
+	case c.BodyReader != nil:
+		if c.BodyLen < 0 {
+			return nil, errors.New("leanhttp: BodyReader needs a BodyLen (this package does not chunk uploads)")
+		}
+		fmt.Fprintf(&b, "Content-Length: %d\r\n", c.BodyLen)
+	case c.Body != nil:
 		fmt.Fprintf(&b, "Content-Length: %d\r\n", len(c.Body))
 	}
 	for k, v := range c.Header {

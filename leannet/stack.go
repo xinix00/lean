@@ -227,6 +227,22 @@ func sameSubnet(a, b [4]byte, prefix int) bool {
 	return au&mask == bu&mask
 }
 
+// isBroadcastIP rapporteert of dst een broadcast-adres is: 255.255.255.255
+// (limited) of het adres met alle hostbits aan in ons eigen subnet (directed).
+// Bij /31 en /32 bestaat er geen broadcastadres (RFC 3021).
+func isBroadcastIP(dst, ip [4]byte, prefix int) bool {
+	if dst == bcastIP {
+		return true
+	}
+	if prefix >= 31 {
+		return false
+	}
+	du := uint32(dst[0])<<24 | uint32(dst[1])<<16 | uint32(dst[2])<<8 | uint32(dst[3])
+	ou := uint32(ip[0])<<24 | uint32(ip[1])<<16 | uint32(ip[2])<<8 | uint32(ip[3])
+	mask := ^uint32(0) << (32 - uint32(prefix))
+	return du&mask == ou&mask && du&^mask == ^mask
+}
+
 // ---- ingress ----
 
 // RecvInboundPacket verwerkt één rauw ethernet-frame. Veilig voor rommel: te
@@ -539,7 +555,7 @@ func (s *Stack) drainLocked() (again bool) {
 			break
 		}
 		f, _ := ParseARP(s.txBuf[EthernetHeaderSize : EthernetHeaderSize+n])
-		dst := [6]byte{0xff, 0xff, 0xff, 0xff, 0xff, 0xff}
+		dst := bcastMAC
 		if f.Op() == ARPReply {
 			dst = [6]byte(f.TargetHW())
 		}
@@ -634,6 +650,19 @@ func (s *Stack) routeLocked(dst [4]byte, now int64) ([6]byte, bool) {
 	// lagen weg van de oorzaak. Zie sendEthLocked voor de loopback-naad.
 	if dst == s.cfg.IP {
 		return s.cfg.MAC, true
+	}
+	// Broadcast gaat naar ff:ff:ff:ff:ff:ff en wordt nooit geARP't. Zonder deze
+	// regel deed de routelaag er iets stils-fouts mee: 255.255.255.255 valt
+	// buiten élk subnet, dus ging het als UNICAST naar de gateway (die het
+	// terecht negeert), en een subnet-gericht adres (x.x.x.255) ging de
+	// ARP-molen in naar een adres dat niemand bezit — vijf pogingen, dan "no
+	// route to host". De gebruiker vandaag is een DHCP-rebind (RFC 2131
+	// §4.4.5): als de lessor verdwijnt is broadcast de enige manier om de lease
+	// te houden, en dan is een fout hier het verschil tussen doorleven en het
+	// IP verliezen. Ingress blijft broadcast-IP's negeren (zie ingressLocked):
+	// het antwoord op een rebind komt unicast op ciaddr terug.
+	if isBroadcastIP(dst, s.cfg.IP, s.cfg.Prefix) {
+		return bcastMAC, true
 	}
 	if !sameSubnet(dst, s.cfg.IP, s.cfg.Prefix) {
 		if s.hasGwMAC {
