@@ -5,7 +5,6 @@ package leans3
 
 import (
 	"context"
-	"encoding/xml"
 	"errors"
 	"fmt"
 	"io"
@@ -244,14 +243,18 @@ func putHeader(opt *PutOptions) leanhttp.Header {
 }
 
 // listBucketResult is het deel van het ListObjectsV2-antwoord dat dit pakket
-// leest. encoding/xml matcht op lokale elementnamen, dus de namespace van het
-// S3-document hoeft geen aandacht.
+// leest; listparse.go haalt het uit de XML. De namespace van het S3-document
+// hoeft geen aandacht: er wordt op lokale elementnaam gematcht.
 type listBucketResult struct {
-	IsTruncated           bool   `xml:"IsTruncated"`
-	NextContinuationToken string `xml:"NextContinuationToken"`
-	Contents              []struct {
-		Key string `xml:"Key"`
-	} `xml:"Contents"`
+	IsTruncated           bool
+	NextContinuationToken string
+	Contents              []listEntry
+}
+
+// listEntry is één object in een pagina. Alleen de key: zie [Client.List] voor
+// waarom dat het antwoord is en niet een keuze die dit pakket maakt.
+type listEntry struct {
+	Key string
 }
 
 // List geeft de keys van elk object waarvan de key met prefix begint, in de
@@ -321,9 +324,9 @@ func (c *Client) listPage(ctx context.Context, prefix, token string) (*listBucke
 	if err != nil {
 		return nil, fmt.Errorf("leans3: read LIST %s body: %w", prefix, err)
 	}
-	var page listBucketResult
-	if err := xml.Unmarshal(body, &page); err != nil {
-		return nil, fmt.Errorf("leans3: parse LIST %s response: %w", prefix, err)
+	page, err := parseListPage(body)
+	if err != nil {
+		return nil, fmt.Errorf("parse LIST %s response: %w", prefix, err)
 	}
-	return &page, nil
+	return page, nil
 }

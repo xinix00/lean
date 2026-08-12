@@ -147,11 +147,58 @@ RGW gelopen — maar hij staat hier voor het eerst als blok.
 - [ ] **Niet op ijzer geweest** in deze vorm. hoplock/s3 en HopOS bouwen erop en
       de host-tests zijn groen, maar sinds de verhuizing heeft er geen echte
       provider aan de andere kant gestaan.
+- [x] **`encoding/xml` eruit** (12-08). Het antwoord op een LIST is XML en dit
+      pakket leest er drie velden uit; die decoder kostte 39.256 bytes symbolen
+      en 85.681 bytes image (kern, arm64) voor een reflectie-gedreven tokenmodel
+      met namespaces. `listparse.go` doet het in één pas, matcht op lokale
+      elementnaam én positie (`Key` onder `Contents`, niet die in
+      `CommonPrefixes`), en kent de vijf entiteiten plus de numerieke. De testen
+      leggen elk antwoord naast `encoding/xml` — inclusief élk afkap-punt van een
+      echt MinIO-antwoord, want een afgekapte pagina die op een complete lijkt is
+      de ene fout die keys kost.
 - [ ] Bewust NIET: streaming signatures (STREAMING-AWS4-HMAC-SHA256-PAYLOAD),
       multipart upload, presigned URL's, sigv4a, credentials uit IMDS/IAM,
       HEAD/CopyObject. Voor dat laatste is `Client.URLFor` de naad: wie een
       operatie nodig heeft die hier niet in zit, signeert hem zelf op de juiste
       URL in plaats van de adresseringsstijl na te bouwen.
+
+## leanelf (nieuw 12-08)
+
+Gebouwd omdat `hop-os/metal/abi/place` de énige importeur van `debug/elf` in de
+kern was, en dat pakket `debug/dwarf` + `internal/zstd` + `compress/zlib`
+meebracht voor gecomprimeerde debug-secties die een loader nooit leest. Meting
+staat in de pakket-doc: 166.397 bytes minder image, zelfde plaatsing.
+
+- [x] Kruisgetest tégen `debug/elf`: de testen bouwen ELF64's en eisen dat beide
+      hetzelfde zeggen over segmenten, symbolen en machine. Wijkt het af op een
+      geldig image, dan is dit pakket fout.
+- [x] `Lookup` in plaats van een volledige symbooldump: `place` zoekt vijf namen,
+      en een app-image draagt tienduizenden symbolen. Geen enkele string wordt
+      gebouwd voor een naam die niemand vroeg.
+- [ ] **Niet op ijzer geweest.** De QEMU-gate plaatst er images mee (host-tests
+      van `abi/place` groen, kern boot), maar een echt board heeft er nog geen
+      image mee geplaatst.
+- [ ] Bewust NIET: 32-bit, big-endian, secties op naam, relocaties, DWARF, en
+      een volledige symbooldump. Alle vier weigeren ze luid. Wie er één nodig
+      heeft, voegt hem toe mét de meting die aantoont dat de afwezigheid iets
+      kost — precies zoals dit pakket zelf ontstond.
+
+## leanrand (nieuw 12-08)
+
+Vervangt `github.com/google/uuid` in hop: dat kostte 3,8 KB symbolen én sleepte
+`database/sql/driver` de kern in (het implementeert `sql.Scanner`) voor twee
+aanroepen `uuid.New().String()`, waarvan één afgekapt op acht tekens.
+
+- [x] `N` doet rejection sampling in plaats van `%`: geen bias, ook bij een
+      grens net boven 2⁶³ (getest over het hele bereik).
+- [x] `Read` heeft geen foutwaarde. `crypto/rand.Read` faalt niet meer (Go's
+      eigen doc), dus élke `if err != nil` erop is een ongeteste tak; hier is
+      het een panic, want een node zonder entropie heeft geen zinnig vervolg.
+- [x] `Jitter` erbij omdat hop's herstart-backoff exact 1, 2, 4, 8 seconden
+      wachtte: honderd nodes proberen dan precies gelijk opnieuw.
+- [ ] Bewust NIET: een eigen generator, een seed, een reproduceerbare stroom
+      voor testen (die hoort in de test), en geen UUID-formaat — 36 tekens om
+      16 bytes te schrijven, waarvan wij de structuur nergens lezen.
 
 ## leancookie (nieuw 12-08)
 
