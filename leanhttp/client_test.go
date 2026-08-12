@@ -1,12 +1,14 @@
 package leanhttp
 
 import (
+	"bufio"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -236,5 +238,91 @@ func TestSetCookieNietGevouwen(t *testing.T) {
 	// En ze staan NIET in Header, want daar zouden ze gevouwen zijn.
 	if got := resp.Header.Get("Set-Cookie"); got != "" {
 		t.Errorf("Set-Cookie staat óók in Header (%q) — daar kan hij alleen gevouwen staan", got)
+	}
+}
+
+// TestPoolNegeertHTTP10 is de derde bug uit dezelfde familie, en de duurste om
+// te vinden: HTTP/1.0 heeft de OMGEKEERDE default. Daar sluit de server tenzij
+// hij expliciet keep-alive zegt (RFC 9112 §9.3), terwijl 1.1 openhoudt tenzij hij
+// close zegt.
+//
+// GEMETEN 12-08 op een echte node: Python's http.server — waar half de wereld
+// zijn artifacts mee serveert — spreekt 1.0 en stuurt een nette Content-Length
+// zonder Connection-header. Dat zag er hier uit als een herbruikbare verbinding,
+// dus ging hij de pool in, en élke tweede download viel om met
+// "read status line: EOF". Op de server bleven verbindingen staan die niemand
+// meer las.
+func TestPoolNegeertHTTP10(t *testing.T) {
+	for _, tc := range []struct {
+		naam       string
+		statusLijn string
+		extra      string
+		wantConns  int
+	}{
+		{"1.0 zonder Connection", "HTTP/1.0 200 OK", "", 3},
+		{"1.0 mét keep-alive", "HTTP/1.0 200 OK", "Connection: keep-alive\r\n", 1},
+		{"1.1 zonder Connection", "HTTP/1.1 200 OK", "", 1},
+	} {
+		l, err := net.Listen("tcp4", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		var conns int
+		var mu sync.Mutex
+		go func() {
+			for {
+				c, err := l.Accept()
+				if err != nil {
+					return
+				}
+				mu.Lock()
+				conns++
+				mu.Unlock()
+				go func(c net.Conn) {
+					defer c.Close()
+					br := bufio.NewReader(c)
+					for {
+						// Kop wegnemen tot de lege regel.
+						for {
+							line, err := br.ReadString('\n')
+							if err != nil {
+								return
+							}
+							if strings.TrimSpace(line) == "" {
+								break
+							}
+						}
+						fmt.Fprintf(c, "%s\r\nContent-Length: 2\r\n%s\r\nok", tc.statusLijn, tc.extra)
+						// Een 1.0-server zonder keep-alive doet hierna wat 1.0
+						// voorschrijft: dicht.
+						if tc.wantConns > 1 {
+							return
+						}
+					}
+				}(c)
+			}
+		}()
+
+		var pool Client
+		for i := range 3 {
+			resp, err := pool.Do(Call{URL: "http://" + l.Addr().String() + "/x"})
+			if err != nil {
+				t.Fatalf("%s: verzoek %d: %v", tc.naam, i+1, err)
+			}
+			body, rerr := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			if rerr != nil || string(body) != "ok" {
+				t.Fatalf("%s: verzoek %d gaf %q (%v)", tc.naam, i+1, body, rerr)
+			}
+		}
+		pool.CloseIdle()
+		l.Close()
+
+		mu.Lock()
+		got := conns
+		mu.Unlock()
+		if got != tc.wantConns {
+			t.Errorf("%s: %d verbindingen voor 3 verzoeken, want %d", tc.naam, got, tc.wantConns)
+		}
 	}
 }

@@ -414,7 +414,7 @@ func do(c Call, raw string) (_ *Response, err error) {
 	if err != nil {
 		return nil, fmt.Errorf("leanhttp: read status line: %w", err)
 	}
-	code, err := statusCode(line)
+	code, proto, err := statusCode(line)
 	if err != nil {
 		return nil, err
 	}
@@ -490,7 +490,17 @@ func do(c Call, raw string) (_ *Response, err error) {
 	// Hergebruik mag alleen als we het einde van de body kunnen vinden EN de
 	// server de verbinding openhoudt. Zonder lengte en zonder chunks loopt de
 	// body tot EOF, en dan IS de verbinding het einde — die kan nooit terug.
-	reuse := c.keepAlive && (chunked || length >= 0) &&
+	//
+	// En het protocol beslist mee, want HTTP/1.0 heeft de omgekeerde default:
+	// dáár sluit de server tenzij hij expliciet keep-alive zegt (RFC 9112 §9.3).
+	// GEMETEN 12-08: Python's http.server spreekt 1.0 en stuurt een nette
+	// Content-Length zonder Connection-header, dus zag dit er precies uit als een
+	// herbruikbare verbinding. Gevolg op ijzer: élke tweede artifact-download van
+	// zo'n server viel om met "read status line: EOF", en op de server bleven
+	// verbindingen staan die niemand meer las.
+	keepAliveOK := proto != "HTTP/1.0" ||
+		strings.Contains(strings.ToLower(hdr.Get("Connection")), "keep-alive")
+	reuse := c.keepAlive && keepAliveOK && (chunked || length >= 0) &&
 		!strings.EqualFold(hdr.Get("Connection"), "close")
 
 	handedOff = true
@@ -585,18 +595,19 @@ func readLine(br *bufio.Reader, budget *int) (string, error) {
 	return strings.TrimRight(string(raw), "\r\n"), nil
 }
 
-// statusCode pelt de code uit "HTTP/1.1 200 OK".
-func statusCode(line string) (int, error) {
+// statusCode pelt code én protocol uit "HTTP/1.1 200 OK". Het protocol telt:
+// zie de hergebruik-regel in do.
+func statusCode(line string) (int, string, error) {
 	proto, rest, found := strings.Cut(line, " ")
 	if !found || !strings.HasPrefix(proto, "HTTP/") {
-		return 0, fmt.Errorf("leanhttp: malformed status line %q", line)
+		return 0, "", fmt.Errorf("leanhttp: malformed status line %q", line)
 	}
 	num, _, _ := strings.Cut(rest, " ")
 	code, err := strconv.Atoi(num)
 	if err != nil || code < 100 || code > 599 {
-		return 0, fmt.Errorf("leanhttp: malformed status line %q", line)
+		return 0, "", fmt.Errorf("leanhttp: malformed status line %q", line)
 	}
-	return code, nil
+	return code, proto, nil
 }
 
 // body koppelt de (eventueel ge-de-chunkte) lezer aan de verbinding, zodat
