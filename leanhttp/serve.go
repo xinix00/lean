@@ -103,13 +103,24 @@ type Request struct {
 	Body       io.Reader // nooit nil; begrensd op maxBodyBytes
 	RemoteAddr string
 
+	// ContentLength is de aangekondigde bodylengte, of -1 als er geen
+	// Content-Length was (chunked of geen body). Zelfde betekenis als bij
+	// net/http, zodat een handler die hem leest niets hoeft te weten van welke
+	// server eronder staat.
+	ContentLength int64
+
 	c         *conn
+	vals      map[string]string // door de Mux gevuld uit {wildcards}
 	query     url.Values
 	queryOnce sync.Once
 	doneOnce  sync.Once
 	done      chan struct{}
 	keepAlive bool
 }
+
+// PathValue geeft wat een {wildcard} in het gematchte patroon opving, of "" als
+// het patroon die naam niet had. Zie mux.go.
+func (r *Request) PathValue(name string) string { return r.vals[name] }
 
 // Query ontleedt de querystring (één keer, daarna gecachet).
 func (r *Request) Query() url.Values {
@@ -317,14 +328,15 @@ func readRequest(c *conn) (*Request, error) {
 	}
 
 	r := &Request{
-		Method:     method,
-		Path:       u.Path,
-		RawQuery:   u.RawQuery,
-		Proto:      proto,
-		Header:     hdr,
-		Body:       emptyBody{},
-		RemoteAddr: c.nc.RemoteAddr().String(),
-		c:          c,
+		ContentLength: -1, // geen Content-Length gezien; hieronder gezet als hij er is
+		Method:        method,
+		Path:          u.Path,
+		RawQuery:      u.RawQuery,
+		Proto:         proto,
+		Header:        hdr,
+		Body:          emptyBody{},
+		RemoteAddr:    c.nc.RemoteAddr().String(),
+		c:             c,
 	}
 	// HTTP/1.1 houdt de verbinding open tenzij iemand "close" zegt; 1.0 is
 	// andersom.
@@ -347,6 +359,7 @@ func readRequest(c *conn) (*Request, error) {
 			return nil, parseError{StatusRequestEntityTooLarge,
 				fmt.Sprintf("leanhttp: body of %d bytes exceeds the %d-byte limit", n, maxBodyBytes)}
 		}
+		r.ContentLength = n
 		r.Body = io.LimitReader(c.br, n)
 	}
 	return r, nil
