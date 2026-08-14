@@ -779,14 +779,25 @@ func (c *tcpConn) processAck(seg tcpSeg, now int64) (accept bool) {
 	// krijgt een reset <SEQ=SEG.ACK> en raakt de machine niet: vóór deze regel
 	// gold zo'n ACK als "levensteken" en hield hij via de retry-reset een
 	// embryo eeuwig vast (review 13-08).
-	if c.state == tcpSynRcvd && !(seqLT(c.una, ack) && seqLEQ(ack, c.nxt)) {
+	//
+	// De maat is maxSent, niet nxt: een dubbele SYN spoelt nxt terug naar iss
+	// (de SYN-ACK moet opnieuw), en als de finale ACK van de peer die
+	// hertransmissie vóór was — hij kruiste de dubbele SYN op de draad — dan
+	// wees ack ≤ nxt hem af en RESETTE deze regel de eigen handshake
+	// (review 13-08, eenendertigste ronde). maxSent rewindt nooit.
+	if c.state == tcpSynRcvd && !(seqLT(c.una, ack) && seqLEQ(ack, c.maxSent)) {
 		c.rst = pendingRST{seq: ack, set: true}
 		return false
 	}
 	switch {
-	case seqLT(c.nxt, ack):
-		// ACK voor iets dat we nog niet stuurden: bevestig onze werkelijkheid,
-		// en drop het hele segment (de aanroeper ziet accept=false).
+	case seqLT(c.maxSent, ack):
+		// ACK voor ruimte die we NOOIT verzonden: bevestig onze werkelijkheid,
+		// en drop het hele segment (de aanroeper ziet accept=false). De maat
+		// is maxSent, niet nxt: goBackN spoelt nxt (de retransmit-cursor)
+		// terug, en een geldige cumulatieve ACK die de pomp vóór was werd dan
+		// als "future" geweigerd — bij een gekrompen venster zelfs blijvend,
+		// want tot dat punt zenden kon niet meer (review 13-08,
+		// negenentwintigste ronde).
 		c.needAck = true
 		return false
 	case seqLT(ack, c.una):
@@ -880,10 +891,20 @@ func (c *tcpConn) processAck(seg tcpSeg, now int64) (accept bool) {
 		if dataAcked > c.tx.buffered() {
 			dataAcked = c.tx.buffered() // SYN/FIN-randen: die tellen niet als ringdata
 		}
+		// De ACK kan de hertransmissie vóór zijn geweest (goBackN spoelde de
+		// sent-cursor terug): wat bevestigd wordt wás verzonden — eerst
+		// terugboeken, dan pas poppen (zie txRing.forceSent).
+		c.tx.forceSent(dataAcked)
 		c.tx.ack(dataAcked)
 		c.dataBase += uint32(dataAcked)
 	}
 	c.una = ack
+	if seqLT(c.nxt, ack) {
+		// De ACK ligt vóórbij de (door goBackN teruggespoelde) zendcursor:
+		// alles tot ack is bevestigd, dus daar hoeft niets meer heen — cursor
+		// bijtrekken (review 13-08, negenentwintigste ronde).
+		c.nxt = ack
+	}
 	c.dupacks = 0
 	c.retries = 0 // échte voortgang: hét levensteken
 	c.persistBackoff = 0
@@ -1143,6 +1164,9 @@ func (c *tcpConn) emit(buf []byte, now int64) (seg tcpSeg, ok bool) {
 	// zijn retransmissie na go-back-N) aan de beurt.
 	if (c.state == tcpSynSent || c.state == tcpSynRcvd) && c.nxt == c.iss {
 		c.nxt = c.iss + 1
+		if seqLT(c.maxSent, c.nxt) {
+			c.maxSent = c.nxt // de SYN neemt sequence-ruimte in: zijn ACK is geen future
+		}
 		c.armTimer(now)
 		// Het venster op een SYN is nooit geschaald; en op een SYN|ACK mag de
 		// WS-optie alleen mee als de peer hem zelf bood (RFC 7323 §2.2).
@@ -1270,6 +1294,9 @@ func stateSendsFin(s tcpState) bool {
 // sendFinBookkeeping schuift nxt over de FIN en doet de staatstransitie.
 func (c *tcpConn) sendFinBookkeeping(now int64) {
 	c.nxt = c.finSeq + 1
+	if seqLT(c.maxSent, c.nxt) {
+		c.maxSent = c.nxt // ook de FIN neemt sequence-ruimte in (zie de future-poort)
+	}
 	c.armTimer(now)
 	switch c.state {
 	case tcpEstablished:
@@ -1280,7 +1307,11 @@ func (c *tcpConn) sendFinBookkeeping(now int64) {
 }
 
 func (c *tcpConn) bareAck() tcpSeg {
-	return tcpSeg{seq: c.nxt, ack: c.rcvNxt, flags: FlagACK, wnd: c.advertisedWnd()}
+	// seq is maxSent, niet nxt: een kale ACK draagt SND.NXT (RFC 9293 §3.9),
+	// en dat is de verste ooit verzonden rand — nxt is onze retransmit-cursor
+	// en staat na een go-back-N tijdelijk terug (review 13-08, eenendertigste
+	// ronde; semantiek, geen aangetoond falen).
+	return tcpSeg{seq: c.maxSent, ack: c.rcvNxt, flags: FlagACK, wnd: c.advertisedWnd()}
 }
 
 // rawWnd is het ongeschaalde venster voor SYN-segmenten.

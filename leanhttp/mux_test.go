@@ -72,10 +72,6 @@ func TestMuxPatronen(t *testing.T) {
 		{"GET", "/app-ui/com.x/settings/style.css", "GET /app-ui/{app}/settings/{path...}"},
 		{"GET", "/app-ui/com.x/settings/a/b/c.png", "GET /app-ui/{app}/settings/{path...}"},
 		{"GET", "/app-ui/com.x/pair/switch/index.html", "GET /app-ui/{app}/pair/{driver}/{path...}"},
-
-		// Genormaliseerd vóór het matchen: een handler ziet nooit een "..".
-		{"GET", "/api//devices", "GET /api/devices"},
-		{"GET", "/api/devices/lamp-1/../lamp-1", "GET /api/devices/{id}"},
 	} {
 		got = ""
 		m.ServeHTTP(&muxWriter{hdr: Header{}}, &Request{Method: tc.method, Path: tc.path, Header: Header{}})
@@ -90,6 +86,27 @@ func TestMuxPatronen(t *testing.T) {
 	} {
 		if vals[k] != want {
 			t.Errorf("PathValue(%q) = %q, want %q", k, vals[k], want)
+		}
+	}
+}
+
+// TestMuxMatchtAlleenCanoniek: de mux normaliseert NIET (meer) — de parser is
+// de ene plek die het pad schoont en valideert, en een tweede interpretatie in
+// de mux was zelf een differentiaal-risico (review 13-08, eenendertigste
+// ronde). Een met de hand gebouwde Request met een niet-canoniek pad matcht
+// dus gewoon niets; over de draad bestaat die vorm niet (parser schoont
+// dubbele slashes en weigert dot-segmenten met een 400).
+func TestMuxMatchtAlleenCanoniek(t *testing.T) {
+	m := NewServeMux()
+	m.HandleFunc("GET /api/devices", func(w ResponseWriter, r *Request) { w.WriteHeader(StatusOK) })
+	// Sinds de tweeëndertigste ronde deelt de mux het canonicalPath-predicaat
+	// met de parser: ook een ontbrekende leidende slash — die splitPath'
+	// getrim anders liet matchen — is gewoon een 404.
+	for _, pad := range []string{"/api//devices", "/api/devices/", "api/devices", "//api/devices"} {
+		w := &muxWriter{hdr: Header{}}
+		m.ServeHTTP(w, &Request{Method: "GET", Path: pad, Header: Header{}})
+		if w.status != StatusNotFound {
+			t.Errorf("%s -> %d, wil 404: de mux hoort niet-canonieke paden niet te herschrijven", pad, w.status)
 		}
 	}
 }
@@ -153,10 +170,12 @@ func TestMuxWeigertFouteWiring(t *testing.T) {
 			fn(NewServeMux())
 		}()
 	}
-	// Dezelfde weg onder een andere methode is juist normaal.
+	// Dezelfde weg onder een andere methode is juist normaal — mét echte
+	// handlers, want een nil-handler panickt sinds de dertigste ronde zelf.
+	h := func(w ResponseWriter, r *Request) {}
 	m := NewServeMux()
-	m.HandleFunc("GET /x", nil)
-	m.HandleFunc("POST /x", nil)
+	m.HandleFunc("GET /x", h)
+	m.HandleFunc("POST /x", h)
 }
 
 // TestMuxOverDeDraad: de mux als Handler in Serve, zodat de padnormalisatie en

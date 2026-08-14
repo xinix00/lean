@@ -10,7 +10,7 @@ Gebouwd 11/12-08-2026 als vervanger van lneto+go-net in HopOS. Ontwerp,
 afwegingen en de lijst met bewust-niet-gebouwd:
 [leannet/DESIGN.md](leannet/DESIGN.md).
 
-Stand: ~80 tests, 91% coverage, `-race` groen, compileert onder de
+Stand: de volledige tests en `-race` zijn groen; de stack compileert onder de
 tamago-toolchain (riscv64 + arm64). HopOS draait er volledig op in QEMU (agent
 + leader, SNTP, DNS, TLS-download van GitHub, slot-demo 20/20 markers, 200×
 verbindings-churn schoon, 8 vastgehouden verbindingen + verse = 200).
@@ -23,7 +23,7 @@ is alles langzamer. De server houdt de verbinding nu vast tot de test hem
 vrijgeeft: geen tijdafhankelijkheid meer. 6× `-race` in isolatie en 2× de hele
 suite met `-race` groen.
 
-**Na v0.2.0 gebouwd (12-08, ongecommit) — twee gaten die het ijzer vond:**
+**Na v0.2.0 gebouwd (12-08) — twee gaten die het ijzer vond:**
 
 - [x] **Zelf-verkeer (loopback).** Een wereld kon niet bij zichzelf: een dial
       naar het eigen IP vroeg op de draad "who has mijzelf", en dat antwoordt
@@ -40,7 +40,7 @@ suite met `-race` groen.
       health-check of een net verhuisd origin is dat het verschil tussen zoeken
       en weten. Een RST lokt nooit een RST uit (storm-test).
 
-**Na v0.3.0 gebouwd (12-08, ongecommit):**
+**Na v0.3.0 gebouwd (12-08):**
 
 - [x] **Broadcast de deur uit.** De routelaag deed er iets stils-fouts mee:
       255.255.255.255 valt buiten élk subnet, dus ging het als *unicast* naar de
@@ -79,14 +79,13 @@ suite met `-race` groen.
 - [ ] `TIME-WAIT` is nu 1s en een constante. Configureerbaar maken zodra een
       omgeving het vraagt (2MSL van 4 minuten past niet op een embedded node,
       maar 1s is een keuze zonder meting).
-- [ ] Overweeg een `Stats()`-methode die de tellers als struct teruggeeft, in
-      plaats van exported velden op `Stack` (nu leest HopOS ze onder de
-      stack-mutex mee; dat werkt, maar het is geen contract).
+- [x] `Stats()` geeft de tellers als structkopie onder het stack-slot terug;
+      callers hoeven exported velden niet racegevoelig mee te lezen.
 
 **Bewust niet op deze lijst** (zie DESIGN.md voor de reden per punt):
 congestion control, out-of-order reassembly/SACK, IPv6/NDP,
 IPv4-fragmentatie, TCP timestamps/PAWS, Nagle, SYN-cookies, logging in de
-stack, een tweede buffer-knop.
+stack, een tweede globale bufferpot.
 
 ## leanhttp — uitgebreid 12-08 zodat een browser hem kan gebruiken
 
@@ -94,10 +93,10 @@ Dereks vraag: kunnen de basis-delen die een browser nodig heeft er wél in, in
 plaats van dat de volgende gebruiker naar net/http grijpt (en 3,2 MB betaalt)?
 Ja, en het legde onderweg een echte bug bloot.
 
-- [x] **Call.Dial** — een algemene dialer-naad (proxy, unix-socket, testdubbel,
-      TLS). Zonder deze naad is https onmogelijk zonder TLS in dit pakket te
-      linken; mét de naad blijft het pakket TLS-vrij en knoopt de aanroeper de
-      twee (leanhttps doet dat).
+- [x] **Call.DialContext** — één algemene, annuleerbare dialer-naad (proxy,
+      unix-socket, testdubbel, TLS). Zonder deze naad is https onmogelijk
+      zonder TLS in dit pakket te linken; mét de naad blijft het pakket
+      TLS-vrij en knoopt de aanroeper de twee (leanhttps doet dat).
 - [x] **Client met keep-alive** — een pool per host. De veiligheidsregel is
       één: een verbinding gaat alleen terug als de body TOT HET EINDE gelezen
       is, want anders leest het volgende verzoek de staart van dit antwoord als
@@ -112,19 +111,13 @@ Ja, en het legde onderweg een echte bug bloot.
       zelf komma's, dus gevouwen is de lijst niet meer te splitsen. Wie cookies
       las kreeg er één waar er twee stonden — en dat merk je pas als een login
       niet blijft plakken. Nu apart en per regel.
-- [x] **GetCall** — Get met de rest van de Call erbij (headers, termijn, Dial),
-      zoals Do dat voor Get al was.
-- [ ] **De clientkant kent de bodyless-regel niet (204/304).** De serverkant wel
-      (serve_test.go toetst hem), maar `do` geeft een antwoord zonder
-      Content-Length en zonder chunks een body die tot EOF leest — en op een
-      keep-alive-verbinding komt dat EOF pas als de server zijn idle-timeout
-      haalt. Gevonden door leans3: een S3-DELETE en een hoplockserver-DELETE
-      antwoorden béide met 204, dus élke delete bleef staan tot de server hem
-      verveeld dichtgooide (in de test: een `go test` die zijn timeout haalde).
-      RFC 9112 §6.3 zegt dat 204 en 304 nooit een body hebben; drie regels in
-      `do` (lengte 0 in plaats van "tot EOF") lossen het op voor iedereen. Nu
-      omzeild in leans3 en in hoplockserver/client met een eigen `emptyBody` —
-      dat hoort niet in twee aanroepers te staan.
+- [x] **GetCall** — Get met de rest van de Call erbij (headers, termijn,
+      DialContext), zoals Do dat voor Get al was.
+- [x] **De clientkant kent de bodyless-regel voor 204/304.** Gevonden door
+      leans3: een S3-DELETE en een hoplockserver-DELETE bleven zonder die regel
+      op een keep-alive-verbinding wachten op een body die nooit kon komen.
+      `leanhttp` behandelt beide nu centraal als bodyloos; een 304 behoudt zijn
+      eventuele informatieve Content-Length.
 
 ## leans3 (nieuw 12-08)
 
@@ -156,11 +149,12 @@ RGW gelopen — maar hij staat hier voor het eerst als blok.
       leggen elk antwoord naast `encoding/xml` — inclusief élk afkap-punt van een
       echt MinIO-antwoord, want een afgekapte pagina die op een complete lijkt is
       de ene fout die keys kost.
-- [ ] Bewust NIET: streaming signatures (STREAMING-AWS4-HMAC-SHA256-PAYLOAD),
-      multipart upload, presigned URL's, sigv4a, credentials uit IMDS/IAM,
-      HEAD/CopyObject. Voor dat laatste is `Client.URLFor` de naad: wie een
-      operatie nodig heeft die hier niet in zit, signeert hem zelf op de juiste
-      URL in plaats van de adresseringsstijl na te bouwen.
+**Bewust niet:** streaming signatures
+(STREAMING-AWS4-HMAC-SHA256-PAYLOAD), multipart upload, presigned URL's,
+sigv4a, credentials uit IMDS/IAM en HEAD/CopyObject. Voor dat laatste is
+`Client.URLFor` de naad: wie een operatie nodig heeft die hier niet in zit,
+signeert hem zelf op de juiste URL in plaats van de adresseringsstijl na te
+bouwen.
 
 ## leanelf (nieuw 12-08)
 
@@ -178,10 +172,10 @@ staat in de pakket-doc: 166.397 bytes minder image, zelfde plaatsing.
 - [ ] **Niet op ijzer geweest.** De QEMU-gate plaatst er images mee (host-tests
       van `abi/place` groen, kern boot), maar een echt board heeft er nog geen
       image mee geplaatst.
-- [ ] Bewust NIET: 32-bit, big-endian, secties op naam, relocaties, DWARF, en
-      een volledige symbooldump. Alle vier weigeren ze luid. Wie er één nodig
-      heeft, voegt hem toe mét de meting die aantoont dat de afwezigheid iets
-      kost — precies zoals dit pakket zelf ontstond.
+**Bewust niet:** 32-bit, big-endian, secties op naam, relocaties, DWARF en een
+volledige symbooldump. Ze worden luid geweigerd. Wie er één nodig heeft, voegt
+hem toe mét de meting die aantoont dat de afwezigheid iets kost — precies zoals
+dit pakket zelf ontstond.
 
 ## leanrand (nieuw 12-08)
 
@@ -196,24 +190,24 @@ aanroepen `uuid.New().String()`, waarvan één afgekapt op acht tekens.
       het een panic, want een node zonder entropie heeft geen zinnig vervolg.
 - [x] `Jitter` erbij omdat hop's herstart-backoff exact 1, 2, 4, 8 seconden
       wachtte: honderd nodes proberen dan precies gelijk opnieuw.
-- [ ] Bewust NIET: een eigen generator, een seed, een reproduceerbare stroom
-      voor testen (die hoort in de test), en geen UUID-formaat — 36 tekens om
-      16 bytes te schrijven, waarvan wij de structuur nergens lezen.
+**Bewust niet:** een eigen generator, een seed, een reproduceerbare stroom voor
+testen (die hoort in de test), en een UUID-formaat — 36 tekens om 16 bytes te
+schrijven, waarvan wij de structuur nergens lezen.
 
 ## leancookie (nieuw 12-08)
 
-- [ ] Geen open punten. Bewust NIET: public-suffix-lijst (honderden KB's,
-      maandelijks anders — dus host-only als default, met een AllowDomain-hook
-      voor wie het zelf kan weten), SameSite (navigatiebeleid van een browser,
-      geen jar-beleid), __Host-/__Secure-voorvoegsels.
+Geen open punten. **Bewust niet:** een public-suffix-lijst (honderden KB's,
+maandelijks anders — dus host-only als default, met een AllowDomain-hook voor
+wie het zelf kan weten), SameSite (navigatiebeleid van een browser, geen
+jar-beleid) en __Host-/__Secure-voorvoegsels.
 
 ## leanhttps (nieuw 12-08, de eerste samenstelling)
 
-- [ ] Geen open punten. Gemeten: 3,75 MB tegen 5,77 MB voor
-      net/http+crypto/tls+CA-bundel, en 2,65 MB met een gepinde peer.
-- [ ] Wél te overwegen als iemand het nodig heeft: een server-kant. Nu is dit
-      alleen een client; https serveren vraagt leantls' serverhelft (die er nog
-      niet is).
+Geen open punten. Gemeten: 3,75 MB tegen 5,77 MB voor
+net/http+crypto/tls+CA-bundel, en 2,65 MB met een gepinde peer.
+
+**Bewust niet:** een serverkant. Deze compositie is alleen een client; https
+serveren vraagt leantls' serverhelft en valt buiten de huidige KAM.
 
 ## leandhcp — beide punten gedaan 12-08, en het pakket heeft nu tests
 
@@ -259,9 +253,29 @@ dus in microseconden in plaats van in uren.
 
 ## Repo-breed
 
-- [x] Taggen: v0.3.0 staat, `hop-os/metal/go.mod` require't hem zonder replace,
-      en de README-tabel heeft zijn `leannet`-regel.
-- [ ] **Volgende tag** (v0.4.0: nieuwe exports `State`, `Rebind`, `Lease.T2Secs`
-      — geen breuk). Daarna in hop-os de require bumpen. Tijdens het werken
-      hoort er een dev-`replace` in `hop-os/metal/go.mod` te staan; die mag niet
-      mee in een commit.
+- [ ] **KAM-conformiteit: Mux-patronen niet normaliseren.** Requestpaden met
+      dubbele slashes worden al geweigerd, maar registratie vouwt `/a//b` nog
+      stil naar `/a/b`. Laat niet-canonieke patronen fail-fast panicken en voeg
+      een registratietest toe; één spelling per pad geldt ook voor bedrading.
+- [ ] **KAM-conformiteit: client-`CONNECT` luid weigeren.** De server weigert
+      CONNECT al, maar de clientserializer schrijft nu ieder geldig
+      methodetoken en heeft geen tunnel-API. Voeg vóór de volgende tag een
+      expliciete weigering plus regressietest toe; stil een origin-form CONNECT
+      sturen is geen gedragen tussenweg.
+- [ ] **KAM-releasegate: surfserve `/stream`.** Een endpoint dat
+      `Request.Done` claimt moet eerst exact zijn methode controleren en een
+      niet-lege requestbody afwijzen of volledig lezen. `serveStream` claimt
+      `Done` nu nog onvoorwaardelijk; een bodydragend verzoek kan daardoor de
+      fail-fast-wacht in `leanhttp` bereiken. Test exact `GET /stream` met een
+      niet-lege Content-Length (4xx, server daarna nog bruikbaar) én een
+      bodyloze niet-GET (405). Zie [KAM.md](KAM.md#consumerplichten).
+- [ ] **KAM-releasegate: versies standalone maken.** Lean eerst taggen, daarna
+      hoplock, hoplockserver, Hop, surfserve en metal in afhankelijkheidsvolgorde
+      verhogen en standalone verifiëren. Elke lokale-pad-`replace` — relatief
+      of absoluut — is alleen ontwikkelbedrading. De releasegate gebruikt de
+      gepinde Go 1.26.4-toolchain; de consumer-CI mag niet op Go 1.24 blijven.
+
+- [x] Tags tot en met v0.6.0 staan in deze repository.
+- [ ] **Volgende tag:** pas na de twee KAM-releasegates hierboven. Daarna de
+      consumers in afhankelijkheidsvolgorde verhogen en standalone testen;
+      tijdelijke workspace- en `replace`-bedrading telt niet als bewijs.

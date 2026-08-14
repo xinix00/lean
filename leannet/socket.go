@@ -371,8 +371,8 @@ func (s *Stack) dialTCP(ctx context.Context, raddr [4]byte, rport uint16, deadli
 	// dus zou arp.noAnswer hieronder nooit waar worden en wachtte een dial naar
 	// buiten het subnet zijn volle 30s uit op een fout die bij de eerste blik
 	// vaststond (review 13-08).
-	hop := s.nextHopLocked(raddr)
-	if hop == ([4]byte{}) {
+	hop, hopViaARP := s.nextHopLocked(raddr)
+	if hopViaARP && hop == ([4]byte{}) {
 		s.mu.Unlock()
 		return nil, errNoRoute
 	}
@@ -405,7 +405,12 @@ func (s *Stack) dialTCP(ctx context.Context, raddr [4]byte, rport uint16, deadli
 				// bruikbaar (lezen tot EOF, schrijven mag nog)
 				// (review 13-08, zevenentwintigste ronde).
 				return true, nil
-			case s.arp.noAnswer(hop, s.now()):
+			case hopViaARP && s.arp.noAnswer(hop, s.now()):
+				// Alleen als de route een ARP-lot HEEFT: met een statische
+				// gateway-MAC is hop een vulwaarde zonder eigen query, en de
+				// vol-tabel-toets in noAnswer verklaarde die bestemming
+				// anders meteen onbereikbaar terwijl de SYN gewoon via de
+				// bekende MAC vertrekt (review 13-08, zesendertigste ronde).
 				// VÓÓR de closed-toets: het route-dood-vangnet in de pomp kan
 				// deze verbinding al geabort hebben (zelfde noAnswer, andere
 				// goroutine), en dan las de closed-tak "connect timed out"
@@ -506,9 +511,10 @@ func (t *tcpSock) Close() error {
 	s := t.s
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	t.closed = true     // wachtende Reads/Writes zien dit bij hun wek-ronde
-	_ = t.c.tcp.close() // dubbel sluiten is geen fout op de socket-rand
-	s.notify()          // de FIN mag eruit én de waiters worden wakker
+	t.closed = true       // wachtende Reads/Writes zien dit bij hun wek-ronde
+	_ = t.c.tcp.close()   // dubbel sluiten is geen fout op de socket-rand
+	t.c.tcp.abandonRead() // VOLLE close: de ontvangkant mag zijn ring kwijt (zie tcp.abandonRead)
+	s.notify()            // de FIN mag eruit én de waiters worden wakker
 	return nil
 }
 
@@ -636,6 +642,21 @@ func (u *udpSock) ReadFrom(p []byte) (int, net.Addr, error) {
 }
 
 func (u *udpSock) WriteTo(p []byte, addr net.Addr) (int, error) {
+	if u.connected {
+		// net.UDPConn-contract: een connected socket schrijft alleen naar
+		// zijn peer — en replies van een ánder adres worden toch al bij
+		// deliver weggegooid, dus dit was hoe dan ook een zwart gat
+		// (review 13-08, dertigste ronde).
+		return 0, net.ErrWriteToConnected
+	}
+	ua, isUDP := addr.(*net.UDPAddr)
+	if !isUDP || ua == nil || ua.Port <= 0 || ua.Port > 65535 {
+		// Strikt een *net.UDPAddr mét bruikbare poort: de generieke addrPort
+		// accepteerde zelfs een *net.TCPAddr, en de test daarop was
+		// vals-groen op een verlopen write-deadline (review 13-08, dertigste
+		// ronde).
+		return 0, errors.New("leannet: WriteTo needs an IPv4 *net.UDPAddr with a valid port")
+	}
 	dst, dport, ok := addrPort(addr)
 	if !ok {
 		return 0, errors.New("leannet: WriteTo needs an IPv4 *net.UDPAddr")
@@ -676,13 +697,13 @@ func (u *udpSock) writeUDP(p []byte, dst [4]byte, dport uint16) (int, error) {
 				sent = len(p)
 				return true, nil
 			}
-			hop := s.nextHopLocked(dst)
-			if hop == ([4]byte{}) {
+			hop, viaARP := s.nextHopLocked(dst)
+			if viaARP && hop == ([4]byte{}) {
 				// Zelfde regel als DialTCP: geen gateway is een antwoord,
 				// geen wachttijd.
 				return false, errNoRoute
 			}
-			if s.arp.noAnswer(hop, now) {
+			if viaARP && s.arp.noAnswer(hop, now) {
 				return false, errUnreachable
 			}
 			s.notify() // pomp: ARP-query eruit
@@ -744,8 +765,18 @@ func (s *Stack) Socket(ctx context.Context, network string, family, sotype int, 
 	if family != afINET {
 		return nil, errors.New("leannet: unsupported address family")
 	}
-	lip, lport, _ := addrPort(laddr)
-	_ = lip // we luisteren altijd op ons ene adres
+	lip, lport, hasL := addrPort(laddr)
+	if laddr != nil && (!hasL || !portInRange(laddr)) {
+		// Zelfde regel als voor het remote-adres: een niet-nil maar
+		// onbruikbaar lokaal adres (IPv6, vreemd type, poort buiten bereik)
+		// werd stil een wildcard-listener (review 13-08, dertigste ronde).
+		return nil, errors.New("leannet: unsupported local address")
+	}
+	if lip != ([4]byte{}) && lip != s.cfg.IP {
+		// We dragen één adres; binden op iets anders is een bedradingsfout,
+		// geen wens die stil genegeerd hoort te worden.
+		return nil, errors.New("leannet: local address is not this stack's address")
+	}
 	rip, rport, hasR := addrPort(raddr)
 	if raddr != nil && (!hasR || rport == 0 || !portInRange(raddr)) {
 		// Een niet-nil maar onbruikbaar remote-adres (IPv6, vreemd type) werd
@@ -755,6 +786,13 @@ func (s *Stack) Socket(ctx context.Context, network string, family, sotype int, 
 		return nil, errors.New("leannet: unsupported remote address")
 	}
 	isDial := hasR
+	if isDial && lport != 0 {
+		// Een gevraagde bronpoort op een dial werd stil genegeerd (de stack
+		// kiest altijd een efemere poort): wie hem zet — een firewall-afspraak,
+		// een protocol met vaste bronpoort — hoort te horen dat dat hier niet
+		// bestaat (review 13-08, eenendertigste ronde).
+		return nil, errors.New("leannet: dialing from a fixed local port is not supported")
+	}
 
 	switch network {
 	case "tcp", "tcp4":

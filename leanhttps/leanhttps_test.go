@@ -208,3 +208,40 @@ func TestGeenEcdsaInPin(t *testing.T) {
 		}
 	}
 }
+
+// TestTLSPoolHergebruik — de idle-read-probe (27e ronde) vergiftigde élke
+// gezonde gepoolde TLS-verbinding: de 1ms-timeout werd in leantls een
+// permanente record-leesfout, waarna verzoek 2 op de sticky fout stierf. De
+// probe is gesloopt; dit is de wacht dat TLS-pooling werkt (review 13-08,
+// negenentwintigste ronde).
+func TestTLSPoolHergebruik(t *testing.T) {
+	cert, pub := selfSigned(t, "leader.internal")
+	addr := tlsServer(t, cert, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("ok"))
+	}))
+	pool := &leanhttp.Client{DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
+		return DialerContext(&leantls.Config{PeerKey: pub})(ctx, network, addr)
+	}}
+	for i := 0; i < 3; i++ {
+		resp, err := pool.Do(leanhttp.Call{URL: "https://leader.internal/"})
+		if err != nil {
+			t.Fatalf("verzoek %d over de TLS-pool: %v", i+1, err)
+		}
+		if b, _ := io.ReadAll(resp.Body); string(b) != "ok" {
+			t.Fatalf("verzoek %d: body %q", i+1, b)
+		}
+		resp.Body.Close()
+	}
+}
+
+// TestDialerContextNilFaaltNetjes — DialerContext(nil) leverde een dialer die
+// bij gebruik panicte op c.TLS.PeerKey, vijf lagen van de bedradingsfout
+// vandaan; nu is het dezelfde luide errNoConfig als bij Client
+// (review 13-08, eenendertigste ronde).
+func TestDialerContextNilFaaltNetjes(t *testing.T) {
+	dial := DialerContext(nil)
+	_, err := dial(context.Background(), "tcp4", "host.example:443")
+	if err == nil || !strings.Contains(err.Error(), "TLS is nil") {
+		t.Fatalf("DialerContext(nil) gaf %v, wil de errNoConfig-uitleg", err)
+	}
+}

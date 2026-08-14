@@ -78,6 +78,12 @@ const (
 	// maxRedirects volgt hetzelfde plafond als net/http's default.
 	maxRedirects = 10
 
+	// expectTimeout is hoe lang een gestroomde upload op het oordeel van de
+	// server wacht (100 of een vroege finale status) als er geen strakkere
+	// termijn geldt (HeaderTimeout/Timeout). Stilte is daarna een FOUT en de
+	// verbinding gaat dicht — er is geen stuur-toch-pad (zie de Expect-dans).
+	expectTimeout = 10 * time.Second
+
 	// bufSize is tevens de maximale lengte van één headerregel: readLine leest
 	// via ReadSlice, dus een regel die niet in de buffer past is een fout i.p.v.
 	// ongebonden geheugengroei. Ruim voor elke echte header.
@@ -99,6 +105,7 @@ const (
 	StatusNotFound              = 404
 	StatusMethodNotAllowed      = 405
 	StatusRequestEntityTooLarge = 413
+	StatusExpectationFailed     = 417
 	StatusInternalServerError   = 500
 	StatusNotImplemented        = 501
 )
@@ -175,40 +182,30 @@ type Call struct {
 	// Een gestroomde body kan niet opnieuw verstuurd worden, dus [Do] volgt geen
 	// redirect: de 3xx komt bij de aanroeper terecht, net als bij Body.
 	//
-	// BEKENDE GRENS: de body wordt volledig geschreven vóórdat het antwoord
-	// gelezen wordt. Een server die de upload vroeg afwijst (401/413) wordt
-	// dus pas ná het schrijven gezien — netjes afhandelen vergt
-	// Expect: 100-continue aan de clientkant, en dat is bewust buiten scope
-	// (de serverkant van dit pakket antwoordt er wél op). Wie een grote
-	// upload naar een onvertrouwde server doet, probet eerst zelf.
+	// Een stroom vraagt eerst het oordeel van de server (Expect:
+	// 100-continue): een vroege 401/413 spaart de hele upload uit. De server
+	// MOET dat oordeel geven (een 100 of een finale status); stilte is na
+	// expectTimeout een fout en de verbinding gaat dicht — het oude
+	// na-één-seconde-tóch-sturen-pad vergiftigde op TLS de reader blijvend
+	// (review 13-08, eenendertigste ronde).
 	BodyReader io.Reader
 	BodyLen    int64
 
-	// Dial maakt de verbinding. nil = net.DialTimeout op tcp4, en dan blijft
-	// dit pakket wat het is: plain http zonder één byte TLS.
+	// DialContext maakt de verbinding; nil = de stdlib-dialer op tcp4, en dan
+	// blijft dit pakket wat het is: plain http zonder één byte TLS.
 	//
-	// De naad is er voor álles wat een andere verbinding wil zijn dan een kale
-	// TCP-dial: een proxy, een unix-socket, een testdubbel dat nooit het net
-	// op gaat — en een versleutelde verbinding. In dat laatste geval hoort de
-	// aanroeper hier een TLS-dialer neer te zetten; dit pakket weet daar niets
-	// van en linkt er niets voor (leanhttps doet die knoop voor je).
+	// De naad is er voor álles wat een andere verbinding wil zijn dan een
+	// kale TCP-dial: een proxy, een testdubbel, en vooral een versleutelde
+	// verbinding (leanhttps.DialerContext past hier). addr is "host:poort"
+	// mét de hostnaam erin (voor SNI); bij een redirect naar een andere host
+	// wordt de dialer opnieuw geroepen met die nieuwe host. De context draagt
+	// de totaaltermijn (Timeout, over alle redirects heen): een dialer hoort
+	// op ctx.Done() op te geven.
 	//
-	// addr is "host:poort" met de hostnaam er nog in (niet opgelost naar een
-	// IP), zodat een TLS-dialer zijn SNI kan zetten. Bij een redirect naar een
-	// andere host wordt Dial opnieuw geroepen met die nieuwe host — wie SNI uit
-	// addr haalt, volgt dus automatisch mee.
-	//
-	// CONTRACT: een Dial hoort zélf eindig te zijn (een eigen dial- en
-	// handshake-termijn). De totaaltermijn (Timeout) begrenst alleen hoe lang
-	// dit pakket erop wácht (dialBounded); annuleren kan hij niet — wie dat
-	// wil, zet DialContext.
-	Dial func(network, addr string) (net.Conn, error)
-
-	// DialContext is Dial mét annulering: de context draagt de totaaltermijn
-	// (Timeout, over álle redirects heen) en de dialer hoort op ctx.Done() op
-	// te geven — dan leeft er bij een verlopen termijn ook geen dial-goroutine
-	// meer door (review 13-08, vijftiende ronde). Als beide gezet zijn gaat
-	// DialContext vóór. Zelfde addr-contract als Dial.
+	// (De kale Dial-gedaante zonder context is gesloopt in review 13-08,
+	// dertigste ronde: er waren nog twee gebruikers — hophttp en leans3,
+	// allebei van ons — en één gedaante scheelt de dialBounded-adapter, het
+	// eindigheids-contract en een klasse uiteenloop-bugs.)
 	DialContext func(ctx context.Context, network, addr string) (net.Conn, error)
 
 	// NoFollow geeft de 3xx aan de aanroeper in plaats van hem te volgen.
@@ -262,7 +259,7 @@ type Response struct {
 func Get(raw string) (*Response, error) { return GetCall(Call{URL: raw}) }
 
 // GetCall is Get met de rest van de Call erbij — headers, een termijn, of een
-// eigen [Call.Dial]. Zelfde eisen: een 200 mét Content-Length. Dit is wat Get
+// eigen [Call.DialContext]. Zelfde eisen: een 200 mét Content-Length. Dit is wat Get
 // is voor Do: dezelfde ronde, maar met de controles die een bestand-ophaler
 // wil.
 func GetCall(c Call) (*Response, error) {
@@ -304,8 +301,8 @@ func Do(c Call) (*Response, error) { return doVia(c, nil) }
 // call draagt, of nil voor de kale éénmalige vorm. Een parameter en geen
 // Call-veld, want dat veld moest élk constructiepad correct zetten — drie
 // reviewrondes op precies die naad (pool-bypass in Get, plaintext-443 op een
-// redirect, per-call-Dial-menging) kwamen alle drie neer op "de pool-dialer
-// vermomd als Call.Dial" (review 13-08, zesde ronde).
+// redirect, per-call-DialContext-menging) kwamen alle drie neer op "de pool-dialer
+// vermomd als Call.DialContext" (review 13-08, zesde ronde).
 func doVia(c Call, via *Client) (*Response, error) {
 	// Eén absolute termijn voor de HELE call, redirects inbegrepen: de klok
 	// startte eerst pas ná de dial en elke redirect kreeg een verse Timeout —
@@ -330,7 +327,7 @@ func doVia(c Call, via *Client) (*Response, error) {
 			// de call dwingt een verse verbinding af, en het antwoord poolt
 			// daarna gewoon weer (review 13-08, achtentwintigste ronde).
 			fresh := c
-			fresh.DialContext = normalizeDial(via.DialContext, via.Dial)
+			fresh.DialContext = normalizeDial(via.DialContext)
 			resp, err = do(fresh, via, loc, total)
 		}
 		if err != nil {
@@ -369,24 +366,24 @@ func doVia(c Call, via *Client) (*Response, error) {
 			return nil, fmt.Errorf("leanhttp: bad Location %q: %w", next, err)
 		}
 		dest := base.ResolveReference(ref)
-		// Gevoelige headers reizen alleen mee binnen dezelfde ORIGIN: schema
-		// én host én poort. Alleen de hostnaam vergelijken liet een token mee
-		// naar een andere poort (een tweede dienst op dezelfde machine) of
-		// over een https→http-degradatie het plaintext-net op
-		// (review 13-08, tweede ronde).
-		sameOrigin := originOf(dest) == originOf(base)
-		if !sameOrigin && len(c.Header) > 0 {
-			trimmed := Header{}
-			for k, v := range c.Header {
-				switch {
-				case strings.EqualFold(k, "Authorization"),
-					strings.EqualFold(k, "Proxy-Authorization"),
-					strings.EqualFold(k, "Cookie"):
-					continue
-				}
-				trimmed[k] = v
-			}
-			c.Header = trimmed
+		// Een https→http-degradatie volgen we NOOIT: wat de aanroeper
+		// versleuteld begon hoort niet op een wenk van de server het
+		// plaintext-net op — ook niet "zonder headers", want de URL zelf (het
+		// pad, de query, een signed token daarin) is dan al de lekkage. Wie
+		// dit écht wil, zet NoFollow en volgt zelf (review 13-08,
+		// eenendertigste ronde).
+		if strings.EqualFold(base.Scheme, "https") && !strings.EqualFold(dest.Scheme, "https") {
+			return nil, fmt.Errorf("leanhttp: refusing redirect from %s to %s: https must not degrade to plain http", loc, dest)
+		}
+		// Callerheaders reizen alleen mee binnen dezelfde ORIGIN (schema én
+		// host én poort) — en cross-origin gaan ze er ÁLLEMAAL af, niet alleen
+		// een lijstje "gevoelige": welke header een geheim draagt weet alleen
+		// de aanroeper (X-Api-Key, een HMAC-header, een sessie-token in een
+		// eigen naam), en een blocklist die dat moet raden is precies de fout
+		// die pas opvalt als het geheim al bij de CDN ligt (review 13-08,
+		// eenendertigste ronde; de blocklist was de tweede/vijfentwintigste).
+		if originOf(dest) != originOf(base) {
+			c.Header = nil
 		}
 		loc = dest.String() // een relatieve Location mag
 	}
@@ -394,29 +391,20 @@ func doVia(c Call, via *Client) (*Response, error) {
 }
 
 // Intern bestaat er maar ÉÉN dialervorm: die van DialContext. De totaaltermijn
-// reist als context-deadline; do() en Client.dial normaliseren de andere
-// gedaantes aan de rand — een kale Dial via dialBounded, géén dialer via de
-// stdlib (net.Dialer combineert zijn Timeout zelf al met de ctx-deadline, wie
-// het eerst om is wint). Acht gedaantes en een vierarmige switch werden zo één
-// zin (review 13-08, achttiende ronde).
+// reist als context-deadline. (De kale Dial-gedaante en zijn
+// dialBounded-adapter zijn in de dertigste ronde gesloopt; de normalisatie
+// die overblijft is alleen nog "geen dialer = de stdlib-dialer".)
 
-// normalizeDial vouwt de twee publieke dialer-gedaantes naar de ene interne
-// vorm (zie dialBounded): DialContext zoals hij is, een kale Dial door de
-// adapter, en niets = de stdlib-dialer (net.Dialer combineert zijn Timeout
-// zelf met de ctx-deadline; wie het eerst om is wint). Call- en
-// Client-dialers gaan hier allebei doorheen en zijn dus per constructie
-// identiek genormaliseerd — "de twee dialer-ingangen liepen uiteen" was
-// letterlijk de bugklasse die drie rondes kostte (review 13-08,
+// normalizeDial vouwt de ene publieke dialer-gedaante naar de interne vorm:
+// DialContext zoals hij is, en niets = de stdlib-dialer (net.Dialer
+// combineert zijn Timeout zelf met de ctx-deadline; wie het eerst om is
+// wint). Call- en Client-dialers gaan hier allebei doorheen en zijn dus per
+// constructie identiek genormaliseerd — "de twee dialer-ingangen liepen
+// uiteen" was letterlijk de bugklasse die drie rondes kostte (review 13-08,
 // zesentwintigste ronde).
-func normalizeDial(dc func(context.Context, string, string) (net.Conn, error),
-	d func(string, string) (net.Conn, error)) func(context.Context, string, string) (net.Conn, error) {
-	switch {
-	case dc != nil:
+func normalizeDial(dc func(context.Context, string, string) (net.Conn, error)) func(context.Context, string, string) (net.Conn, error) {
+	if dc != nil {
 		return dc
-	case d != nil:
-		return func(ctx context.Context, network, addr string) (net.Conn, error) {
-			return dialBounded(ctx, d, network, addr)
-		}
 	}
 	return (&net.Dialer{Timeout: dialTimeout}).DialContext
 }
@@ -445,44 +433,6 @@ func originOf(u *url.URL) string {
 	return strings.ToLower(u.Scheme) + "://" + strings.ToLower(host)
 }
 
-// dialBounded is de adapter van een kale Dial naar de interne vorm: hij dwingt
-// de ctx-deadline af op een dialer die alleen (network, addr) kent en dus in
-// zijn TCP-connect of TLS-handshake kan blijven hangen terwijl de termijn al
-// om is — een leanhttps-dial naar een zwijgende host trok zo een verlopen
-// S3-call alsnog tien seconden open (review 13-08, twaalfde ronde). Het
-// dialer-contract blijft ongemoeid: hij draait in een goroutine door tot zijn
-// éigen einde; levert hij de verbinding te laat alsnog op, dan gaat die dicht.
-//
-// Wees eerlijk over de grens: dit begrenst het WACHTEN, niet de dialer zelf.
-// Een dialer die nooit terugkeert lekt zijn goroutine (en zijn socket) — het
-// contract is dus dat een dialer eindig is (onze eigen leantls.Dial is dat:
-// dial- én handshake-termijn). Wie écht annuleren wil, zet DialContext.
-func dialBounded(ctx context.Context, dial func(network, addr string) (net.Conn, error), network, addr string) (net.Conn, error) {
-	if ctx.Done() == nil {
-		return dial(network, addr) // geen termijn: niets te bewaken
-	}
-	type result struct {
-		c   net.Conn
-		err error
-	}
-	ch := make(chan result, 1)
-	go func() {
-		c, err := dial(network, addr)
-		ch <- result{c, err}
-	}()
-	select {
-	case r := <-ch:
-		return r.c, r.err
-	case <-ctx.Done():
-		go func() {
-			if r := <-ch; r.c != nil {
-				r.c.Close()
-			}
-		}()
-		return nil, ctx.Err()
-	}
-}
-
 // do doet één ronde: verbinden, verzoek schrijven, antwoordkop lezen. via is
 // het transport (zie doVia); nil = kale call.
 func do(c Call, via *Client, raw string, total time.Time) (_ *Response, err error) {
@@ -502,18 +452,17 @@ func do(c Call, via *Client, raw string, total time.Time) (_ *Response, err erro
 	// plaintext naar poort 443 droeg, inclusief Authorization (review 13-08,
 	// derde ronde: dat heropende precies het gat dat de schemewacht op de
 	// eerste URL dichtte).
-	// TLS kan uit twee hoeken komen: een expliciete Call.Dial(Context), of de
-	// eigen Dial(Context) van de Client die deze call draagt.
-	hasTLS := c.Dial != nil || c.DialContext != nil ||
-		(via != nil && (via.Dial != nil || via.DialContext != nil))
+	// TLS kan uit twee hoeken komen: een expliciete Call.DialContext, of de
+	// eigen DialContext van de Client die deze call draagt.
+	hasTLS := c.DialContext != nil || (via != nil && via.DialContext != nil)
 	port := "80"
 	switch {
 	case u.Scheme == "http":
 	case u.Scheme == "https" && hasTLS:
 		port = "443"
 	case u.Scheme == "https":
-		return nil, fmt.Errorf("leanhttp: https:// needs a Call.Dial that returns an "+
-			"encrypted connection (this package links no TLS) — use leanhttps, or set Dial yourself: %s", raw)
+		return nil, fmt.Errorf("leanhttp: https:// needs a Call.DialContext that returns an "+
+			"encrypted connection (this package links no TLS) — use leanhttps, or set DialContext yourself: %s", raw)
 	default:
 		return nil, fmt.Errorf("leanhttp: only http:// and https:// are supported, got %q", u.Scheme)
 	}
@@ -530,7 +479,7 @@ func do(c Call, via *Client, raw string, total time.Time) (_ *Response, err erro
 		return nil, err
 	}
 
-	// Normaliseren naar de ene interne dialervorm (zie dialBounded): de
+	// Normaliseren naar de ene interne dialervorm (zie normalizeDial): de
 	// totaaltermijn reist als context-deadline, dus élk pad — ook de pool en
 	// de kale stdlib-dial — leeft erbinnen (review 13-08, elfde/twaalfde
 	// ronde: beide gaten waren precies een pad dat total niet kende).
@@ -541,17 +490,17 @@ func do(c Call, via *Client, raw string, total time.Time) (_ *Response, err erro
 		defer cancel()
 	}
 	var dial func(ctx context.Context, network, addr string) (net.Conn, error)
-	if c.DialContext == nil && c.Dial == nil && via != nil {
+	if c.DialContext == nil && via != nil {
 		dial = via.dial // pool eerst; de staart normaliseert de Client-dialers
 	} else {
-		dial = normalizeDial(c.DialContext, c.Dial)
+		dial = normalizeDial(c.DialContext)
 	}
 	conn, err := dial(ctx, "tcp4", addr)
 	if err != nil {
 		return nil, fmt.Errorf("leanhttp: dial %s: %w", addr, err)
 	}
 	if conn == nil {
-		return nil, fmt.Errorf("leanhttp: Call.Dial returned no connection and no error for %s", addr)
+		return nil, fmt.Errorf("leanhttp: DialContext returned no connection and no error for %s", addr)
 	}
 	// Elk faalpad hierna sluit de verbinding; het succespad geeft hem als Body
 	// aan de aanroeper mee.
@@ -577,6 +526,16 @@ func do(c Call, via *Client, raw string, total time.Time) (_ *Response, err erro
 			return nil, fmt.Errorf("leanhttp: set deadline: %w", err)
 		}
 	}
+	// De gebufferde lezer komt VÓÓR de body-send tot leven: de Expect-dans
+	// hieronder wil op het antwoord kunnen wachten voordat er één body-byte
+	// vertrokken is.
+	var br *bufio.Reader
+	if pc, ok := conn.(*pooledConn); ok {
+		br = pc.br // de pool bewaart de reader bij de verbinding, altijd
+	} else {
+		br = bufio.NewReaderSize(conn, bufSize)
+	}
+
 	// pooled: dit verzoek rijdt op een hergebruikte verbinding. Faalt die vóór
 	// de eerste antwoordbyte, dan is dat vrijwel altijd een server die zijn
 	// idle keep-alive net sloot — doVia mag dan één keer veilig opnieuw (er is
@@ -591,45 +550,83 @@ func do(c Call, via *Client, raw string, total time.Time) (_ *Response, err erro
 	if _, err := conn.Write(req); err != nil {
 		return nil, stale(fmt.Errorf("leanhttp: write request: %w", err))
 	}
-	if c.BodyReader != nil {
-		// Precies BodyLen bytes: dat is wat de Content-Length de server belooft.
-		// Een reader die minder levert laat de server op de rest wachten en de
-		// verbinding hangen — dus dat is hier een fout, niet een korte upload.
+	// Precies BodyLen bytes: dat is wat de Content-Length de server belooft.
+	// Een reader die minder levert laat de server op de rest wachten en de
+	// verbinding hangen — dus dat is een fout, niet een korte upload.
+	sendStream := func() error {
 		n, err := io.CopyN(conn, c.BodyReader, c.BodyLen)
 		switch {
 		case err != nil:
-			return nil, fmt.Errorf("leanhttp: stream body after %d of %d bytes: %w", n, c.BodyLen, err)
+			return fmt.Errorf("leanhttp: stream body after %d of %d bytes: %w", n, c.BodyLen, err)
 		case n != c.BodyLen:
-			return nil, fmt.Errorf("leanhttp: BodyReader gave %d bytes, Content-Length promised %d", n, c.BodyLen)
+			return fmt.Errorf("leanhttp: BodyReader gave %d bytes, Content-Length promised %d", n, c.BodyLen)
 		}
+		return nil
 	}
-	if len(c.Body) > 0 {
-		if _, err := conn.Write(c.Body); err != nil {
-			return nil, fmt.Errorf("leanhttp: write body: %w", err)
+	bodySent := c.BodyReader == nil
+	if c.BodyReader != nil {
+		// De Expect-dans (RFC 9110 §10.1.1): requestBytes stuurde
+		// "Expect: 100-continue" mee, dus de server oordeelt éérst; de
+		// statusloop hieronder leest dat oordeel — een 100 laat de stroom
+		// vertrekken, een vroege 401/413 spaart hem volledig uit. STILTE IS
+		// EEN FOUT (eenendertigste ronde), en de termijn daarop is ÉÉN
+		// absolute deadline die blijft staan tot het complete oordeel —
+		// statusregel én kopblok — binnen is. De Peek(1) die hier stond
+		// bewaakte alleen de éérste byte: daarna kreeg de server er een verse
+		// kop-termijn bovenop (één byte op 90ms + de rest op 160ms slaagde
+		// met HeaderTimeout: 100ms), en zonder verdere termijnen mocht hij na
+		// die ene byte zelfs eeuwig zwijgen (review 13-08, tweeëndertigste
+		// ronde).
+		wacht := time.Now().Add(expectTimeout)
+		if c.HeaderTimeout > 0 {
+			if h := time.Now().Add(c.HeaderTimeout); h.Before(wacht) {
+				wacht = h // het oordeel is een kop: de kop-termijn geldt ook hier
+			}
+		}
+		if !total.IsZero() && total.Before(wacht) {
+			wacht = total
+		}
+		if err := conn.SetDeadline(wacht); err != nil {
+			return nil, fmt.Errorf("leanhttp: set deadline: %w", err)
+		}
+	} else {
+		if len(c.Body) > 0 {
+			if _, err := conn.Write(c.Body); err != nil {
+				return nil, fmt.Errorf("leanhttp: write body: %w", err)
+			}
 		}
 	}
 	// De kop-termijn gaat pas NU in: het contract zegt "alleen het wachten op
 	// de antwoordkop", en vóór deze verplaatsing stond hij al tijdens de upload
 	// aan — een trage S3-upload sneuvelde dan op de header-timeout terwijl er
-	// niets mis was (review 13-08, negende ronde). Binnen total blijven.
-	if c.HeaderTimeout > 0 {
+	// niets mis was (review 13-08, negende ronde). Binnen total blijven. Als
+	// closure: de 100-tak in de statusloop moet hem voor de duur van de upload
+	// uit- en daarna opnieuw áánzetten (eenendertigste ronde).
+	armHeader := func() error {
+		if c.HeaderTimeout <= 0 {
+			return nil
+		}
 		if head := time.Now().Add(c.HeaderTimeout); total.IsZero() || head.Before(total) {
 			if err := conn.SetDeadline(head); err != nil {
-				return nil, fmt.Errorf("leanhttp: set header deadline: %w", err)
+				return fmt.Errorf("leanhttp: set header deadline: %w", err)
 			}
+		}
+		return nil
+	}
+	if c.BodyReader == nil {
+		// De stroom-variant heeft zijn oordeel-deadline al staan en die MOET
+		// blijven staan: hem hier verversen gaf de server per fase een nieuw
+		// budget (tweeëndertigste ronde). Ná de upload zet de 100-tak hem
+		// alsnog via ditzelfde closure.
+		if err := armHeader(); err != nil {
+			return nil, err
 		}
 	}
 
 	// Een verbinding uit de pool draagt zijn eigen bufio.Reader mee: daar kunnen
 	// bytes in staan die al van de socket gelezen zijn (de server stuurde kop en
-	// body in één pakket). Een nieuwe Reader maken zou die bytes weggooien en
-	// het volgende antwoord half laten beginnen.
-	var br *bufio.Reader
-	if pc, ok := conn.(*pooledConn); ok {
-		br = pc.br // de pool bewaart de reader bij de verbinding, altijd
-	} else {
-		br = bufio.NewReaderSize(conn, bufSize)
-	}
+	// body in één pakket). De Reader is hierboven al aan de verbinding
+	// gebonden (vóór de Expect-dans).
 	budget := maxHeaderBytes
 
 	// Interim-antwoorden (1xx) zijn geen eindantwoord: een 100 Continue of een
@@ -645,6 +642,13 @@ func do(c Call, via *Client, raw string, total time.Time) (_ *Response, err erro
 		line, err := readLine(br, &budget)
 		if err != nil {
 			if firstRead {
+				if c.BodyReader != nil && !bodySent {
+					// Geen (complete) statusregel binnen de oordeel-termijn:
+					// deze server spreekt (waarschijnlijk) geen Expect. Dat is
+					// een expliciete mismatch — benoemen scheelt de zoektocht
+					// die een kale "read status line: timeout" zou starten.
+					return nil, fmt.Errorf("leanhttp: no verdict on Expect: 100-continue (want 100 or a final status): %w", err)
+				}
 				// Nog geen antwoordbyte gezien: op een gepoolde verbinding is
 				// dit het stale-keep-alive-geval en mag doVia herkansen. Ná
 				// een gelezen interim niet meer — er is dan al geconsumeerd.
@@ -666,6 +670,24 @@ func do(c Call, via *Client, raw string, total time.Time) (_ *Response, err erro
 		// De (meestal lege) kop van het interim-antwoord wegslikken.
 		if err := readHeaderBlock(br, &budget, nil); err != nil {
 			return nil, fmt.Errorf("leanhttp: read interim headers: %w", err)
+		}
+		if code == 100 && !bodySent {
+			// Het oordeel is er: de stroom mag vertrekken (Expect-dans). De
+			// kop-termijn dekt per contract alléén het wachten op een kop, dus
+			// hij gaat UIT voor de upload en daarna opnieuw aan — hij stond
+			// hier al gewapend en een upload die langer duurde dan de
+			// HeaderTimeout sneuvelde zonder dat er iets mis was
+			// (review 13-08, eenendertigste ronde).
+			if err := conn.SetDeadline(total); err != nil {
+				return nil, fmt.Errorf("leanhttp: clear header deadline: %w", err)
+			}
+			if err := sendStream(); err != nil {
+				return nil, err
+			}
+			bodySent = true
+			if err := armHeader(); err != nil {
+				return nil, err
+			}
 		}
 	}
 
@@ -743,8 +765,8 @@ func do(c Call, via *Client, raw string, total time.Time) (_ *Response, err erro
 		// `go test` die zijn eigen timeout haalde). De serverkant kende deze
 		// regel al; de clientkant niet.
 		rd, chunked = emptyBody{}, false
-		if code == StatusNoContent {
-			length = 0 // een 204 draagt per definitie niets
+		if code == StatusNoContent || code == 205 {
+			length = 0 // een 204/205 draagt per definitie niets (RFC 9110)
 		}
 		// Een 304 mag een informatieve Content-Length dragen (RFC 9110 §8.6):
 		// Length blijft dan de geadverteerde waarde, zoals bij HEAD
@@ -762,8 +784,10 @@ func do(c Call, via *Client, raw string, total time.Time) (_ *Response, err erro
 
 	// De kop is binnen: terug naar de totaal-deadline. Is die er niet (total is
 	// de nulwaarde), dan wist dit de deadline en mag de body zo lang duren als
-	// hij duurt — een artifact van 30MB hoort niet af te lopen.
-	if c.HeaderTimeout > 0 {
+	// hij duurt — een artifact van 30MB hoort niet af te lopen. Ook voor de
+	// stroom-variant zónder HeaderTimeout: daar staat de oordeel-deadline
+	// (expectTimeout) nog en die hoort niet over de responsebody te regeren.
+	if c.HeaderTimeout > 0 || c.BodyReader != nil {
 		if err := conn.SetDeadline(total); err != nil {
 			return nil, fmt.Errorf("leanhttp: restore deadline: %w", err)
 		}
@@ -784,7 +808,7 @@ func do(c Call, via *Client, raw string, total time.Time) (_ *Response, err erro
 	keepAliveOK := proto != "HTTP/1.0" || connectionHas(connHdr, "keep-alive")
 	bodyless := isHEAD || !bodyAllowed(code)
 	reuse := via != nil && keepAliveOK && (bodyless || chunked || length >= 0) &&
-		!connectionHas(connHdr, "close")
+		!connectionHas(connHdr, "close") && bodySent
 
 	handedOff = true
 	b := body{r: rd, c: conn, deadline: total}
@@ -824,6 +848,15 @@ func requestBytes(c Call, u *url.URL, keepAlive bool) ([]byte, error) {
 		// headernamen (review 13-08, vijfde ronde).
 		return nil, fmt.Errorf("leanhttp: invalid method %q", c.Method)
 	}
+	if method == "CONNECT" {
+		// CONNECT vraagt een tunnel, en dit pakket heeft geen tunnel-API: na
+		// een 2xx zou de verbinding rauw moeten worden overgedragen, en dat
+		// contract bestaat hier niet. Hem tóch serialiseren stuurde een
+		// tunnelopdracht de deur uit waarvan het antwoord vervolgens als
+		// gewone response gelezen werd (review 13-08, vierendertigste ronde;
+		// de serverkant weigert hem sinds de tweeëndertigste).
+		return nil, errors.New("leanhttp: CONNECT is not supported (this client is never a tunnel)")
+	}
 	var b bytes.Buffer
 	// Accept-Encoding: identity is de DEFAULT, niet een wet — wij pakken niets
 	// uit, dus vragen we niets. Wie wél gecomprimeerd wil (een browser: 2-5×
@@ -848,7 +881,11 @@ func requestBytes(c Call, u *url.URL, keepAlive bool) ([]byte, error) {
 		if c.BodyLen < 0 {
 			return nil, errors.New("leanhttp: BodyReader needs a BodyLen (this package does not chunk uploads)")
 		}
-		fmt.Fprintf(&b, "Content-Length: %d\r\n", c.BodyLen)
+		// Een stroom kan niet opnieuw, dus vraagt hij eerst het oordeel van
+		// de server (RFC 9110 §10.1.1): een vroege 401/413 spaart de hele
+		// upload uit — zie de Expect-dans in do (review 13-08,
+		// negenentwintigste ronde).
+		fmt.Fprintf(&b, "Content-Length: %d\r\nExpect: 100-continue\r\n", c.BodyLen)
 	case c.Body != nil:
 		fmt.Fprintf(&b, "Content-Length: %d\r\n", len(c.Body))
 	}
@@ -863,10 +900,13 @@ func requestBytes(c Call, u *url.URL, keepAlive bool) ([]byte, error) {
 			// Zelfde grammatica als inkomend (validFieldValue): ook een NUL of
 			// VT is een injectievector, niet alleen CR/LF.
 			return nil, fmt.Errorf("leanhttp: illegal value for header %q", k)
-		// De vier hierboven zijn van ons; stil laten overschrijven zou het
-		// verzoek onbegrijpelijk maken.
+		// De framing- en verbindingsheaders zijn van ons; stil laten
+		// overschrijven zou het verzoek onbegrijpelijk maken. Expect hoort er
+		// sinds de tweeëndertigste ronde bij: BodyReader schrijft hem zelf, en
+		// een caller-Expect ernaast gaf twee (mogelijk strijdige) regels.
 		case strings.EqualFold(k, "Host"), strings.EqualFold(k, "Content-Length"),
-			strings.EqualFold(k, "Connection"), strings.EqualFold(k, "Transfer-Encoding"):
+			strings.EqualFold(k, "Connection"), strings.EqualFold(k, "Transfer-Encoding"),
+			strings.EqualFold(k, "Expect"):
 			return nil, fmt.Errorf("leanhttp: header %q is set by the package, not by the caller", k)
 		case strings.EqualFold(k, "Accept-Encoding"):
 			continue // al in de statusregel geschreven; niet dubbel

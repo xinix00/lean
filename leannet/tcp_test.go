@@ -1932,3 +1932,75 @@ func TestTCPHandshakeResetDeRTO(t *testing.T) {
 			w.a.rto, w.a.retries, w.a.backoff)
 	}
 }
+
+// TestTCPCumulatieveACKNaGoBackN — goBackN spoelt nxt (de zendcursor) terug;
+// een geldige cumulatieve ACK die de hertransmissie vóór was werd dan als
+// "future" geweigerd — bij een gekrompen venster zelfs blijvend. nxt is nu
+// weer een cursor en maxSent de high-watermark (review 13-08,
+// negenentwintigste ronde).
+func TestTCPCumulatieveACKNaGoBackN(t *testing.T) {
+	w := newTCPPair(t, 32<<10, 32<<10)
+	w.connect()
+	c := w.a
+	if _, err := c.write(make([]byte, 4000)); err != nil { // 3 segmenten à ~1460
+		t.Fatal(err)
+	}
+	segs := w.drain(c) // ... en alle drie zoek
+	if len(segs) < 3 {
+		t.Fatalf("opzet: %d segmenten, wil ≥3", len(segs))
+	}
+	hoog := c.nxt
+	wnd := uint16(c.sndWnd)
+	for i := 0; i < 3; i++ { // drie duplicaten → fast retransmit spoelt nxt terug
+		c.recv(tcpSeg{seq: c.rcvNxt, ack: c.una, flags: FlagACK, wnd: wnd}, w.now)
+	}
+	if c.nxt == hoog {
+		t.Fatal("opzet: goBackN heeft de cursor niet teruggespoeld")
+	}
+	// De cumulatieve ACK voor álles arriveert vóór de pomp opnieuw zond.
+	c.recv(tcpSeg{seq: c.rcvNxt, ack: hoog, flags: FlagACK, wnd: wnd}, w.now)
+	if c.una != hoog {
+		t.Fatalf("una = %d, wil %d — de geldige cumulatieve ACK is geweigerd", c.una, hoog)
+	}
+	if c.nxt != hoog {
+		t.Fatalf("nxt = %d, wil bijgetrokken tot %d", c.nxt, hoog)
+	}
+}
+
+// TestTCPDubbeleSYNVerliestDeFinaleACKNiet — een dubbele SYN (onze SYN-ACK
+// leek zoek) spoelt nxt terug naar iss voor de hertransmissie. Kruiste de
+// FINALE ACK van de peer die dubbele SYN op de draad, dan wees de
+// SYN-RCVD-poort (ack ≤ nxt, met nxt=iss) hem af als toekomst-ACK en resette
+// hij de eigen handshake met een RST (review 13-08, eenendertigste ronde). De
+// maat hoort maxSent te zijn: die rewindt nooit.
+func TestTCPDubbeleSYNVerliestDeFinaleACKNiet(t *testing.T) {
+	w := newTCPPair(t, 8<<10, 8<<10)
+
+	syn := w.drain(w.a) // de SYN van de actieve kant
+	if len(syn) != 1 || !syn[0].flags.Has(FlagSYN) {
+		t.Fatalf("verwachtte de SYN, kreeg %v", syn)
+	}
+	w.b.recv(syn[0], w.now)
+	for _, seg := range w.drain(w.b) { // SYN-ACK naar a
+		w.a.recv(seg, w.now)
+	}
+	final := w.drain(w.a) // de finale ACK — nog even vasthouden
+	if len(final) != 1 || final[0].ack != w.b.iss+1 {
+		t.Fatalf("verwachtte de finale ACK op iss+1, kreeg %v", final)
+	}
+
+	// Het netwerk-duplicaat van de oorspronkelijke SYN arriveert eerst: b
+	// spoelt nxt terug voor een verse SYN-ACK.
+	w.b.recv(syn[0], w.now)
+	// En dán pas de finale ACK, vóór die hertransmissie de deur uit is.
+	w.b.recv(final[0], w.now)
+
+	if w.b.state != tcpEstablished {
+		t.Fatalf("b staat in %v, wil ESTABLISHED — de finale ACK is afgewezen", w.b.state)
+	}
+	for _, seg := range w.drain(w.b) {
+		if seg.flags.Has(FlagRST) {
+			t.Fatal("b resette zijn eigen handshake op de kruisende finale ACK")
+		}
+	}
+}

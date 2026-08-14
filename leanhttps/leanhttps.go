@@ -105,25 +105,14 @@ func (c Client) Do(call leanhttp.Call) (*leanhttp.Response, error) {
 	return leanhttp.Do(call)
 }
 
-// Dialer geeft de TLS-dialer los, om in een [leanhttp.Client] te hangen: dan
-// poolt die versleutelde verbindingen (keep-alive over TLS). Dat is de vorm die
-// een browser wil — dertig resources van één host over één handshake.
+// DialerContext geeft de TLS-dialer los, om in een [leanhttp.Client] te
+// hangen: dan poolt die versleutelde verbindingen (keep-alive over TLS).
 //
 //	pool := &leanhttp.Client{DialContext: leanhttps.DialerContext(tlsCfg)}
 //
 // De config wordt niet gemuteerd en ServerName komt per verbinding uit het
-// dial-adres, net als bij [Client]. Neem [DialerContext] waar het kan: die
-// vorm kan de totaaltermijn van een call ook echt annuleren; deze blijft voor
-// wie alleen een Dial-gat heeft.
-func Dialer(cfg *leantls.Config) func(network, addr string) (net.Conn, error) {
-	c := Client{TLS: cfg}
-	return func(network, addr string) (net.Conn, error) {
-		return c.dial(context.Background(), network, addr)
-	}
-}
-
-// DialerContext is [Dialer] mét annulering — voor [leanhttp.Client.DialContext]
-// en [leanhttp.Call.DialContext].
+// dial-adres, net als bij [Client]. (De contextloze Dialer-vorm is gesloopt
+// in review 13-08, dertigste ronde: één dialer-gedaante.)
 func DialerContext(cfg *leantls.Config) func(ctx context.Context, network, addr string) (net.Conn, error) {
 	return Client{TLS: cfg}.dial
 }
@@ -152,6 +141,13 @@ func (c Client) call(call leanhttp.Call) (leanhttp.Call, error) {
 // dial verbindt versleuteld. De SNI-naam komt uit addr — dus uit de host die
 // leanhttp op DIT moment wil bereiken, niet uit de oorspronkelijke URL.
 func (c Client) dial(ctx context.Context, network, addr string) (net.Conn, error) {
+	if c.TLS == nil {
+		// DialerContext(nil) levert deze dialer zónder de wacht in call():
+		// een fout bij het dialen is laat maar leesbaar, een nil-deref op
+		// c.TLS.PeerKey hieronder was een panic vijf lagen van de oorzaak
+		// (review 13-08, eenendertigste ronde).
+		return nil, errNoConfig
+	}
 	host := addr
 	if h, _, err := net.SplitHostPort(addr); err == nil {
 		host = h

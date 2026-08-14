@@ -40,7 +40,6 @@ package leanhttp
 
 import (
 	"net/url"
-	"path"
 	"strings"
 )
 
@@ -69,8 +68,22 @@ func (m *Mux) HandleFunc(pattern string, h Handler) {
 	if i := strings.IndexByte(pattern, ' '); i >= 0 {
 		method, p = pattern[:i], strings.TrimSpace(pattern[i+1:])
 	}
-	if !strings.HasPrefix(p, "/") {
-		panic("leanhttp: pattern " + pattern + " must start with /")
+	// Vroeg falen, volledig (review 13-08, dertigste ronde): een kromme
+	// methode ("GE(T"), een nil-handler of een patroon dat nooit kan vuren
+	// is een bedradingsfout die je bij de start wilt zien, niet bij dispatch.
+	if h == nil {
+		panic("leanhttp: pattern " + pattern + " registered with a nil handler")
+	}
+	if method != "" && !validToken(method) {
+		panic("leanhttp: pattern " + pattern + " has a malformed method token")
+	}
+	if !canonicalPath(p) {
+		// Hetzelfde predicaat als requestdispatch (parser 400, ServeHTTP 404):
+		// de Trim/Split hieronder — met zijn overslaan van lege segmenten —
+		// vouwde "/a//b", "//a" en "/a//" anders STIL naar een andere route,
+		// die vervolgens nooit kon vuren of (erger) een andere dekking had
+		// dan geschreven stond (review 13-08, vierendertigste ronde).
+		panic("leanhttp: pattern " + pattern + " is not canonical (leading slash, no empty or dot segments)")
 	}
 	rt := route{method: method, h: h, subtree: strings.HasSuffix(p, "/")}
 	seen := map[string]bool{} // wildcardnamen binnen dit patroon
@@ -107,6 +120,7 @@ func (m *Mux) HandleFunc(pattern string, h Handler) {
 			// segment interpreteren is een valstrik, geen tolerantie.
 			panic("leanhttp: pattern " + pattern + " has a malformed wildcard segment " + seg)
 		default:
+			// (Dot-segmenten zijn hierboven al door canonicalPath geweigerd.)
 			if strings.ContainsRune(seg, '%') {
 				// Verzoekpaden zijn bij het parsen al gedecodeerd; een escaped
 				// literal zou dus nooit matchen. Patronen zijn broncode:
@@ -244,10 +258,17 @@ func (m *Mux) Handler() Handler { return m.ServeHTTP }
 // routes vormen dankzij de conflictwacht altijd een keten, dus paarsgewijs
 // vergelijken volstaat.
 func (m *Mux) ServeHTTP(w ResponseWriter, r *Request) {
-	// r.Path is bij het parsen al gedecodeerd en geschoond; opnieuw schonen
-	// dekt middleware-rewrites en met de hand gebouwde Requests, zodat mux en
-	// handler gegarandeerd hetzelfde pad zien.
-	r.Path = cleanPath(r.Path)
+	// GEEN normalisatie: de parser is de ene plek die het pad valideert
+	// (readRequest weigert niet-canoniek met een 400), en dit is hetzelfde
+	// predicaat als daar. Zonder deze wacht liet splitPath — dat slashes
+	// trimt — een handgebouwde "api/devices" of "//api/devices" alsnog
+	// matchen: normalisatie via de achterdeur (review 13-08, tweeëndertigste
+	// ronde). Een middleware-rewrite hoort canoniek aan te leveren;
+	// niet-canoniek bestaat hier gewoon niet: 404.
+	if !canonicalPath(r.Path) {
+		Error(w, "not found", StatusNotFound)
+		return
+	}
 	segs := splitPath(r.Path)
 	trailing := strings.HasSuffix(r.Path, "/")
 
@@ -275,12 +296,18 @@ func (m *Mux) ServeHTTP(w ResponseWriter, r *Request) {
 				continue
 			}
 			pathMatched = true // het pad bestaat, deze methode niet
+			if allowed == nil {
+				allowed = map[string]bool{}
+			}
 			if !allowed[rt.method] {
-				if allowed == nil {
-					allowed = map[string]bool{}
-				}
 				allowed[rt.method] = true
 				allowList = append(allowList, rt.method)
+			}
+			if rt.method == "GET" && !allowed["HEAD"] {
+				// Een GET-route bedient per contract ook HEAD: de Allow hoort
+				// dat te zeggen (review 13-08, dertigste ronde).
+				allowed["HEAD"] = true
+				allowList = append(allowList, "HEAD")
 			}
 			continue
 		}
@@ -354,6 +381,16 @@ func (r *route) match(segs []string, trailing bool) (map[string]string, bool) {
 // (review 13-08, zevenentwintigste ronde).
 func cleanEscapes(escaped string) bool {
 	for _, seg := range strings.Split(escaped, "/") {
+		if seg == "." || seg == ".." {
+			// Ook de RUWE dot-segmenten worden geweigerd: cleanPath vouwde
+			// /admin/. en /admin/x/.. tot /admin, waarmee de wortel van een
+			// beveiligde /admin/-subtree bij de publieke exacte route
+			// belandde — en middleware zag consistent dezelfde, verkeerde
+			// grens. Weigeren spaart bovendien het hele
+			// remove-dot-segments-algoritme uit (review 13-08,
+			// negenentwintigste ronde).
+			return false
+		}
 		if !strings.ContainsRune(seg, '%') {
 			continue
 		}
@@ -375,22 +412,24 @@ func splitPath(p string) []string {
 	return strings.Split(p, "/")
 }
 
-// cleanPath normaliseert: een leidende slash, geen "." of ".."-stappen, geen
-// dubbele slashes. Zonder dit zou "/app-ui/x/../.." bij een subtree-handler
-// komen die het nooit had mogen zien — en met een redirect (wat net/http
-// doet) verplaats je die vraag naar de client.
-func cleanPath(p string) string {
-	if p == "" {
-		return "/"
+// canonicalPath: één spelling per pad — begint met '/', geen lege segmenten
+// (dus geen "//"), geen "."/".."-segmenten; alleen de staart mag leeg zijn (de
+// sluitende slash, die betekenis draagt: subtree-wortel). Dit is het ENE
+// predicaat dat parser (400) en Mux (404) delen; zijn voorganger cleanPath
+// NORMALISEERDE in plaats van te toetsen, en elke normalisatie is een tweede
+// interpretatiemoment van hetzelfde pad (review 13-08, tweeëndertigste ronde).
+func canonicalPath(p string) bool {
+	if p == "" || p[0] != '/' {
+		return false
 	}
-	if p[0] != '/' {
-		p = "/" + p
+	segs := strings.Split(p[1:], "/")
+	for i, seg := range segs {
+		if seg == "." || seg == ".." {
+			return false
+		}
+		if seg == "" && i != len(segs)-1 {
+			return false
+		}
 	}
-	cleaned := path.Clean(p)
-	// path.Clean haalt een sluitende slash weg, en die slash betekent hier
-	// iets: hij bepaalt of een pad een subtree-patroon matcht.
-	if cleaned != "/" && strings.HasSuffix(p, "/") {
-		cleaned += "/"
-	}
-	return cleaned
+	return true
 }

@@ -164,13 +164,15 @@ type Client struct {
 	// MinIO en de meeste niet-AWS-providers; bij R2 mag beide.
 	UsePathStyle bool
 
-	// Dial vervangt de manier van verbinden. nil — het normale geval — kiest
+	// Dial vervangt de manier van verbinden (context-vorm sinds review 13-08,
+	// dertigste ronde: één dialer-gedaante in de hele stapel). nil — het
+	// normale geval — kiest
 	// op het schema van Endpoint: https krijgt een TLS-dialer die de
 	// certificaatketen valideert, http verbindt kaal (dan linkt leanhttp zelf
 	// niets van TLS). Zet hem voor een proxy, een unix-socket of een test die
 	// een lokale server onder een virtual-hosted bucketnaam moet bereiken —
 	// en weet dan dat je de versleuteling vervangt.
-	Dial func(network, addr string) (net.Conn, error)
+	Dial func(ctx context.Context, network, addr string) (net.Conn, error)
 
 	// Now vervangt de klok in de signatuur. nil = time.Now. Voor tests: een
 	// signatuur is per definitie tijdgebonden, dus zonder deze naad is er geen
@@ -234,6 +236,13 @@ func (c *Client) do(ctx context.Context, r request) (*leanhttp.Response, error) 
 		BodyReader: r.stream,
 		BodyLen:    r.streamLen,
 		Timeout:    timeoutFor(ctx),
+		// NoFollow, altijd: een SigV4-signatuur dekt exact déze host en dit
+		// pad, dus op de nieuwe URL is hij per definitie ongeldig — en erger:
+		// de gesigneerde headers (waaronder X-Amz-Security-Token) reisden mee
+		// naar waar de Location ook maar wees. Een 3xx wordt zo gewoon een
+		// StatusError met de Location in de body-dump (review 13-08,
+		// eenendertigste ronde).
+		NoFollow: true,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("leans3: %s %s: %w", r.op, r.key, err)
@@ -251,9 +260,17 @@ func (c *Client) do(ctx context.Context, r request) (*leanhttp.Response, error) 
 // laten groeien.
 func (c *Client) fail(op, key string, resp *leanhttp.Response) error {
 	switch resp.StatusCode {
-	case leanhttp.StatusNotFound:
-		return ErrNotFound
-	case statusPreconditionFailed, statusConflict:
+	case leanhttp.StatusNotFound, statusPreconditionFailed, statusConflict:
+		// De sentinel-gevallen zijn geen storing maar protocol (een miss, een
+		// verloren CAS-race) en komen dus VAAK: hun kleine XML-body begrensd
+		// leegdrinken houdt de (TLS-)verbinding poolbaar — de vroege return
+		// zonder drain sloot hem, en elke miss kostte zo een handshake
+		// (review 13-08, eenendertigste ronde). Groter dan de grens? Dan is
+		// hij niet leeg en sluit Close hem gewoon.
+		io.Copy(io.Discard, io.LimitReader(resp.Body, 4<<10))
+		if resp.StatusCode == leanhttp.StatusNotFound {
+			return ErrNotFound
+		}
 		return ErrPreconditionFailed
 	}
 	const maxBody = 4 << 10
@@ -276,7 +293,7 @@ func (c *Client) client() (*leanhttp.Client, error) {
 		if err != nil {
 			return nil, err
 		}
-		c.pool = &leanhttp.Client{Dial: dial}
+		c.pool = &leanhttp.Client{DialContext: dial}
 	}
 	return c.pool, nil
 }
@@ -289,7 +306,7 @@ func (c *Client) client() (*leanhttp.Client, error) {
 // golang.org/x/crypto/x509roots/fallback in de main). Er is bewust geen
 // skip-verify-knop — een bucket met sleutels erin is de laatste plek waar je
 // met de verkeerde tegenpartij wil praten.
-func (c *Client) dialer() (func(network, addr string) (net.Conn, error), error) {
+func (c *Client) dialer() (func(ctx context.Context, network, addr string) (net.Conn, error), error) {
 	if c.Dial != nil {
 		return c.Dial, nil
 	}
@@ -299,7 +316,7 @@ func (c *Client) dialer() (func(network, addr string) (net.Conn, error), error) 
 	}
 	switch u.Scheme {
 	case "https":
-		return leanhttps.Dialer(&leantls.Config{
+		return leanhttps.DialerContext(&leantls.Config{
 			VerifyPeer:          x509verify.Chain(nil),
 			SignatureAlgorithms: x509verify.SignatureAlgorithms,
 		}), nil

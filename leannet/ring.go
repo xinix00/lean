@@ -145,3 +145,16 @@ func (t *txRing) ack(k int) {
 // rewind spoelt de zend-cursor terug naar de kop: alles wat onbevestigd is
 // geldt weer als te verzenden (go-back-N na een RTO).
 func (t *txRing) rewind() { t.sent = 0 }
+
+// forceSent boekt bevestigde ruimte die een rewind als "onverzonden"
+// markeerde alsnog als verzonden: een cumulatieve ACK die de hertransmissie
+// vóór was popt anders voorbij de sent-cursor en dat is een boekhoud-panic
+// (review 13-08, negenentwintigste ronde).
+func (t *txRing) forceSent(k int) {
+	if k > t.n {
+		k = t.n
+	}
+	if t.sent < k {
+		t.sent = k
+	}
+}

@@ -14,9 +14,9 @@ that one.
 
 | | |
 |---|---|
-| [`leanhttp`](leanhttp/) | HTTP/1.1 without TLS — small client and server, chunked reading and writing |
+| [`leanhttp`](leanhttp/) | HTTP/1.1 without TLS — small client and server, sequential keep-alive and chunked responses |
 | [`leandhcp`](leandhcp/) | DHCPv4 (RFC 2131) on raw ethernet frames — a lease before any netstack exists |
-| [`leannet`](leannet/) | TCP/IP for bare-metal Go — ethernet, ARP, IPv4, ICMP echo, UDP, TCP, and `net.Conn`/`Listener`/`PacketConn` on top. One memory knob, buffers that grow with use instead of with configuration |
+| [`leannet`](leannet/) | TCP/IP for bare-metal Go — ethernet, ARP, IPv4, ICMP echo, UDP, TCP, and `net.Conn`/`Listener`/`PacketConn` on top. One total memory budget, an optional per-connection cap, and buffers that grow with use instead of with configuration |
 | [`leancookie`](leancookie/) | A cookie jar (RFC 6265) on `net/url` and strings — domain, path, expiry and Secure, without dragging `net/http/cookiejar` (and with it 3.2 MB of `net/http`) into the image. Host-only by default, because a public-suffix list is not something a bare-metal image should carry |
 | [`leanhttps`](leanhttps/) | **A composition:** `leanhttp` over `leantls`, and nothing else. Sets SNI per connection so it follows a redirect to another host. **2.01 MB** lighter than `net/http` + `crypto/tls` with a real chain, 3.12 MB with a pinned peer |
 | [`leans3`](leans3/) | S3: SigV4 signing plus the object operations, including the streaming and the conditional (If-Match/ETag) ones. It exists because one stack already carried **two** hand-written SigV4 implementations, and the second one skipped URI escaping — so a key with a space in it signed a different string than the server read. Reads the listing itself instead of with `encoding/xml`: **84 KB** less in a kernel, and a truncated response is still an error |
@@ -41,6 +41,14 @@ A package belongs here when all three hold:
 
 What does not belong here: anything that only becomes useful once you take
 three more along with it.
+
+## The HTTP/TCP KAM
+
+Lean means reduced scope, not reduced correctness. The frozen contract for
+`leanhttp`, `leanhttps`, `leans3` and `leannet` — what stays, what is narrowed,
+what is deliberately removed, and which release gates protect that boundary —
+is documented in [KAM.md](KAM.md). The document is in Dutch, like the package
+documentation.
 
 ## The one exception: compositions
 

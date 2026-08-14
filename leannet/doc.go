@@ -12,18 +12,23 @@
 // verliezen wedgen stil, en acht daarvan maakten een 8-slots listener blijvend
 // doof — op ijzer gezien als de dode console-poort van 11-08.
 //
-// leannet draait dat om. Er is één knop, Config.Budget: "hier heb je 2MB
-// (klein board) of 40MB (server), deel het zelf in." Niets wordt vooraf
-// geclaimd; elke verbinding start op een floor van enkele KiB en groeit op
-// gemeten gebruik (zendkant volgt de congestion window, ontvangkant volgt wat
-// de applicatie werkelijk per RTT uitleest), geklemd op Budget/4 per verbinding
-// en op wat de pot vrij heeft. Past zelfs de floor niet, dan weigert de stack
-// luid in plaats van stil te verhongeren.
+// leannet draait dat om. Er is één totale pot, Config.Budget: "hier heb je 2MB
+// (klein board) of 40MB (server), deel het zelf in." MaxBufPerConn is alleen
+// een optionele klem op het aandeel van één verbinding, geen tweede pot. Niets
+// wordt vooraf geclaimd; elke verbinding start met 16 KiB ontvangst- en 4 KiB
+// zendruimte en groeit op gemeten druk (een volle ontvangstring, of een Write
+// die niet past terwijl de peer meer venster biedt), standaard geklemd op
+// Budget/4 per verbinding en op wat de pot vrij heeft. Past zelfs de floor niet,
+// dan weigert de stack luid in plaats van stil te verhongeren.
 //
 // Retransmissie werkt op sequence-ruimte, niet op "data": SYN en FIN doen
 // gewoon mee en worden dus hergezonden. De klok in alle timer-contracten is
 // monotoon. Out-of-order ontvangst wordt in v1 niet gereassembleerd maar
 // gedropt met een directe dup-ACK, zodat de peer fast-retransmit kan doen.
 //
-// Ontwerpdossier: hop-os/docs/leannet-ontwerp.md.
+// De motivering staat in het [ontwerpdossier]. De bevroren,
+// package-overstijgende scope en release-gate staan in de [KAM].
+//
+// [ontwerpdossier]: https://github.com/xinix00/lean/blob/main/leannet/DESIGN.md
+// [KAM]: https://github.com/xinix00/lean/blob/main/KAM.md
 package leannet

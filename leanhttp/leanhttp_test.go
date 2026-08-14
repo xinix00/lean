@@ -6,6 +6,7 @@ package leanhttp
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"fmt"
 	"io"
 	"net"
@@ -144,7 +145,7 @@ func TestDialHookStuurtOm(t *testing.T) {
 	var dialedTo string
 	resp, err := Do(Call{
 		URL: "https://artifacts.example/app.elf",
-		Dial: func(network, addr string) (net.Conn, error) {
+		DialContext: func(_ context.Context, network, addr string) (net.Conn, error) {
 			dialedTo = addr // moet de hostnaam + 443 zijn, niet een IP
 			return net.Dial(network, strings.TrimPrefix(srv.URL, "http://"))
 		},
@@ -166,8 +167,8 @@ func TestDialHookStuurtOm(t *testing.T) {
 // verderop worden.
 func TestDialHookNilConn(t *testing.T) {
 	_, err := Do(Call{
-		URL:  "https://x.example/y",
-		Dial: func(string, string) (net.Conn, error) { return nil, nil },
+		URL:         "https://x.example/y",
+		DialContext: func(context.Context, string, string) (net.Conn, error) { return nil, nil },
 	})
 	if err == nil {
 		t.Fatal("nil-verbinding zonder fout werd geaccepteerd")

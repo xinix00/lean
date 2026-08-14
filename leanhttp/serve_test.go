@@ -138,9 +138,13 @@ func TestServeFlushStreamt(t *testing.T) {
 func TestServeDoneBijWegvallendeClient(t *testing.T) {
 	gemerkt := make(chan struct{})
 	base := serveer(t, func(w ResponseWriter, r *Request) {
+		// Vóór de eerste Flush: Done claimt de leeskant én de kop moet
+		// "Connection: close" kunnen zeggen (fail-fast sinds de
+		// tweeëndertigste ronde).
+		done := r.Done()
 		w.Write([]byte("hoi\n"))
 		w.Flush()
-		<-r.Done()
+		<-done
 		close(gemerkt)
 	})
 
@@ -190,25 +194,32 @@ func TestServePOSTMetBody(t *testing.T) {
 
 // Chunked verzoeken (fetch met een stream-body) moeten leesbaar zijn, niet
 // stilzwijgend leeg.
-func TestServeChunkedVerzoekBody(t *testing.T) {
+func TestServeChunkedVerzoekBodyIsEen501(t *testing.T) {
 	base := serveer(t, func(w ResponseWriter, r *Request) {
-		b, err := io.ReadAll(r.Body)
-		if err != nil {
-			Error(w, err.Error(), StatusBadRequest)
-			return
-		}
+		b, _ := io.ReadAll(r.Body)
 		w.Write(b)
 	})
 
-	// Een body zonder bekende lengte: net/http chunkt hem dan.
+	// Een body zonder bekende lengte: net/http chunkt hem dan — en chunked
+	// uploads zijn gesloopt (eenendertigste ronde): verzoeklichamen dragen
+	// een Content-Length, punt. De 501 hoort netjes aan te komen.
 	req, _ := http.NewRequest("POST", base+"/echo", io.NopCloser(strings.NewReader("hallo chunked")))
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatalf("POST: %v", err)
 	}
 	defer resp.Body.Close()
-	b, _ := io.ReadAll(resp.Body)
-	if string(b) != "hallo chunked" {
+	if resp.StatusCode != 501 {
+		t.Fatalf("status %d, wil 501 voor een gechunkt verzoek", resp.StatusCode)
+	}
+
+	// Mét lengte (net/http stuurt hem zodra de maat bekend is): gewoon werk.
+	resp2, err := http.Post(base+"/echo", "text/plain", strings.NewReader("hallo lengte"))
+	if err != nil {
+		t.Fatalf("POST met lengte: %v", err)
+	}
+	defer resp2.Body.Close()
+	if b, _ := io.ReadAll(resp2.Body); string(b) != "hallo lengte" {
 		t.Fatalf("echo %q", b)
 	}
 }

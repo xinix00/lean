@@ -9,6 +9,7 @@ import (
 	"net"
 	"os"
 	"strings"
+	"sync/atomic"
 	"sync"
 	"testing"
 	"time"
@@ -864,12 +865,20 @@ func TestStackUDPAccessors(t *testing.T) {
 	if _, _, err := u.ReadFrom(make([]byte, 8)); err != os.ErrDeadlineExceeded {
 		t.Errorf("ReadFrom err = %v, want deadline exceeded", err)
 	}
-	if err := u.SetWriteDeadline(time.Now()); err != nil {
+	// WriteTo met een verkeerd adrestype of onzinnige poort weigert luid —
+	// zónder verlopen deadline in de buurt: de oude test was daarop
+	// vals-groen (review 13-08, dertigste ronde).
+	if err := u.SetWriteDeadline(time.Time{}); err != nil {
 		t.Fatal(err)
 	}
-	// WriteTo met een niet-IPv4-adres weigert luid.
-	if _, err := u.WriteTo([]byte("x"), &net.TCPAddr{Port: 1}); err == nil {
+	if _, err := u.WriteTo([]byte("x"), &net.TCPAddr{IP: net.IP{10, 0, 0, 2}, Port: 1}); err == nil {
 		t.Error("WriteTo accepted a TCP address")
+	}
+	if _, err := u.WriteTo([]byte("x"), &net.UDPAddr{IP: net.IP{10, 0, 0, 2}, Port: -1}); err == nil {
+		t.Error("WriteTo accepted a negative port")
+	}
+	if _, err := u.WriteTo([]byte("x"), &net.UDPAddr{IP: net.IP{10, 0, 0, 2}, Port: 65536}); err == nil {
+		t.Error("WriteTo accepted port 65536")
 	}
 	u.Close()
 	u.Close() // idempotent
@@ -938,6 +947,7 @@ func TestStackFastReaderKeepsFullWindow(t *testing.T) {
 		t.Fatal(err)
 	}
 	srvDone := make(chan int, 1)
+	gemeten := make(chan struct{})
 	go func() {
 		c, err := l.Accept()
 		if err != nil {
@@ -947,6 +957,7 @@ func TestStackFastReaderKeepsFullWindow(t *testing.T) {
 		// Zo snel lezen als het maar kan: dit is de "snelle lezer".
 		n, _ := io.Copy(io.Discard, c)
 		srvDone <- int(n)
+		<-gemeten // de volle close geeft de ring terug (abandonRead): eerst meten
 		c.Close()
 	}()
 
@@ -968,13 +979,14 @@ func TestStackFastReaderKeepsFullWindow(t *testing.T) {
 	// volle initial-cwnd-burst kunnen dragen, ook al is zijn ring nooit
 	// gegroeid (snelle lezer). 10 × 1460 is de burst die een zender opent.
 	b.mu.Lock()
-	defer b.mu.Unlock()
 	for _, sc := range b.conns {
 		if w := sc.tcp.rx.size(); w < 10*1460 {
 			t.Fatalf("server receive window is %d bytes; a 10-segment initial burst (%d) does not fit, so bulk RX degrades to stop-and-wait",
 				w, 10*1460)
 		}
 	}
+	b.mu.Unlock()
+	close(gemeten)
 }
 
 // TestStackSelfDial: een wereld moet bij zichzelf kunnen. Zonder de
@@ -2779,5 +2791,517 @@ func TestSocketWeigertOnzinnigePoort(t *testing.T) {
 		if err == nil || v != nil {
 			t.Fatalf("poort %d: kreeg (%v, %v), wil (nil, error)", port, v, err)
 		}
+	}
+}
+
+// TestSocketCloseGeeftRxDirectTerug — de volle close van de socket-laag hoort
+// abandonRead aan te roepen: zonder die bedrading hield een gepoolde/idle-
+// geëvicte verbinding minstens 16KiB RX-budget vast tot de peer sloot of
+// FIN-WAIT-2 na 20s verliep (review 13-08, negenentwintigste ronde — de
+// machinefix bestond, de wiring was in een toggle-herstel gesneuveld).
+func TestSocketCloseGeeftRxDirectTerug(t *testing.T) {
+	a, b := newStackPair(t, 1<<20, 1<<20)
+	l, err := b.Listen(93)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	klaar := make(chan struct{})
+	go func() {
+		if c, err := l.Accept(); err == nil {
+			<-klaar // b sluit NIET: a moet zijn budget zelf terugkrijgen
+			c.Close()
+		}
+	}()
+	conn, err := a.DialTCP([4]byte{10, 0, 0, 2}, 93, time.Now().Add(5*time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn.Close()
+	time.Sleep(200 * time.Millisecond) // FIN + ACK wisselen; b blijft open
+	a.mu.Lock()
+	used := a.pot.used
+	a.mu.Unlock()
+	if used != 0 {
+		t.Fatalf("a's pot draagt nog %d bytes na de volle close — abandonRead is niet bedraad", used)
+	}
+	close(klaar)
+}
+
+// TestConnectedUDPWeigertWriteTo — na DialUDP(peerA) is WriteTo naar peerB
+// een zwart gat (replies van B worden bij deliver al weggegooid): het
+// net.UDPConn-contract weigert hem, wij nu ook (review 13-08, dertigste
+// ronde).
+func TestConnectedUDPWeigertWriteTo(t *testing.T) {
+	a, _ := newStackPair(t, 1<<20, 1<<20)
+	u, err := a.DialUDP([4]byte{10, 0, 0, 2}, 53)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer u.Close()
+	if _, err := u.WriteTo([]byte("x"), &net.UDPAddr{IP: net.IP{10, 0, 0, 3}, Port: 53}); !errors.Is(err, net.ErrWriteToConnected) {
+		t.Fatalf("WriteTo op een connected socket gaf %v, wil net.ErrWriteToConnected", err)
+	}
+}
+
+// TestSeedNeighborKentEenPlafond — statische seeds omzeilen tick, sweep én
+// verdringing: onbegrensd zaaien kon de tabel vullen waarna resolve geen
+// pending entry meer kwijt kon en een UDP-write zonder deadline permanent
+// sliep (review 13-08, dertigste ronde).
+func TestSeedNeighborKentEenPlafond(t *testing.T) {
+	da, db := &memDevice{}, &memDevice{}
+	da.peer, db.peer = db, da
+	s := NewStack(da, Config{
+		IP: [4]byte{10, 0, 0, 1}, Prefix: 24, MAC: [6]byte{2, 0, 0, 0, 0, 1},
+		Budget: 1 << 20,
+	}, 7)
+	t.Cleanup(s.Close)
+	var geweigerd bool
+	for i := 2; i < 2+arpCacheCap; i++ {
+		if err := s.SeedNeighbor([4]byte{10, 0, 0, byte(i)}, [6]byte{2, 0, 0, 0, 0, 9}); err != nil {
+			geweigerd = true
+			break
+		}
+	}
+	if !geweigerd {
+		t.Fatal("de cap-hoeveelheid seeds werd zonder morren geaccepteerd")
+	}
+	s.mu.Lock()
+	vrij := arpCacheCap - len(s.arp.entries)
+	s.mu.Unlock()
+	if vrij <= 0 {
+		t.Fatalf("geen vrije cache-plekken over (%d) — resolve kan nergens meer heen", vrij)
+	}
+}
+
+// TestSocketWeigertOngeldigLokaalAdres — een IPv6- of vreemd-type laddr werd
+// stil een wildcard-listener, en een vreemde poort klapte om via uint16
+// (review 13-08, dertigste ronde).
+func TestSocketWeigertOngeldigLokaalAdres(t *testing.T) {
+	da, db := &memDevice{}, &memDevice{}
+	da.peer, db.peer = db, da
+	s := NewStack(da, Config{
+		IP: [4]byte{10, 0, 0, 1}, Prefix: 24, MAC: [6]byte{2, 0, 0, 0, 0, 1},
+		Budget: 1 << 20,
+	}, 7)
+	t.Cleanup(s.Close)
+	for name, laddr := range map[string]net.Addr{
+		"ipv6":          &net.TCPAddr{IP: net.IPv6loopback, Port: 80},
+		"vreemde poort": &net.TCPAddr{IP: net.IP{10, 0, 0, 1}, Port: -1},
+		"andermans ip":  &net.TCPAddr{IP: net.IP{10, 0, 0, 9}, Port: 80},
+	} {
+		v, err := s.Socket(context.Background(), "tcp", afINET, sockSTREAM, laddr, nil)
+		if err == nil || v != nil {
+			t.Fatalf("%s: kreeg (%v, %v), wil (nil, error)", name, v, err)
+		}
+	}
+}
+
+// TestARPVolleTabelIsLuid — een resolver wiens query niet eens kán starten
+// (tabel vol met pending/statisch, niets verdringbaars) hoort dat als "geen
+// antwoord" te zien: er komt immers nooit een arpFailed-entry waar noAnswer op
+// zou slaan, dus sliep de wachter tot zijn deadline — of zonder deadline voor
+// altijd (review 13-08, eenendertigste ronde).
+func TestARPVolleTabelIsLuid(t *testing.T) {
+	tbl := newARPTable([4]byte{10, 0, 0, 1}, [6]byte{2, 0, 0, 0, 0, 1})
+	now := int64(time.Hour)
+	// De tabel volpompen met pending queries (allemaal onverdringbaar).
+	for i := 0; i < arpCacheCap; i++ {
+		tbl.resolve([4]byte{10, 0, byte(i >> 8), byte(i)}, now)
+	}
+	slachtoffer := [4]byte{10, 0, 200, 200}
+	if _, ok := tbl.resolve(slachtoffer, now); ok {
+		t.Fatal("resolve op een volle tabel gaf een MAC")
+	}
+	if !tbl.noAnswer(slachtoffer, now) {
+		t.Fatal("volle tabel: noAnswer bleef false — de wachter slaapt voor altijd")
+	}
+	if tbl.cnt.FullDrop == 0 {
+		t.Fatal("de geweigerde resolve is niet geteld (FullDrop)")
+	}
+	// Zodra er iets verdringbaars staat is het geen vol-fout meer: een entry
+	// lost op (wordt verdringbaar) en de nieuwe resolve hoort weer te lopen.
+	tbl.learn([4]byte{10, 0, 0, 2}, [6]byte{2, 0, 0, 0, 0, 2}, now) // ververst niets: vol
+	tbl.recv(mustARPReply(t, [4]byte{10, 0, 0, 5}, [6]byte{2, 0, 0, 0, 0, 5}, [4]byte{10, 0, 0, 1}), now)
+	if tbl.noAnswer(slachtoffer, now) {
+		t.Fatal("met een verdringbare (opgeloste) entry hoort noAnswer weer false te zijn")
+	}
+}
+
+// mustARPReply bouwt een geldige aan-ons-gerichte reply voor de test hierboven.
+func mustARPReply(t *testing.T, senderIP [4]byte, senderHW [6]byte, target [4]byte) ARPFrame {
+	t.Helper()
+	buf := make([]byte, sizeARP)
+	if _, err := PutARP(buf, ARPReply, senderHW, senderIP, [6]byte{2, 0, 0, 0, 0, 1}, target); err != nil {
+		t.Fatal(err)
+	}
+	f, err := ParseARP(buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return f
+}
+
+// TestSocketWeigertBronpoortBijDial — een gevraagde bronpoort op een dial werd
+// stil genegeerd (de stack kiest altijd efemeer): dat hoort een luide fout te
+// zijn (review 13-08, eenendertigste ronde).
+func TestSocketWeigertBronpoortBijDial(t *testing.T) {
+	a, _ := newStackPair(t, 0, 0)
+	_, err := a.Socket(context.Background(), "tcp4", afINET, sockSTREAM,
+		&net.TCPAddr{IP: net.IP(a.cfg.IP[:]), Port: 1234},
+		&net.TCPAddr{IP: net.IPv4(10, 0, 0, 9), Port: 80})
+	if err == nil || !strings.Contains(err.Error(), "local port") {
+		t.Fatalf("dial met bronpoort gaf %v, wil een luide weigering", err)
+	}
+}
+
+// TestCapaciteitssweepLaatPendingMetRust — pending → failed doet UITSLUITEND
+// de pomp (emit): de capaciteitssweep in resolve (en noAnswer's toets) kon een
+// uitgeputte query buiten de pomp om naar failed tikken, en dan viel de
+// transitie buiten de GaveUp-tellerbaseline van drainLocked — de notify die
+// bestaande wachters moest wekken kwam er nooit (review 13-08,
+// tweeëndertigste ronde).
+func TestCapaciteitssweepLaatPendingMetRust(t *testing.T) {
+	tbl := newARPTable([4]byte{10, 0, 0, 1}, [6]byte{2, 0, 0, 0, 0, 1})
+	now := int64(time.Hour)
+	// Volle tabel met uitgeputte pending queries (laatste tussenpoos voorbij).
+	for i := 0; i < arpCacheCap; i++ {
+		ip := [4]byte{10, 0, byte(i >> 8), byte(i)}
+		tbl.entries[ip] = &arpEntry{state: arpPending, tries: arpQueryTries, due: now - 1}
+	}
+	// De capaciteitspaden (resolve op een nieuw IP → sweep, en noAnswer's
+	// vol-toets) mogen die staat niet aanraken.
+	tbl.resolve([4]byte{10, 0, 200, 200}, now)
+	tbl.noAnswer([4]byte{10, 0, 200, 201}, now)
+	if tbl.cnt.GaveUp != 0 {
+		t.Fatalf("GaveUp = %d buiten de pomp om — die transitie is van emit", tbl.cnt.GaveUp)
+	}
+	for ip, e := range tbl.entries {
+		if e.state != arpPending {
+			t.Fatalf("%v is %v geworden buiten de pomp om", ip, e.state)
+		}
+	}
+	// De pomp zelf geeft ze luid op — mét teller, dus mét notify.
+	buf := make([]byte, sizeARP)
+	for {
+		if _, ok := tbl.emit(buf, now); !ok {
+			break
+		}
+	}
+	if tbl.cnt.GaveUp != arpCacheCap {
+		t.Fatalf("emit gaf %d queries op, wil %d", tbl.cnt.GaveUp, arpCacheCap)
+	}
+}
+
+// ---- vierendertigste ronde ----
+
+// wachtOpPending pollt tot de ARP-entry voor ip pending is — het moment
+// waarop de wachter van de test écht op de query slaapt.
+func wachtOpPending(t *testing.T, s *Stack, ip [4]byte) {
+	t.Helper()
+	for begin := time.Now(); time.Since(begin) < 2*time.Second; {
+		s.mu.Lock()
+		e, ok := s.arp.entries[ip]
+		pending := ok && e.state == arpPending
+		s.mu.Unlock()
+		if pending {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatal("de ARP-query kwam nooit op gang")
+}
+
+// TestSeedWektDeWachter — SeedNeighbor kan een lopende query vervangen door
+// een statische entry; daarmee verdwijnt de query-timer uit nextDeadline, en
+// zonder notify sliep een deadline-loze UDP-writer op die route voorgoed
+// (review 13-08, vierendertigste ronde).
+func TestSeedWektDeWachter(t *testing.T) {
+	a, _ := newStackPair(t, 1<<20, 1<<20)
+	pc, err := a.ListenUDP(9000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pc.Close()
+	doel := [4]byte{10, 0, 0, 99} // niemand antwoordt op deze ARP
+	klaar := make(chan error, 1)
+	go func() {
+		_, err := pc.WriteTo([]byte("ping"), &net.UDPAddr{IP: net.IP(doel[:]), Port: 7})
+		klaar <- err
+	}()
+	wachtOpPending(t, a, doel)
+	if err := a.SeedNeighbor(doel, [6]byte{2, 0, 0, 0, 0, 99}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-klaar:
+		if err != nil {
+			t.Fatalf("WriteTo na de seed gaf %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("de seed loste de route op maar wekte de wachter niet")
+	}
+}
+
+// TestPassiefLerenWektDeWachter — passief leren kan een lopende query
+// oplossen terwijl het pakket zelf daarna op een early-return-pad sterft
+// (hier: UDP naar een poort zonder listener). Zonder notify uit het leren
+// zelf wekte niets de wachter meer (review 13-08, vierendertigste ronde).
+func TestPassiefLerenWektDeWachter(t *testing.T) {
+	a, _ := newStackPair(t, 1<<20, 1<<20)
+	pc, err := a.ListenUDP(9001)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pc.Close()
+	doel := [4]byte{10, 0, 0, 99}
+	klaar := make(chan error, 1)
+	go func() {
+		_, err := pc.WriteTo([]byte("ping"), &net.UDPAddr{IP: net.IP(doel[:]), Port: 7})
+		klaar <- err
+	}()
+	wachtOpPending(t, a, doel)
+
+	// Een geldig UDP-frame VAN het doel, naar een poort zonder listener: het
+	// no-port-pad dropt het (early return) — alleen het passieve leren blijft
+	// over, en dat moet de wachter wekken.
+	frame := make([]byte, EthernetHeaderSize+sizeIPv4+sizeUDP)
+	f, _ := ParseEth(frame)
+	f.SetDst([6]byte{2, 0, 0, 0, 0, 1})
+	f.SetSrc([6]byte{2, 0, 0, 0, 0, 99})
+	f.SetEtherType(EtherTypeIPv4)
+	if _, err := PutUDP(frame[EthernetHeaderSize+sizeIPv4:], 7, 4321, doel, [4]byte{10, 0, 0, 1}, 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := PutIPv4(frame[EthernetHeaderSize:], ProtoUDP, doel, [4]byte{10, 0, 0, 1}, sizeUDP); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.RecvInboundPacket(frame); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-klaar:
+		if err != nil {
+			t.Fatalf("WriteTo na het passieve leren gaf %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("het passieve leren loste de route op maar wekte de wachter niet")
+	}
+}
+
+// TestSeedRespecteertTotaalcap — de statics-cap (arpCacheCap/2) begrensde
+// alleen de seeds zelf: met 65 dynamische entries erbij groeide de tabel naar
+// 129, waarna resolve's ene verdringing nooit onder de cap kwam en fullLocked
+// tóch "niet vol" zei — geen query, geen fout, geen timer (review 13-08,
+// vierendertigste ronde).
+func TestSeedRespecteertTotaalcap(t *testing.T) {
+	a, _ := newStackPair(t, 0, 0)
+	a.mu.Lock()
+	for i := 0; i < 65; i++ { // 65 onverdringbare pending queries
+		a.arp.entries[[4]byte{10, 0, 0, byte(3 + i)}] = &arpEntry{state: arpPending, due: a.now()}
+	}
+	a.mu.Unlock()
+	geplant := 0
+	var laatste error
+	for i := 0; i < 64; i++ {
+		laatste = a.SeedNeighbor([4]byte{10, 0, 0, byte(100 + i)}, [6]byte{2, 0, 0, 0, 0, byte(i)})
+		if laatste == nil {
+			geplant++
+		}
+	}
+	if geplant != 63 || laatste == nil {
+		t.Fatalf("%d seeds geplant (wil 63) en de laatste gaf %v (wil een vol-fout)", geplant, laatste)
+	}
+	a.mu.Lock()
+	n := len(a.arp.entries)
+	a.mu.Unlock()
+	if n > arpCacheCap {
+		t.Fatalf("tabel draagt %d entries, cap is %d", n, arpCacheCap)
+	}
+}
+
+// TestResolveVerdringtTotErRuimteIs — stond de tabel ooit boven de cap, dan
+// moet resolve verdringen TOT er ruimte is (en fullLocked precies dan "vol"
+// zeggen wanneer dat niet kan) — één verdringing liet 129 entries op 128
+// staan: geen query én geen fout (review 13-08, vierendertigste ronde).
+func TestResolveVerdringtTotErRuimteIs(t *testing.T) {
+	now := int64(time.Hour)
+	over := func(evictable int) *arpTable {
+		tbl := newARPTable([4]byte{10, 0, 0, 1}, [6]byte{2, 0, 0, 0, 0, 1})
+		for i := 0; i < arpCacheCap+1-evictable; i++ {
+			tbl.entries[[4]byte{10, 1, byte(i >> 8), byte(i)}] = &arpEntry{state: arpPending, due: now}
+		}
+		for i := 0; i < evictable; i++ {
+			tbl.entries[[4]byte{10, 2, 0, byte(i)}] = &arpEntry{state: arpResolved, born: now}
+		}
+		return tbl // len = arpCacheCap+1: de historische boven-cap-toestand
+	}
+
+	// Twee verdringbare: resolve moet ze BEIDE ruimen en de query starten.
+	tbl := over(2)
+	doel := [4]byte{10, 3, 0, 1}
+	tbl.resolve(doel, now)
+	if e, ok := tbl.entries[doel]; !ok || e.state != arpPending {
+		t.Fatal("resolve startte geen query terwijl er (na twee verdringingen) ruimte was")
+	}
+	if len(tbl.entries) > arpCacheCap {
+		t.Fatalf("tabel draagt %d entries na resolve, cap is %d", len(tbl.entries), arpCacheCap)
+	}
+
+	// Eén verdringbare op 129: dat is en blijft vol — en fullLocked moet dat
+	// ook ZEGGEN, anders wacht de teleurgestelde resolver eeuwig.
+	tbl = over(1)
+	tbl.resolve(doel, now)
+	if _, ok := tbl.entries[doel]; ok {
+		t.Fatal("resolve startte een query op een tabel die vol hoort te zijn")
+	}
+	if !tbl.fullLocked(now) {
+		t.Fatal("fullLocked zei 'niet vol' terwijl resolve geen query kon starten — de wachter slaapt eeuwig")
+	}
+}
+
+// ---- zesendertigste ronde ----
+
+// arpFrameTeller telt uitgaande ARP-frames — het meetinstrument voor de
+// nul-ARP-belofte van een geseede gateway.
+type arpFrameTeller struct {
+	*memDevice
+	n atomic.Int32
+}
+
+func (d *arpFrameTeller) Transmit(p []byte) error {
+	if f, err := ParseEth(p); err == nil && f.EtherType() == EtherTypeARP {
+		d.n.Add(1)
+	}
+	return d.memDevice.Transmit(p)
+}
+
+// TestGatewaySeedDektOokDeGatewayZelf — de gateway is same-subnet, dus
+// verkeer NAAR hem viel buiten de gwMAC-route en startte alsnog ARP, terwijl
+// appnet.Up belooft dat dials naar de host nul ARP kosten (hopswitch maskeerde
+// dat door de query te beantwoorden). Nu: dst == cfg.GW && hasGwMAC routeert
+// rechtstreeks — TCP én UDP, nul ARP-frames (review 13-08, zesendertigste
+// ronde).
+func TestGatewaySeedDektOokDeGatewayZelf(t *testing.T) {
+	da, db := &memDevice{}, &memDevice{}
+	da.peer, db.peer = db, da
+	teller := &arpFrameTeller{memDevice: da}
+	a := NewStack(teller, Config{
+		IP: [4]byte{10, 0, 0, 1}, Prefix: 24, MAC: [6]byte{2, 0, 0, 0, 0, 1},
+		GW: [4]byte{10, 0, 0, 2}, Budget: 1 << 20, AdvWS: 2,
+	}, 12345)
+	b := NewStack(db, Config{
+		IP: [4]byte{10, 0, 0, 2}, Prefix: 24, MAC: [6]byte{2, 0, 0, 0, 0, 2},
+		Budget: 1 << 20, AdvWS: 2,
+	}, 54321)
+	stop := make(chan struct{})
+	rx := func(s *Stack, d *memDevice) {
+		buf := make([]byte, MTU+EthernetMaximumSize)
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			n, _ := d.Receive(buf)
+			if n == 0 {
+				time.Sleep(100 * time.Microsecond)
+				continue
+			}
+			s.RecvInboundPacket(buf[:n])
+		}
+	}
+	go rx(a, da)
+	go rx(b, db)
+	t.Cleanup(func() { close(stop); a.Close(); b.Close() })
+
+	if err := a.SeedNeighbor([4]byte{10, 0, 0, 2}, [6]byte{2, 0, 0, 0, 0, 2}); err != nil {
+		t.Fatal(err)
+	}
+	// TCP naar de gateway zelf.
+	l, err := b.Listen(80)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	go func() {
+		if c, err := l.Accept(); err == nil {
+			c.Close()
+		}
+	}()
+	c, err := a.DialTCP([4]byte{10, 0, 0, 2}, 80, time.Now().Add(5*time.Second))
+	if err != nil {
+		t.Fatalf("dial naar de geseede gateway: %v", err)
+	}
+	c.Close()
+	// En UDP.
+	pc, err := a.ListenUDP(9002)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pc.Close()
+	if _, err := pc.WriteTo([]byte("hi"), &net.UDPAddr{IP: net.IPv4(10, 0, 0, 2), Port: 7}); err != nil {
+		t.Fatalf("UDP naar de geseede gateway: %v", err)
+	}
+	if n := teller.n.Load(); n != 0 {
+		t.Fatalf("%d ARP-frames de deur uit — de seed belooft er nul", n)
+	}
+}
+
+// TestStatischeGatewayNegeertVolleTabel — off-subnet verkeer met een geseede
+// gateway-MAC heeft géén ARP-lot, maar nextHopLocked gaf de eindbestemming als
+// vulwaarde terug en de wachter vroeg daar tóch noAnswer op: op een tabel vol
+// onverdringbaar werk werd elke remote bestemming zo meteen "unreachable"
+// terwijl het pakket gewoon via de bekende MAC kan vertrekken (review 13-08,
+// zesendertigste ronde).
+func TestStatischeGatewayNegeertVolleTabel(t *testing.T) {
+	a, _ := newStackPair(t, 1<<20, 1<<20)
+	a.mu.Lock()
+	a.cfg.GW = [4]byte{10, 0, 0, 2}
+	a.gwMAC, a.hasGwMAC = [6]byte{2, 0, 0, 0, 0, 2}, true
+	for i := 0; i < arpCacheCap; i++ { // vol met onverdringbaar werk
+		a.arp.entries[[4]byte{10, 0, 1, byte(i)}] = &arpEntry{state: arpPending, due: a.now()}
+	}
+	a.mu.Unlock()
+	// De DIAL-cond is de plek die het gat had: die toetst noAnswer VÓÓR de
+	// uitkomst van de handshake, dus vóór de SYN ook maar vertrokken was.
+	// Niemand antwoordt op 192.168.1.1, dus de dial hoort op zijn DEADLINE te
+	// stranden (de SYN vertrok via de bekende gateway-MAC) — niet op de
+	// onmiddellijke "unreachable" die de volle tabel hem aanpraatte.
+	_, err := a.DialTCP([4]byte{192, 168, 1, 1}, 80, time.Now().Add(400*time.Millisecond))
+	if err == nil {
+		t.Fatal("dial slaagde — er is daar helemaal geen server")
+	}
+	if strings.Contains(err.Error(), "no route to host") {
+		t.Fatalf("dial gaf %v: de volle ARP-tabel blokkeerde een route zonder ARP-lot", err)
+	}
+	// En UDP blijft gewoon vertrekken (de route slaagt direct op gwMAC).
+	pc, err := a.ListenUDP(9003)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pc.Close()
+	if _, err := pc.WriteTo([]byte("hi"), &net.UDPAddr{IP: net.IPv4(192, 168, 1, 1), Port: 7}); err != nil {
+		t.Fatalf("off-subnet UDP via de statische gateway gaf %v", err)
+	}
+}
+
+// TestReseedVanBestaandeStaticMagAltijd — de static-cap werd getoetst vóór de
+// bestaat-hij-al-vraag: een MAC-update van een bestaande static (nul extra
+// entries) faalde dus zodra de cap vol stond (review 13-08, zesendertigste
+// ronde).
+func TestReseedVanBestaandeStaticMagAltijd(t *testing.T) {
+	a, _ := newStackPair(t, 0, 0)
+	for i := 0; i < arpCacheCap/2; i++ {
+		if err := a.SeedNeighbor([4]byte{10, 0, 0, byte(10 + i)}, [6]byte{2, 0, 0, 0, 0, byte(i)}); err != nil {
+			t.Fatalf("seed %d: %v", i, err)
+		}
+	}
+	// De cap staat vol; een verse static moet falen, een UPDATE niet.
+	if err := a.SeedNeighbor([4]byte{10, 0, 0, 200}, [6]byte{2, 0, 0, 0, 0, 200}); err == nil {
+		t.Fatal("de 65e statische seed passeerde de cap")
+	}
+	if err := a.SeedNeighbor([4]byte{10, 0, 0, 10}, [6]byte{2, 0, 0, 0, 0, 99}); err != nil {
+		t.Fatalf("MAC-update van een bestaande static gaf %v", err)
 	}
 }

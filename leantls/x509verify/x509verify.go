@@ -22,7 +22,7 @@
 // crypto/tls wegge-optimaliseerd.
 //
 // Belangrijker nog is wat die stapel-meting laat zien: leanhttp weigert een
-// https-URL zonder Call.Dial, en de enige Dial die je hem kon geven was
+// https-URL zonder Call.DialContext, en de enige dialer die je hem kon geven was
 // crypto/tls — waarmee de hele PKI weer binnenkwam en leanhttp's eigen 1,10 MB
 // niet te verzilveren was. Dit pakket plus leantls is wat die winst ontsluit.
 // Dát is de reden dat het bestaat, niet zijn eigen 0,63 MB.

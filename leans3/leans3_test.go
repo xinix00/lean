@@ -13,10 +13,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os/exec"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -523,5 +525,96 @@ func TestAfgebrokenContextDoetNiets(t *testing.T) {
 	}
 	if hits != 0 {
 		t.Errorf("server saw %d requests for a cancelled context", hits)
+	}
+}
+
+// ---- eenendertigste ronde ----
+
+// TestRedirectWordtNooitGevolgd — een SigV4-signatuur dekt exact déze host en
+// dit pad, dus op een Location is hij per definitie ongeldig — en de
+// gesigneerde headers (waaronder X-Amz-Security-Token) reisden vóór NoFollow
+// gewoon mee naar waar de server ook maar heen wees (review 13-08,
+// eenendertigste ronde).
+func TestRedirectWordtNooitGevolgd(t *testing.T) {
+	lekken := make(chan string, 1)
+	elders := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		lekken <- r.Header.Get("X-Amz-Security-Token")
+	}))
+	defer elders.Close()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, elders.URL+"/elders", http.StatusMovedPermanently)
+	}))
+	defer srv.Close()
+
+	c := klant(t, srv)
+	c.SessionToken = "STSGEHEIM"
+	_, _, err := c.Get(t.Context(), "sleutel")
+	var se *StatusError
+	if !errors.As(err, &se) || se.Code != http.StatusMovedPermanently {
+		t.Fatalf("Get gaf %v, wil een StatusError met de 301 zelf", err)
+	}
+	select {
+	case tok := <-lekken:
+		t.Fatalf("de redirect is gevolgd — token %q lag bij de andere host", tok)
+	default:
+	}
+}
+
+// TestUnsignedPayloadEistHTTPS — een niet-gesigneerde payload over plain http
+// is onderweg door iedereen te vervangen zonder dat S3 of wij dat merken; de
+// doc beloofde "alleen over https" maar dwong het niet af (review 13-08,
+// eenendertigste ronde).
+func TestUnsignedPayloadEistHTTPS(t *testing.T) {
+	c := &Client{Endpoint: "http://minio.lan:9000", Bucket: "b", Region: "r",
+		AccessKeyID: "AK", SecretAccessKey: "SK", UsePathStyle: true}
+	_, err := c.PutFrom(t.Context(), "k", strings.NewReader("x"), 1, UnsignedPayload, nil)
+	if err == nil || !strings.Contains(err.Error(), "https") {
+		t.Fatalf("UnsignedPayload over http gaf %v, wil een luide weigering", err)
+	}
+}
+
+// TestPutFromNulNeemtHetLengtepad — nul bytes stromen niet: geen Expect-dans,
+// gewoon Content-Length: 0 (review 13-08, eenendertigste ronde).
+func TestPutFromNulNeemtHetLengtepad(t *testing.T) {
+	zagExpect := make(chan string, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		zagExpect <- r.Header.Get("Expect")
+		w.Header().Set("ETag", `"leeg"`)
+	}))
+	defer srv.Close()
+	c := klant(t, srv)
+	etag, err := c.PutFrom(t.Context(), "k", strings.NewReader(""), 0, emptyPayloadHash, nil)
+	if err != nil || etag != `"leeg"` {
+		t.Fatalf("PutFrom(0) gaf (%q, %v), wil de ETag zonder fout", etag, err)
+	}
+	if e := <-zagExpect; e != "" {
+		t.Fatalf("PutFrom(0) stuurde Expect %q — de lege stroom hoort het lengtepad te nemen", e)
+	}
+}
+
+// TestSentinelHoudtDeVerbinding — een 404/412 is protocol (miss, verloren
+// CAS-race) en komt vaak: zijn kleine body hoort begrensd leeggedronken zodat
+// de (TLS-)verbinding poolbaar blijft in plaats van per miss een handshake te
+// kosten (review 13-08, eenendertigste ronde).
+func TestSentinelHoudtDeVerbinding(t *testing.T) {
+	var verbindingen int32
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "<Error><Code>NoSuchKey</Code></Error>", http.StatusNotFound)
+	}))
+	srv.Config.ConnState = func(c net.Conn, s http.ConnState) {
+		if s == http.StateNew {
+			atomic.AddInt32(&verbindingen, 1)
+		}
+	}
+	srv.Start()
+	defer srv.Close()
+	c := klant(t, srv)
+	for i := 0; i < 3; i++ {
+		if _, _, err := c.Get(t.Context(), "bestaat-niet"); !errors.Is(err, ErrNotFound) {
+			t.Fatalf("Get gaf %v, wil ErrNotFound", err)
+		}
+	}
+	if n := atomic.LoadInt32(&verbindingen); n != 1 {
+		t.Fatalf("%d verbindingen voor 3 misses — de sentinel-body wordt niet gedraind", n)
 	}
 }

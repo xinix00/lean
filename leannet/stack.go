@@ -179,6 +179,7 @@ type ARPStats struct {
 	MACChanged int // refresh die een ánder MAC op een bestaande entry zette
 	ReplyDrop  int // reply-antwoorden gedropt omdat de wachtrij vol was
 	LearnDrop  int // passieve leerpogingen geweigerd op een volle tabel (arpCacheCap)
+	FullDrop   int // resolves die geen query konden starten: tabel vol met pending/statisch
 }
 
 // Stats geeft de tellers als kopie, onder het stack-slot: race-vrij te lezen.
@@ -283,12 +284,52 @@ func (s *Stack) SeedNeighbor(ip [4]byte, mac [6]byte) error {
 	defer s.mu.Unlock()
 	if ip == s.cfg.GW {
 		s.gwMAC, s.hasGwMAC = mac, true
+		// Een al lopende query voor de gateway is nu zinloos (routeLocked
+		// raadpleegt de tabel voor hem nooit meer) én zijn wachters moeten
+		// wakker: de route is er — zonder notify sliep een deadline-loze
+		// writer voorgoed op een query wiens timer zojuist betekenisloos werd
+		// (review 13-08, vierendertigste ronde).
+		delete(s.arp.entries, ip)
+		s.notify()
 		return nil
 	}
 	if !sameSubnet(ip, s.cfg.IP, s.cfg.Prefix) {
 		return errors.New("leannet: seed outside subnet would never be consulted")
 	}
-	s.arp.seed(ip, mac)
+	// Statische entries omzeilen tick/sweep/verdringing: onbegrensd zaaien
+	// kon de tabel volledig vullen, waarna resolve geen pending entry of
+	// negatieve status meer kwijt kon en een UDP-write zonder deadline
+	// permanent sliep (review 13-08, dertigste ronde). De helft van de cap is
+	// ruim voor élke config; meer is een bedradingsfout en faalt luid. De cap
+	// telt alleen voor een seed die het aantal statics laat GROEIEN: een
+	// MAC-update van een bestaande static gebruikt geen extra plek en faalde
+	// eerst tóch zodra de cap vol stond (review 13-08, zesendertigste ronde).
+	e, exists := s.arp.entries[ip]
+	if !exists || !e.static {
+		statics := 0
+		for _, o := range s.arp.entries {
+			if o.static {
+				statics++
+			}
+		}
+		if statics >= arpCacheCap/2 {
+			return errors.New("leannet: too many static neighbor seeds (cap is arpCacheCap/2)")
+		}
+	}
+	// En de TOTALE cap geldt ook voor seeds: 65 dynamische + 64 statische gaf
+	// een tabel van 129, waarna resolve's ene verdringing nooit meer onder de
+	// cap kwam en fullLocked tóch "niet vol" zei — geen query, geen fout,
+	// geen timer (review 13-08, vierendertigste ronde). Een seed op een
+	// bestáánd IP groeit niet en mag altijd.
+	if !exists && !s.arp.makeRoom(s.now()) {
+		return errors.New("leannet: neighbor table is full of pending queries; cannot seed")
+	}
+	if s.arp.seed(ip, mac) {
+		// De seed verving een lopende query: de wachters daarop zien de route
+		// nu bij hun volgende blik — als iemand ze wekt. De query-timer die
+		// dat via de pomp deed bestaat niet meer, dus dat doen wij.
+		s.notify()
+	}
 	return nil
 }
 
@@ -386,8 +427,14 @@ func (s *Stack) recvIPv4(ip IPv4Frame, srcMAC [6]byte, now int64) {
 	// authenticatie — de échte grens is de cap in arp.learn — maar hij haalt
 	// de triviaalste vervalsing eruit.
 	learn := func() {
-		if sameSubnet(src, s.cfg.IP, s.cfg.Prefix) {
-			s.arp.learn(src, srcMAC, now)
+		if sameSubnet(src, s.cfg.IP, s.cfg.Prefix) && s.arp.learn(src, srcMAC, now) {
+			// Het passieve leren loste een lopende query op: de wachter op
+			// die route (dial, UDP-write) moet dat NU horen. Het pakket zelf
+			// kan hierna nog op een early-return-pad sterven (UDP zonder
+			// poort bijvoorbeeld) en dan notify't niets anders meer — de
+			// query-timer is met de pending-status mee verdwenen
+			// (review 13-08, vierendertigste ronde).
+			s.notify()
 		}
 	}
 	switch ip.Proto() {
@@ -732,7 +779,10 @@ func (s *Stack) drainLocked() (again bool) {
 			// zonder ARP-lot: een inbound SYN van zo'n peer maakte anders een
 			// embryo waarvan de timer nooit gewapend werd — een 20KiB-zombie
 			// per SYN, tot de pot leeg was (review 13-08, vijfde ronde).
-			if hop := s.nextHopLocked(key.rip); hop == ([4]byte{}) || s.arp.noAnswer(hop, now) {
+			if hop, viaARP := s.nextHopLocked(key.rip); viaARP && (hop == ([4]byte{}) || s.arp.noAnswer(hop, now)) {
+				// Alleen een route MET ARP-lot kan zo doodgaan; met een
+				// statische gateway-MAC kwam routeLocked hierboven nooit op
+				// !ok uit (review 13-08, zesendertigste ronde).
 				c.tcp.abort() // reset: read/write falen luid
 				s.reap(key, c)
 			}
@@ -812,17 +862,23 @@ func (s *Stack) nextDeadlineLocked() int64 {
 	return d
 }
 
-// nextHopLocked geeft het IP waarvan het ARP-lot dit doel draagt: binnen het
-// subnet het doel zelf, daarbuiten de gateway (nul = geen route geconfigureerd;
-// met een statische gateway-MAC is er geen ARP-lot en telt het doel als
-// onschadelijke vulling). Eén beslissing voor dial, UDP-write én de route-dood
-// in de pomp — drie inline kopieën waren al aan het uiteenlopen
-// (review 13-08, derde ronde).
-func (s *Stack) nextHopLocked(dst [4]byte) [4]byte {
-	if !sameSubnet(dst, s.cfg.IP, s.cfg.Prefix) && !s.hasGwMAC {
-		return s.cfg.GW
+// nextHopLocked geeft het IP waarvan het ARP-lot dit doel draagt, plus óf er
+// überhaupt een ARP-lot is. viaARP=false betekent: de route staat vast (een
+// geseede gateway-MAC) en geen enkele ARP-status mag hem blokkeren — de
+// vulwaarde-vorm die hier eerst stond liet dialTCP alsnog arp.noAnswer op de
+// eindbestemming vragen, en op een tabel vol onverdringbaar werk verklaarde
+// de vol-toets van de eenendertigste ronde die bestemming dan meteen
+// onbereikbaar terwijl de SYN gewoon via de bekende gateway-MAC kon
+// vertrekken (review 13-08, zesendertigste ronde). Eén beslissing voor dial,
+// UDP-write én de route-dood in de pomp (derde ronde).
+func (s *Stack) nextHopLocked(dst [4]byte) (hop [4]byte, viaARP bool) {
+	if s.hasGwMAC && (dst == s.cfg.GW || !sameSubnet(dst, s.cfg.IP, s.cfg.Prefix)) {
+		return dst, false // statisch plan: geen ARP-lot
 	}
-	return dst
+	if !sameSubnet(dst, s.cfg.IP, s.cfg.Prefix) {
+		return s.cfg.GW, true // nul = geen route geconfigureerd
+	}
+	return dst, true
 }
 
 // routeLocked beslist het volgende-hop-MAC: binnen het subnet direct via ARP,
@@ -852,6 +908,14 @@ func (s *Stack) routeLocked(dst [4]byte, now int64, query bool) ([6]byte, bool) 
 	// het antwoord op een rebind komt unicast op ciaddr terug.
 	if isBroadcastIP(dst, s.cfg.IP, s.cfg.Prefix) {
 		return bcastMAC, true
+	}
+	// Een geseede gateway geldt óók voor verkeer NAAR de gateway zelf: die is
+	// same-subnet en viel dus in de ARP-tak hieronder, terwijl appnet.Up juist
+	// belooft dat dials naar de host (10.100.0.1) nul ARP kosten — hopswitch
+	// maskeerde dat door de query alsnog te beantwoorden (review 13-08,
+	// zesendertigste ronde).
+	if s.hasGwMAC && dst == s.cfg.GW {
+		return s.gwMAC, true
 	}
 	if !sameSubnet(dst, s.cfg.IP, s.cfg.Prefix) {
 		if s.hasGwMAC {

@@ -30,6 +30,12 @@ import (
 const (
 	defaultMaxIdlePerHost = 2
 	defaultIdleTimeout    = 30 * time.Second
+
+	// defaultMaxIdleTotal begrenst de héle pool: alleen een per-host-cap liet
+	// een burst naar unieke (of case-gevarieerde) hosts op leannet de hele
+	// bufferpot claimen voor de duur van de idle-termijn (review 13-08,
+	// dertigste ronde).
+	defaultMaxIdleTotal = 8
 )
 
 // Client doet verzoeken mét keep-alive. Hij is veilig voor gelijktijdig
@@ -39,21 +45,20 @@ const (
 // De package-level [Do] en [Get] blijven de kale vorm: één verzoek per
 // verbinding, Connection: close. Wie geen pool wil, verandert niets.
 type Client struct {
-	// Dial maakt een nieuwe verbinding; nil = net.DialTimeout op tcp4. Zelfde
-	// contract als [Call.Dial] — een TLS-dialer past er dus ook op, en dan
-	// poolt dit type versleutelde verbindingen. Ook hetzelfde
-	// eindigheids-contract: de totaaltermijn begrenst het wachten, niet de
-	// dialer zelf.
-	Dial func(network, addr string) (net.Conn, error)
-
-	// DialContext is Dial mét annulering — zelfde contract als
-	// [Call.DialContext]; gaat vóór Dial als beide gezet zijn.
+	// DialContext maakt een nieuwe verbinding; nil = de stdlib-dialer op
+	// tcp4. Zelfde contract als [Call.DialContext] — een TLS-dialer past er
+	// dus ook op, en dan poolt dit type versleutelde verbindingen.
 	DialContext func(ctx context.Context, network, addr string) (net.Conn, error)
 
 	// MaxIdlePerHost is hoeveel ongebruikte verbindingen per host blijven
 	// staan; 0 = 2. Meer kost geheugen en socket-slots op de server, minder
 	// kost handshakes.
 	MaxIdlePerHost int
+
+	// MaxIdleTotal is het plafond over álle hosts samen; 0 = 8. Zie de
+	// const: zonder totaalcap claimde een burst naar unieke hosts de hele
+	// leannet-pot.
+	MaxIdleTotal int
 
 	// IdleTimeout is hoe lang een ongebruikte verbinding blijft staan; 0 = 30s.
 	// Wie langer wacht dan de server, krijgt een verbinding die al dicht is —
@@ -81,7 +86,7 @@ type idleConn struct {
 // laat hem daarna staan voor het volgende verzoek. Verder identiek aan [Do]:
 // een foutstatus is geen fout.
 func (cl *Client) Do(call Call) (*Response, error) {
-	if call.Dial != nil || call.DialContext != nil {
+	if call.DialContext != nil {
 		// Een eigen transport per call mengt niet met de pool: de verbinding
 		// erin stoppen zou een volgende Get een verbinding van een ánder
 		// transport geven (review 13-08, tweede ronde). Dit is dan gewoon een
@@ -91,7 +96,7 @@ func (cl *Client) Do(call Call) (*Response, error) {
 	// Het transport gaat als PARAMETER mee, niet als Call-veld: do() vraagt
 	// zelf via.Dial voor de schemewacht en via.dial voor de pool — er valt
 	// niets meer verkeerd te zetten (review 13-08, zesde ronde: drie eerdere
-	// rondes braken alle drie op "de pool-dialer vermomd als Call.Dial").
+	// rondes braken alle drie op "de pool-dialer vermomd als Call.DialContext").
 	return doVia(call, cl)
 }
 
@@ -120,7 +125,7 @@ func (cl *Client) CloseIdle() {
 }
 
 // dial pakt eerst een verbinding uit de pool; is er geen, dan een verse — in
-// de ene interne dialervorm (zie dialBounded in leanhttp.go): de ctx draagt
+// de ene interne dialervorm (zie normalizeDial in leanhttp.go): de ctx draagt
 // de totaaltermijn van de call, dus ook de fallback-dial hieronder leeft
 // erbinnen (review 13-08, elfde/twaalfde ronde; achttiende: genormaliseerd).
 //
@@ -150,38 +155,26 @@ func (cl *Client) dial(ctx context.Context, network, addr string) (net.Conn, err
 		if c == nil {
 			break
 		}
-		// Idle-read-probe: bytes die ná het poolen arriveerden (een laat,
-		// ongevraagd "antwoord" in de socketbuffer — onzichtbaar voor de
-		// Buffered()-toets in body.Close) diskwalificeren de verbinding vóór
-		// er een verzoek op vertrekt. De probe leest met een ~1ms-deadline:
-		// data (of een EOF van een server die al sloot) komt meteen, stilte
-		// kost hooguit de milliseconde — en dat werkt op leannet én de stdlib
-		// (de oude verleden-deadline-truc stierf toen await de deadline vóór
-		// gereed I/O ging toetsen; review 13-08, zevenentwintigste en
-		// achtentwintigste ronde).
-		if idleClean(c, br) {
+		// Alleen de Buffered()-toets: een verbinding met al-voorgelezen bytes
+		// draagt een ongevraagd "antwoord" en gaat dicht. GEEN read-probe
+		// meer: de 1ms-probe van de zevenentwintigste ronde vergiftigde élke
+		// gezonde TLS-verbinding (leantls maakt record-leesfouten bewust
+		// permanent, en een half gelezen recordheader is onherstelbaar),
+		// negeerde EOF's, en was TOCTOU. Een application-level Read ís geen
+		// liveness-probe; dat zou een blijvende reader-eigenaar per verbinding
+		// vergen (net/http's readLoop), en dat gewicht is deze pool niet waard
+		// (review 13-08, negenentwintigste ronde). Restrisico — bytes die ná
+		// deze toets arriveren — accepteren we alleen binnen het contract van
+		// een protocolcorrecte origin. De stale-herkansing vangt een GESLOTEN
+		// idle verbinding voor GET/HEAD op; zij kan een syntactisch geldig
+		// ongevraagd antwoord niet van een echt antwoord onderscheiden. Zie
+		// KAM.md.
+		if br.Buffered() == 0 {
 			return &pooledConn{Conn: c, br: br}, nil
 		}
 		c.Close()
 	}
-	return normalizeDial(cl.DialContext, cl.Dial)(ctx, network, addr)
-}
-
-// idleClean rapporteert of een uit de pool gepopte verbinding schoon is: geen
-// voorgelezen bytes, geen bytes in de socketbuffer, geen EOF — zie de
-// probe-uitleg bij dial.
-func idleClean(c net.Conn, br *bufio.Reader) bool {
-	if br.Buffered() > 0 {
-		return false
-	}
-	if c.SetReadDeadline(time.Now().Add(time.Millisecond)) != nil { // ~1ms: data komt meteen, stilte kost hooguit de milliseconde
-		return false
-	}
-	var b [1]byte
-	if n, _ := br.Read(b[:]); n > 0 {
-		return false
-	}
-	return c.SetReadDeadline(time.Time{}) == nil
+	return normalizeDial(cl.DialContext)(ctx, network, addr)
 }
 
 // popLocked pakt de warmste verbinding voor addr. De versheid is al geborgd:
@@ -217,6 +210,10 @@ func (cl *Client) put(addr string, c net.Conn, br *bufio.Reader) bool {
 	if max == 0 {
 		max = defaultMaxIdlePerHost
 	}
+	maxTotal := cl.MaxIdleTotal
+	if maxTotal == 0 {
+		maxTotal = defaultMaxIdleTotal
+	}
 	// De deadline van het vorige verzoek mag niet op een verbinding blijven
 	// staan die straks een ander verzoek draagt — en een transport dat de wis
 	// WEIGERT is per definitie niet herbruikbaar: poolen zou een kapotte
@@ -232,6 +229,13 @@ func (cl *Client) put(addr string, c net.Conn, br *bufio.Reader) bool {
 	cl.mu.Lock()
 	defer cl.mu.Unlock()
 	if len(cl.idle[addr]) >= max {
+		return false
+	}
+	total := 0
+	for _, list := range cl.idle {
+		total += len(list)
+	}
+	if total >= maxTotal {
 		return false
 	}
 	if cl.idle == nil {

@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net/url"
+	"strings"
 
 	"github.com/xinix00/lean/leanhttp"
 )
@@ -162,9 +163,39 @@ func (c *Client) PutFrom(ctx context.Context, key string, r io.Reader, size int6
 	if size < 0 {
 		return "", fmt.Errorf("leans3: PutFrom needs the size up front, got %d", size)
 	}
+	if payloadSHA256 == UnsignedPayload && !strings.HasPrefix(strings.ToLower(c.Endpoint), "https://") {
+		// De pakketdoc beloofde dit al ("dat mag alleen over https") maar
+		// dwong het niet af: een niet-gesigneerde én niet-versleutelde payload
+		// is onderweg door iedereen te vervangen zonder dat S3 of wij dat ooit
+		// merken (review 13-08, eenendertigste ronde).
+		return "", errors.New("leans3: UnsignedPayload over a plain-http endpoint would be silently modifiable in transit — use https, or pass the payload's sha256")
+	}
 	u, err := c.URLFor(key)
 	if err != nil {
 		return "", err
+	}
+	if size == 0 {
+		// Nul bytes stromen niet: het gewone Content-Length: 0-pad, zonder de
+		// Expect-dans die voor een lege body niets uitspaart (review 13-08,
+		// eenendertigste ronde). De hash blijft die van de aanroeper — S3
+		// verifieert hem tegen de (lege) payload.
+		resp, err := c.do(ctx, request{
+			op: methodPut, key: key, method: methodPut, url: u,
+			header:      putHeader(opt),
+			body:        []byte{},
+			payloadHash: payloadSHA256,
+		})
+		if err != nil {
+			return "", err
+		}
+		defer resp.Body.Close()
+		switch resp.StatusCode {
+		case leanhttp.StatusOK, leanhttp.StatusCreated, leanhttp.StatusNoContent:
+			io.Copy(io.Discard, resp.Body) // leegdrinken: zie Put
+			return resp.Header.Get("ETag"), nil
+		default:
+			return "", c.fail(methodPut, key, resp)
+		}
 	}
 	// BodyReader plus BodyLen stuurt de payload als stroom mét een
 	// Content-Length. Die lengte is geen netheid: zonder hem zou het verzoek
