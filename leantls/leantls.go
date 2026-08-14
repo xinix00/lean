@@ -117,6 +117,7 @@
 package leantls
 
 import (
+	"context"
 	"crypto/cipher"
 	"crypto/ed25519"
 	"crypto/sha256"
@@ -214,17 +215,41 @@ type Conn struct {
 
 var _ net.Conn = (*Conn)(nil)
 
-// Dial opent een TCP-verbinding en doet de handshake.
+// dialTimeout begrenst het opzetten van de verbinding én de handshake, elk
+// apart: een peer die de TCP-handdruk wél beantwoordt maar daarna zwijgt
+// (firewall-blackhole, kapotte middlebox) gijzelde anders de goroutine en de
+// socket voorgoed — en elke laag erboven (leanhttp's dialBounded) kan een
+// dialer alleen begrenzen als die zélf eindig is (review 13-08, dertiende
+// ronde). Zelfde waarde als leanhttp's dialTimeout.
+const dialTimeout = 10 * time.Second
+
+// Dial opent een TCP-verbinding en doet de handshake, beide met een termijn
+// (zie dialTimeout). Wie andere termijnen wil, dialt zelf en geeft de
+// verbinding aan [Client]; wie kan annuleren wil, neemt [DialContext].
 func Dial(network, addr string, cfg *Config) (*Conn, error) {
-	c, err := net.Dial(network, addr)
+	return DialContext(context.Background(), network, addr, cfg)
+}
+
+// DialContext is Dial mét annulering: ctx kapt de TCP-dial af, en zijn
+// deadline klemt (indien eerder) ook de handshake-termijn — zo leeft er geen
+// dial voort nadat de aanroeper al opgaf (review 13-08, vijftiende ronde).
+func DialContext(ctx context.Context, network, addr string, cfg *Config) (*Conn, error) {
+	d := net.Dialer{Timeout: dialTimeout}
+	c, err := d.DialContext(ctx, network, addr)
 	if err != nil {
 		return nil, err
 	}
+	dl := time.Now().Add(dialTimeout)
+	if cdl, ok := ctx.Deadline(); ok && cdl.Before(dl) {
+		dl = cdl
+	}
+	c.SetDeadline(dl)
 	tc, err := Client(c, cfg)
 	if err != nil {
 		c.Close()
 		return nil, err
 	}
+	c.SetDeadline(time.Time{})
 	return tc, nil
 }
 

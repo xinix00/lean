@@ -42,7 +42,6 @@ func TestMuxPatronen(t *testing.T) {
 		"DELETE /api/devices/",
 		"GET /api/devices/{id}",
 		"GET /api/devices/{id}/history",
-		"GET /app-ui/{app}/settings/{$}",
 		"GET /app-ui/{app}/settings/{path...}",
 		"GET /app-ui/{app}/pair/{driver}/{path...}",
 	} {
@@ -67,8 +66,9 @@ func TestMuxPatronen(t *testing.T) {
 		{"GET", "/api/devices/lamp-1/history", "GET /api/devices/{id}/history"},
 		{"DELETE", "/api/devices/lamp-1", "DELETE /api/devices/"},
 
-		// {$} eist dat het pad hier ophoudt; {path...} pakt de rest, ook diep.
-		{"GET", "/app-ui/com.x/settings/", "GET /app-ui/{app}/settings/{$}"},
+		// {path...} pakt de rest — ook de lege rest op de wortel-mét-slash
+		// ({$} is gesloopt in de zevenentwintigste ronde: subtree dekt dit).
+		{"GET", "/app-ui/com.x/settings/", "GET /app-ui/{app}/settings/{path...}"},
 		{"GET", "/app-ui/com.x/settings/style.css", "GET /app-ui/{app}/settings/{path...}"},
 		{"GET", "/app-ui/com.x/settings/a/b/c.png", "GET /app-ui/{app}/settings/{path...}"},
 		{"GET", "/app-ui/com.x/pair/switch/index.html", "GET /app-ui/{app}/pair/{driver}/{path...}"},

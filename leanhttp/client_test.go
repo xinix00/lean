@@ -326,3 +326,94 @@ func TestPoolNegeertHTTP10(t *testing.T) {
 		}
 	}
 }
+
+// TestPoolRuimtElkeHostOp — een verlopen verbinding naar host A moet ook
+// verdwijnen als het volgende verzoek naar host B gaat. Eerst gebeurde dat alleen
+// in get(addr): wie host A nooit meer belde, hield die verbinding voor altijd.
+//
+// Op een gewone machine is dat een slapende socket die niemand mist. Op een node
+// is het een stuk van de netstack-pot — leannet houdt de buffers van een open
+// verbinding gereserveerd en die groeien mee met wat er door ging, dus een
+// afgeronde download van 5MB laat een dikke verbinding achter. GEMETEN 12-08 op
+// een LicheeRV: na een reeks app-images was er zo weinig pot over dat élke nieuwe
+// verbinding "buffer budget exhausted" kreeg, en omdat de watchdog voor zijn
+// levensteken juist een VERSE verbinding eist, resette de node zichzelf.
+func TestPoolRuimtElkeHostOp(t *testing.T) {
+	hello := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, "ok")
+	})
+	hostA, _ := servedBy(t, hello)
+	hostB, _ := servedBy(t, hello)
+
+	cl := &Client{IdleTimeout: 20 * time.Millisecond}
+	defer cl.CloseIdle()
+
+	resp, err := cl.Get("http://" + hostA + "/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if n := cl.idleCount(); n != 1 {
+		t.Fatalf("pool draagt %d verbindingen na host A, wil 1", n)
+	}
+
+	time.Sleep(40 * time.Millisecond) // langer dan de idle-timeout
+
+	resp, err = cl.Get("http://" + hostB + "/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	io.ReadAll(resp.Body)
+	resp.Body.Close()
+
+	// Alleen host B mag er nog staan; die van A is verlopen en hoort gesloten.
+	if n := cl.idleCount(); n != 1 {
+		t.Fatalf("pool draagt %d verbindingen, wil 1 (alleen host B) — een verlopen "+
+			"verbinding naar een host die je niet meer belt blijft dus staan", n)
+	}
+	if cl.idleFor(hostA) != 0 {
+		t.Fatal("de verlopen verbinding naar host A staat nog in de pool")
+	}
+}
+
+// TestPoolRuimtOpVoorDeDial — de sweep moet vóór het verzoek gebeuren, niet
+// alleen erná (in put). De volgorde van het gemeten faalscenario: de pot van de
+// netstack is op dóór verlopen gepoolde verbindingen → de dial faalt → er komt
+// geen put → een sweep-in-put draait nooit. De toestand die de sweep moet
+// opruimen maakt hem dan onbereikbaar (review 13-08). Hier nagebootst met een
+// verzoek dat faalt: ook dán moet de verlopen verbinding weg zijn.
+func TestPoolRuimtOpVoorDeDial(t *testing.T) {
+	hostA, _ := servedBy(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, "ok")
+	}))
+	cl := &Client{IdleTimeout: 20 * time.Millisecond}
+	defer cl.CloseIdle()
+
+	resp, err := cl.Get("http://" + hostA + "/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if cl.idleCount() != 1 {
+		t.Fatal("verbinding naar host A kwam niet in de pool")
+	}
+	time.Sleep(40 * time.Millisecond) // laat hem verlopen
+
+	// Een adres dat gegarandeerd weigert: een net gesloten listener.
+	l, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dead := l.Addr().String()
+	l.Close()
+	if _, err := cl.Get("http://" + dead + "/"); err == nil {
+		t.Fatal("verwachtte een dial-fout naar een dichte poort")
+	}
+
+	if n := cl.idleCount(); n != 0 {
+		t.Fatalf("pool draagt nog %d verbindingen na een GEFAALD verzoek — "+
+			"de sweep zit dus achter het verzoek, en het faalscenario komt daar nooit", n)
+	}
+}

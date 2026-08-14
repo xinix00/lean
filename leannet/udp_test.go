@@ -87,8 +87,8 @@ func TestUDPDeliverRecvRoundtrip(t *testing.T) {
 func TestUDPQueueFullDrop(t *testing.T) {
 	tab := newUDPTable()
 	pot := &budget{total: 4096}
-	// Cap 40: één datagram van 16 bytes kost 8+16=24, twee passen niet.
-	u, err := tab.bind(7, 40, pot)
+	// Cap: één datagram van 16 bytes past (overhead+16), twee niet.
+	u, err := tab.bind(7, udpDGramOverhead+16+8, pot)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -187,7 +187,7 @@ func TestUDPDatagramBoundaries(t *testing.T) {
 func TestUDPTruncation(t *testing.T) {
 	tab := newUDPTable()
 	pot := &budget{total: 4096}
-	u, err := tab.bind(9, 32, pot)
+	u, err := tab.bind(9, udpDGramOverhead+16, pot)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -205,7 +205,7 @@ func TestUDPTruncation(t *testing.T) {
 		t.Fatal("truncated remainder still readable")
 	}
 	// En de vólledige kosten zijn vrijgegeven: een cap-vullend datagram past.
-	if !tab.deliver(9, udpTestSrc, 2, bytes.Repeat([]byte{1}, 32-udpDGramOverhead)) {
+	if !tab.deliver(9, udpTestSrc, 2, bytes.Repeat([]byte{1}, 16)) {
 		t.Fatal("queue accounting leaked after truncation")
 	}
 	u.close()

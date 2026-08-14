@@ -476,3 +476,30 @@ func TestTrustModelRequired(t *testing.T) {
 		})
 	}
 }
+
+// TestHandshakeRespecteertDeConnDeadline — Dial zet sinds de dertiende ronde
+// (review 13-08) een termijn op de verbinding vóór de handshake; dat werkt
+// alleen als de handshake een conn-deadline ook echt honoreert. Een zwijgende
+// peer (TCP op, handshake nooit) gijzelde anders goroutine én socket
+// voorgoed — en elke laag erboven (leanhttp's dialBounded) kan een dialer
+// alleen begrenzen als die zélf eindig is.
+func TestHandshakeRespecteertDeConnDeadline(t *testing.T) {
+	client, server := net.Pipe()
+	defer server.Close()
+	go io.Copy(io.Discard, server) // de peer slikt de ClientHello en zwijgt
+
+	client.SetDeadline(time.Now().Add(200 * time.Millisecond))
+	got := make(chan error, 1)
+	go func() {
+		_, err := Client(client, &Config{PeerKey: make([]byte, ed25519.PublicKeySize)})
+		got <- err
+	}()
+	select {
+	case err := <-got:
+		if err == nil {
+			t.Fatal("een handshake tegen een zwijgende peer slaagde?!")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("de handshake hangt voorbij de conn-deadline — een zwijgende peer gijzelt de goroutine")
+	}
+}

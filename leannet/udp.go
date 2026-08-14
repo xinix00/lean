@@ -26,10 +26,13 @@ var (
 	errUDPBudget    = errors.New("leannet: udp bind exceeds budget")
 )
 
-// udpDGramOverhead is wat één datagram naast zijn payload tegen de
-// wachtrijcapaciteit telt: de draad-header (8 bytes). Zo kan een vloed lege
-// datagrammen de wachtrij niet gratis laten vollopen.
-const udpDGramOverhead = sizeUDP
+// udpDGramOverhead is wat één datagram naast zijn payload écht kost in de
+// wachtrij: de udpDatagram-descriptor zelf is op 64-bit al ~40 bytes (slice-
+// header 24 + bron-IP/poort + padding) plus de allocatie-afronding van de
+// gekopieerde payload. De oude 8 (sizeUDP — de dráádoverhead, niet de heap-)
+// maakte van het budget geen werkelijke heapgrens (review 13-08,
+// achtentwintigste ronde).
+const udpDGramOverhead = 48
 
 // udpDatagram is één ontvangen datagram, afzender en grenzen inbegrepen.
 type udpDatagram struct {
@@ -86,6 +89,14 @@ func (t *udpTable) deliver(dstPort uint16, src [4]byte, srcPort uint16, payload 
 		t.cntNoPort++
 		return false
 	}
+	if u.connected && (src != u.peer || srcPort != u.peerPort) {
+		// Vreemde afzenders op een connected socket vallen hiér al af: het
+		// filter zat eerst pas in ReadFrom, dus kon een spoofer de hele
+		// wachtrij vullen en de echte peer verdringen (review 13-08,
+		// vijfentwintigste ronde).
+		u.cntDrop++
+		return false
+	}
 	cost := udpDGramOverhead + len(payload)
 	if u.used+cost > u.cap {
 		u.cntDrop++
@@ -106,8 +117,13 @@ type udpPort struct {
 	pot   *budget
 	port  uint16
 	cap   int // wachtrijcapaciteit in bytes, gereserveerd uit de pot
-	used  int // bezette bytes (overhead + payloads)
-	q     []udpDatagram
+
+	// connected-filter (zie deliver): gezet door DialUDP, onder het stack-slot.
+	connected bool
+	peer      [4]byte
+	peerPort  uint16
+	used      int // bezette bytes (overhead + payloads)
+	q         []udpDatagram
 
 	cntDrop int // datagrammen gedropt omdat de wachtrij vol was
 	closed  bool

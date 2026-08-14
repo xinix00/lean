@@ -61,15 +61,8 @@ func TestEthRoundtrip(t *testing.T) {
 	f.SetDst([6]byte{0xff, 0xff, 0xff, 0xff, 0xff, 0xff})
 	f.SetSrc([6]byte{2, 0x48, 0x4f, 0x50, 0, 1})
 	f.SetEtherType(EtherTypeARP)
-	if !f.IsBroadcastDst() {
-		t.Error("broadcast dst not recognized")
-	}
 	if f.EtherType() != EtherTypeARP {
 		t.Errorf("ethertype = %#04x", f.EtherType())
-	}
-	f.SetDst([6]byte{0xff, 0xff, 0xff, 0xff, 0xff, 0xfe})
-	if f.IsBroadcastDst() {
-		t.Error("near-broadcast dst wrongly recognized as broadcast")
 	}
 	if _, err := ParseEth(buf[:sizeEth-1]); err == nil {
 		t.Error("short ethernet frame accepted")

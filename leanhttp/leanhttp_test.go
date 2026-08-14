@@ -656,8 +656,16 @@ func TestBodylessStatusBlokkeertNiet(t *testing.T) {
 				done <- fmt.Errorf("body = %q, want leeg", b)
 				return
 			}
-			if resp.Length != 0 {
-				done <- fmt.Errorf("Length = %d, want 0", resp.Length)
+			// Zonder Content-Length is de lengte onbekend: een 204 wordt 0
+			// (draagt per definitie niets), een 304 blijft -1 — de informatieve
+			// lengte is van de server, niet van ons (review 13-08,
+			// vijfentwintigste ronde).
+			want := int64(-1)
+			if code == StatusNoContent {
+				want = 0
+			}
+			if resp.Length != want {
+				done <- fmt.Errorf("Length = %d, want %d", resp.Length, want)
 				return
 			}
 			done <- nil

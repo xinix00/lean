@@ -70,12 +70,6 @@ func (f EthFrame) SetDst(mac [6]byte)     { copy(f[0:6], mac[:]) }
 func (f EthFrame) SetSrc(mac [6]byte)     { copy(f[6:12], mac[:]) }
 func (f EthFrame) SetEtherType(et uint16) { binary.BigEndian.PutUint16(f[12:14], et) }
 
-// IsBroadcastDst rapporteert of het frame aan ff:ff:ff:ff:ff:ff gericht is.
-func (f EthFrame) IsBroadcastDst() bool {
-	d := f.Dst()
-	return d[0]&d[1]&d[2]&d[3]&d[4]&d[5] == 0xff
-}
-
 // ---- ARP (alleen ethernet/IPv4, RFC 826) ----
 
 // ARP-opcodes.

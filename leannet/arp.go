@@ -33,6 +33,14 @@ const (
 	// Meer dan zoveel wachtende reply-antwoorden droppen we (met teller):
 	// een request-flood mag de tabel geen geheugen laten groeien.
 	arpReplyQueueCap = 8
+
+	// arpCacheCap begrenst de hele tabel. Passief leren is gratis voor de
+	// afzender: een stroom frames met gespoofde bron-IP's (de transport-
+	// checksum is geen authenticatie) maakte anders per frame een entry — op
+	// een node van 64MB is een onbegrensde map een DoS (review 13-08,
+	// dertiende ronde). Een HOP-node praat met een handvol peers; 128 is daar
+	// ruim boven en kost hooguit ~15KB.
+	arpCacheCap = 128
 )
 
 // arpState — de drie levensfasen van een entry.
@@ -75,11 +83,9 @@ type arpTable struct {
 	replies []arpReply
 
 	// Tellers voor de stack-laag (telemetrie/logregels; de machine zelf
-	// logt niet).
-	cntGaveUp     int // queries die na arpQueryTries pogingen opgaven
-	cntIgnored    int // replies die niet aan ons gericht en niet gratuitous waren
-	cntMACChanged int // refresh die een ánder MAC op een bestaande entry zette
-	cntReplyDrop  int // reply-antwoorden gedropt omdat de wachtrij vol was
+	// logt niet). Eén blok: Stats() kopieert hem in z'n geheel, dus een
+	// nieuwe teller reist vanzelf mee (review 13-08, achttiende ronde).
+	cnt ARPStats
 }
 
 func newARPTable(ourIP [4]byte, ourMAC [6]byte) *arpTable {
@@ -96,7 +102,7 @@ func (t *arpTable) tick(ip [4]byte, e *arpEntry, now int64) bool {
 		if e.tries >= arpQueryTries && now >= e.due {
 			e.state = arpFailed
 			e.born = now
-			t.cntGaveUp++
+			t.cnt.GaveUp++
 		}
 	case arpResolved:
 		if !e.static && now-e.born >= arpEntryTTL {
@@ -125,7 +131,57 @@ func (t *arpTable) resolve(ip [4]byte, now int64) (mac [6]byte, ok bool) {
 		}
 		return mac, false // pending of failed: geen nieuwe query
 	}
+	// Vol? Eerst verlopen entries ruimen, dan een passief geleerde cache-plek
+	// verdringen: een actieve resolve (iemand wíl dit adres) gaat vóór een
+	// bewaard antwoord dat niemand vroeg. Ook dit pad is van buiten te
+	// triggeren (elke refuse-RST resolvet zijn bestemming), dus ook hier
+	// geldt de cap (review 13-08, dertiende ronde).
+	if len(t.entries) >= arpCacheCap {
+		t.sweepExpired(now)
+		if len(t.entries) >= arpCacheCap {
+			t.evictResolved()
+		}
+	}
+	if len(t.entries) >= arpCacheCap {
+		return mac, false // alles pending/statisch: niet aanmaken, de poller komt terug
+	}
 	t.entries[ip] = &arpEntry{state: arpPending, due: now}
+	return mac, false
+}
+
+// sweepExpired tikt élke entry, zodat verlopen exemplaren verdwijnen — voor
+// de cap-paden: eerst ruimte maken, dan pas verdringen of weigeren.
+func (t *arpTable) sweepExpired(now int64) {
+	for ip, e := range t.entries {
+		t.tick(ip, e, now)
+	}
+}
+
+// evictResolved verdringt een willekeurige opgeloste, niet-statische entry —
+// alleen die soort: pending draagt een lopende query van een échte vrager en
+// statisch is configuratie. Bewust niet de óudste zoeken: map-willekeur raakt
+// met een handvol echte buren op 128 plekken vrijwel zeker een spoof-entry,
+// en een echte peer die zijn plek verliest leert zichzelf bij zijn volgende
+// pakket gewoon terug (review 13-08, achttiende ronde).
+func (t *arpTable) evictResolved() {
+	for ip, e := range t.entries {
+		if e.state == arpResolved && !e.static {
+			delete(t.entries, ip)
+			return
+		}
+	}
+}
+
+// peek geeft het MAC voor ip als dat al bekend is, zonder ooit een query te
+// starten. Voor best-effort-uitvoer (RST op een refuse, echo-reply): wie ons
+// net geldig aansprak is zojuist passief geleerd, dus in het legitieme geval
+// is het antwoord er altijd — en voor een gespoofde bron een actieve query
+// starten liet élke refuse-RST een echte cache-plek verdringen, tot de hele
+// tabel uit pending spoof-queries bestond (review 13-08, vijftiende ronde).
+func (t *arpTable) peek(ip [4]byte, now int64) (mac [6]byte, ok bool) {
+	if e, exists := t.entries[ip]; exists && t.tick(ip, e, now) && e.state == arpResolved {
+		return e.mac, true
+	}
 	return mac, false
 }
 
@@ -165,6 +221,17 @@ func (t *arpTable) learn(ip [4]byte, mac [6]byte, now int64) {
 	}
 	e, exists := t.entries[ip]
 	if !exists || !t.tick(ip, e, now) {
+		// Passief leren verdringt níets: vol is vol (na een sweep), en de
+		// weigering telt. Een échte peer verliest daar alleen de gratis
+		// cache-plek — zijn verkeer werkt gewoon, via de ARP-molen
+		// (review 13-08, dertiende ronde).
+		if len(t.entries) >= arpCacheCap {
+			t.sweepExpired(now)
+			if len(t.entries) >= arpCacheCap {
+				t.cnt.LearnDrop++
+				return
+			}
+		}
 		t.entries[ip] = &arpEntry{mac: mac, state: arpResolved, born: now}
 		return
 	}
@@ -197,7 +264,7 @@ func (t *arpTable) recv(f ARPFrame, now int64) {
 		// Vraagt de peer óns adres? Reply klaarzetten; emit verstuurt hem.
 		if target == t.ourIP && sender != t.ourIP {
 			if len(t.replies) >= arpReplyQueueCap {
-				t.cntReplyDrop++
+				t.cnt.ReplyDrop++
 			} else {
 				t.replies = append(t.replies, arpReply{hw: senderHW, ip: sender})
 			}
@@ -227,7 +294,7 @@ func (t *arpTable) recv(f ARPFrame, now int64) {
 		default:
 			// Niet aan ons gericht en niet gratuitous: negeren. Dit is de
 			// poisoning-vorm — een (broadcast-)reply voor andermans gesprek.
-			t.cntIgnored++
+			t.cnt.Ignored++
 		}
 	}
 }
@@ -241,7 +308,7 @@ func (t *arpTable) refresh(ip [4]byte, mac [6]byte, now int64) {
 		return
 	}
 	if e.mac != mac {
-		t.cntMACChanged++
+		t.cnt.MACChanged++
 		e.mac = mac
 	}
 	e.born = now

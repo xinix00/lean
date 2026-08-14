@@ -17,11 +17,11 @@ package leanhttp
 // de staart van dit antwoord als statusregel lezen. Twijfel = sluiten.
 
 import (
+	"bufio"
+	"context"
 	"net"
 	"sync"
 	"time"
-
-	"bufio"
 )
 
 // Standaardmaten van de pool. Twee verbindingen per host is wat een pagina met
@@ -41,8 +41,14 @@ const (
 type Client struct {
 	// Dial maakt een nieuwe verbinding; nil = net.DialTimeout op tcp4. Zelfde
 	// contract als [Call.Dial] — een TLS-dialer past er dus ook op, en dan
-	// poolt dit type versleutelde verbindingen.
+	// poolt dit type versleutelde verbindingen. Ook hetzelfde
+	// eindigheids-contract: de totaaltermijn begrenst het wachten, niet de
+	// dialer zelf.
 	Dial func(network, addr string) (net.Conn, error)
+
+	// DialContext is Dial mét annulering — zelfde contract als
+	// [Call.DialContext]; gaat vóór Dial als beide gezet zijn.
+	DialContext func(ctx context.Context, network, addr string) (net.Conn, error)
 
 	// MaxIdlePerHost is hoeveel ongebruikte verbindingen per host blijven
 	// staan; 0 = 2. Meer kost geheugen en socket-slots op de server, minder
@@ -56,6 +62,13 @@ type Client struct {
 
 	mu   sync.Mutex
 	idle map[string][]idleConn
+
+	// sweepTimer loopt zolang er idle verbindingen staan (zie put): de
+	// sweep-bij-dial dekt alleen een vólgend verzoek, en na het laatste
+	// verzoek kwam die nooit — precies de gepoolde verbinding die op leannet
+	// minstens 20KiB pot vasthield tot de watchdog de node resette
+	// (review 13-08, vierentwintigste ronde).
+	sweepTimer *time.Timer
 }
 
 type idleConn struct {
@@ -68,22 +81,27 @@ type idleConn struct {
 // laat hem daarna staan voor het volgende verzoek. Verder identiek aan [Do]:
 // een foutstatus is geen fout.
 func (cl *Client) Do(call Call) (*Response, error) {
-	call.keepAlive = true
-	call.pool = cl
-	if call.Dial == nil {
-		call.Dial = cl.dial
+	if call.Dial != nil || call.DialContext != nil {
+		// Een eigen transport per call mengt niet met de pool: de verbinding
+		// erin stoppen zou een volgende Get een verbinding van een ánder
+		// transport geven (review 13-08, tweede ronde). Dit is dan gewoon een
+		// kale Do met Connection: close.
+		return Do(call)
 	}
-	return Do(call)
+	// Het transport gaat als PARAMETER mee, niet als Call-veld: do() vraagt
+	// zelf via.Dial voor de schemewacht en via.dial voor de pool — er valt
+	// niets meer verkeerd te zetten (review 13-08, zesde ronde: drie eerdere
+	// rondes braken alle drie op "de pool-dialer vermomd als Call.Dial").
+	return doVia(call, cl)
 }
 
 // Get is [Get] over de pool: 200 mét Content-Length vereist.
 func (cl *Client) Get(url string) (*Response, error) {
-	call := Call{URL: url, keepAlive: true, pool: cl}
-	call.Dial = cl.dial
-	if cl.Dial != nil {
-		call.Dial = cl.Dial
+	resp, err := doVia(Call{URL: url}, cl)
+	if err != nil {
+		return nil, err
 	}
-	return GetCall(call)
+	return checkGet(resp)
 }
 
 // CloseIdle sluit alle ongebruikte verbindingen. Aan te roepen als je klaar
@@ -101,55 +119,116 @@ func (cl *Client) CloseIdle() {
 	}
 }
 
-// dial pakt eerst een verbinding uit de pool; is er geen, dan een verse.
-func (cl *Client) dial(network, addr string) (net.Conn, error) {
-	if c, br := cl.get(addr); c != nil {
-		return &pooledConn{Conn: c, br: br}, nil
-	}
-	if cl.Dial != nil {
-		return cl.Dial(network, addr)
-	}
-	return net.DialTimeout(network, addr, dialTimeout)
-}
-
-// get haalt een bruikbare verbinding voor addr uit de pool. Verlopen
-// verbindingen gaan onderweg dicht — een idle socket die de server al
-// opgeruimd heeft, is geen verbinding maar een fout op het volgende verzoek.
-func (cl *Client) get(addr string) (net.Conn, *bufio.Reader) {
-	timeout := cl.IdleTimeout
-	if timeout == 0 {
-		timeout = defaultIdleTimeout
-	}
+// dial pakt eerst een verbinding uit de pool; is er geen, dan een verse — in
+// de ene interne dialervorm (zie dialBounded in leanhttp.go): de ctx draagt
+// de totaaltermijn van de call, dus ook de fallback-dial hieronder leeft
+// erbinnen (review 13-08, elfde/twaalfde ronde; achttiende: genormaliseerd).
+//
+// De sweep staat hiér, vóór het verzoek — niet alleen in put, ná het verzoek.
+// Dat is geen smaak maar de volgorde van het gemeten faalscenario: als de
+// netstack-pot op is door verlopen gepoolde verbindingen, dan FAALT de dial,
+// dus komt er geen put, dus zou een sweep-in-put nooit draaien — de toestand
+// die hem moet opruimen is precies de toestand die hem onbereikbaar maakt
+// (review 13-08). Eerst ruimen, dan vragen.
+func (cl *Client) dial(ctx context.Context, network, addr string) (net.Conn, error) {
+	// Sweep en pop in één kritieke sectie: na de sweep is élke overgebleven
+	// verbinding per definitie vers, dus de pop hoeft geen eigen
+	// versheids-toets meer (review 13-08, tweede ronde).
 	cl.mu.Lock()
-	defer cl.mu.Unlock()
-	list := cl.idle[addr]
-	for len(list) > 0 {
-		ic := list[len(list)-1] // laatst teruggegeven = warmst
-		list = list[:len(list)-1]
-		if time.Since(ic.when) < timeout {
-			cl.idle[addr] = list
-			return ic.c, ic.br
-		}
+	stale := cl.sweepLocked()
+	cl.mu.Unlock()
+	for _, ic := range stale {
+		// Buiten het slot, en let wel: Close start een nette sluiting (FIN) —
+		// de buffers komen pas vrij als die rond is. Op een levend LAN is dat
+		// éen RTT; een dial die er te vroeg bij is, slaagt bij zijn herhaling.
 		ic.c.Close()
 	}
-	delete(cl.idle, addr)
-	return nil, nil
+	for {
+		cl.mu.Lock()
+		c, br := cl.popLocked(addr)
+		cl.mu.Unlock()
+		if c == nil {
+			break
+		}
+		// Idle-read-probe: bytes die ná het poolen arriveerden (een laat,
+		// ongevraagd "antwoord" in de socketbuffer — onzichtbaar voor de
+		// Buffered()-toets in body.Close) diskwalificeren de verbinding vóór
+		// er een verzoek op vertrekt. De probe leest met een ~1ms-deadline:
+		// data (of een EOF van een server die al sloot) komt meteen, stilte
+		// kost hooguit de milliseconde — en dat werkt op leannet én de stdlib
+		// (de oude verleden-deadline-truc stierf toen await de deadline vóór
+		// gereed I/O ging toetsen; review 13-08, zevenentwintigste en
+		// achtentwintigste ronde).
+		if idleClean(c, br) {
+			return &pooledConn{Conn: c, br: br}, nil
+		}
+		c.Close()
+	}
+	return normalizeDial(cl.DialContext, cl.Dial)(ctx, network, addr)
+}
+
+// idleClean rapporteert of een uit de pool gepopte verbinding schoon is: geen
+// voorgelezen bytes, geen bytes in de socketbuffer, geen EOF — zie de
+// probe-uitleg bij dial.
+func idleClean(c net.Conn, br *bufio.Reader) bool {
+	if br.Buffered() > 0 {
+		return false
+	}
+	if c.SetReadDeadline(time.Now().Add(time.Millisecond)) != nil { // ~1ms: data komt meteen, stilte kost hooguit de milliseconde
+		return false
+	}
+	var b [1]byte
+	if n, _ := br.Read(b[:]); n > 0 {
+		return false
+	}
+	return c.SetReadDeadline(time.Time{}) == nil
+}
+
+// popLocked pakt de warmste verbinding voor addr. De versheid is al geborgd:
+// de enige aanroeper (dial) sweept in dezelfde kritieke sectie. Aanroepen met
+// cl.mu vast.
+func (cl *Client) popLocked(addr string) (net.Conn, *bufio.Reader) {
+	list := cl.idle[addr]
+	if len(list) == 0 {
+		return nil, nil
+	}
+	ic := list[len(list)-1] // laatst teruggegeven = warmst
+	if len(list) == 1 {
+		delete(cl.idle, addr)
+	} else {
+		cl.idle[addr] = list[:len(list)-1]
+	}
+	return ic.c, ic.br
 }
 
 // put geeft een verbinding terug; false = de pool wil hem niet (vol), en dan
 // sluit de aanroeper hem. Alleen body.Close roept dit aan, en alleen als de
 // body helemaal gelezen is.
 func (cl *Client) put(addr string, c net.Conn, br *bufio.Reader) bool {
-	if addr == "" {
-		return false
+	// Uitpakken: c is bij hergebruik de pooledConn die dial er zelf omheen
+	// wikkelde, en dial wikkelt er straks een verse laag omheen. Zonder deze
+	// stap groeit de nesting per ronde — een poller van 1 req/s draagt na een
+	// dag ~86k lagen en elke Read loopt de hele keten af (review 13-08,
+	// derde ronde).
+	if pc, ok := c.(*pooledConn); ok {
+		c = pc.Conn
 	}
 	max := cl.MaxIdlePerHost
 	if max == 0 {
 		max = defaultMaxIdlePerHost
 	}
 	// De deadline van het vorige verzoek mag niet op een verbinding blijven
-	// staan die straks een ander verzoek draagt.
-	c.SetDeadline(time.Time{})
+	// staan die straks een ander verzoek draagt — en een transport dat de wis
+	// WEIGERT is per definitie niet herbruikbaar: poolen zou een kapotte
+	// verbinding aan het volgende verzoek geven (review 13-08,
+	// vijfentwintigste ronde).
+	if c.SetDeadline(time.Time{}) != nil {
+		return false
+	}
+	// Geen sweep hier: dial sweept vóór élk verzoek en dat is ook het enige
+	// moment dat telt (zonder verkeer is er niets dat een sweep triggert, mét
+	// verkeer loopt hij toch). Twee sweeps per verzoek was dubbel werk
+	// (review 13-08, derde ronde).
 	cl.mu.Lock()
 	defer cl.mu.Unlock()
 	if len(cl.idle[addr]) >= max {
@@ -159,7 +238,79 @@ func (cl *Client) put(addr string, c net.Conn, br *bufio.Reader) bool {
 		cl.idle = make(map[string][]idleConn)
 	}
 	cl.idle[addr] = append(cl.idle[addr], idleConn{c: c, br: br, when: time.Now()})
+	cl.scheduleSweepLocked()
 	return true
+}
+
+// scheduleSweepLocked zorgt dat er precies één timer loopt zolang de pool
+// niet leeg is. De marge (timeout/4) voorkomt dat de timer nét vóór de
+// vervaltijd van de oudste verbinding vuurt; een verbinding staat er zo
+// hooguit ~2× de idle-timeout. Aanroepen met cl.mu vast.
+func (cl *Client) scheduleSweepLocked() {
+	if cl.sweepTimer != nil {
+		return
+	}
+	timeout := cl.IdleTimeout
+	if timeout == 0 {
+		timeout = defaultIdleTimeout
+	}
+	cl.sweepTimer = time.AfterFunc(timeout+timeout/4, cl.timedSweep)
+}
+
+// timedSweep is de timer-gedreven opruiming: verlopen verbindingen dicht, en
+// zolang er nog verse staan komt er een nieuwe timer.
+func (cl *Client) timedSweep() {
+	cl.mu.Lock()
+	cl.sweepTimer = nil
+	stale := cl.sweepLocked()
+	if len(cl.idle) > 0 {
+		cl.scheduleSweepLocked()
+	}
+	cl.mu.Unlock()
+	for _, ic := range stale {
+		ic.c.Close()
+	}
+}
+
+// sweepLocked haalt de verlopen verbindingen van ÁLLE hosts uit de pool en
+// geeft ze terug om te sluiten. Aanroepen met cl.mu vast.
+//
+// Waarom over alle hosts en niet alleen de host die je nodig hebt: de
+// idle-timeout werd alleen afgedwongen in get(addr), dus een verbinding naar een
+// host die je nooit meer belt bleef staan tot het einde der tijden. Op een
+// gewone machine is dat een socket die niemand mist. Op een node is het een stuk
+// van de netstack-pot: leannet houdt de buffers van een open verbinding
+// gereserveerd, en die groeien mee met wat er door ging — een afgeronde download
+// van 5MB laat dus een dikke verbinding achter.
+//
+// GEMETEN 12-08 op een LicheeRV: HOP haalde app-images op bij een artifact-server,
+// liet er twee gepoold achter, en had daarna zo weinig pot over dat élke nieuwe
+// verbinding "buffer budget exhausted" kreeg. De watchdog eist voor zijn
+// levensteken juist een VERSE verbinding naar de agent-poort — dus resette de
+// node zichzelf, twee keer op één avond.
+func (cl *Client) sweepLocked() []idleConn {
+	timeout := cl.IdleTimeout
+	if timeout == 0 {
+		timeout = defaultIdleTimeout
+	}
+	now := time.Now() // één klokread voor de hele sweep, niet één per verbinding
+	var stale []idleConn
+	for addr, list := range cl.idle {
+		keep := list[:0]
+		for _, ic := range list {
+			if now.Sub(ic.when) < timeout {
+				keep = append(keep, ic)
+				continue
+			}
+			stale = append(stale, ic)
+		}
+		if len(keep) == 0 {
+			delete(cl.idle, addr)
+			continue
+		}
+		cl.idle[addr] = keep
+	}
+	return stale
 }
 
 // pooledConn is een verbinding uit de pool plus de bufio.Reader die er al op
@@ -168,4 +319,23 @@ func (cl *Client) put(addr string, c net.Conn, br *bufio.Reader) bool {
 type pooledConn struct {
 	net.Conn
 	br *bufio.Reader
+}
+
+// idleCount en idleFor zijn er voor de tests in dit package: de pool is
+// opzettelijk niet naar buiten zichtbaar, maar wat hij vasthoudt is precies wat
+// getest moet worden.
+func (cl *Client) idleCount() int {
+	cl.mu.Lock()
+	defer cl.mu.Unlock()
+	n := 0
+	for _, list := range cl.idle {
+		n += len(list)
+	}
+	return n
+}
+
+func (cl *Client) idleFor(addr string) int {
+	cl.mu.Lock()
+	defer cl.mu.Unlock()
+	return len(cl.idle[addr])
 }

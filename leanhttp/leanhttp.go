@@ -57,13 +57,15 @@ package leanhttp
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/url"
-	"strconv"
+	"os"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -98,6 +100,7 @@ const (
 	StatusMethodNotAllowed      = 405
 	StatusRequestEntityTooLarge = 413
 	StatusInternalServerError   = 500
+	StatusNotImplemented        = 501
 )
 
 // Header is één verzameling headers. HTTP-headernamen zijn
@@ -120,12 +123,17 @@ func (h Header) Get(key string) string {
 
 // Set zet key op value en ruimt een afwijkend gespelde dubbel op.
 func (h Header) Set(key, value string) {
+	h.Del(key)
+	h[key] = value
+}
+
+// Del verwijdert key, hoe hij ook gespeld is.
+func (h Header) Del(key string) {
 	for k := range h {
-		if k != key && strings.EqualFold(k, key) {
+		if strings.EqualFold(k, key) {
 			delete(h, k)
 		}
 	}
-	h[key] = value
 }
 
 // add voegt toe: een herhaalde header wordt één komma-lijst (RFC 9110 §5.3),
@@ -166,6 +174,13 @@ type Call struct {
 	//
 	// Een gestroomde body kan niet opnieuw verstuurd worden, dus [Do] volgt geen
 	// redirect: de 3xx komt bij de aanroeper terecht, net als bij Body.
+	//
+	// BEKENDE GRENS: de body wordt volledig geschreven vóórdat het antwoord
+	// gelezen wordt. Een server die de upload vroeg afwijst (401/413) wordt
+	// dus pas ná het schrijven gezien — netjes afhandelen vergt
+	// Expect: 100-continue aan de clientkant, en dat is bewust buiten scope
+	// (de serverkant van dit pakket antwoordt er wél op). Wie een grote
+	// upload naar een onvertrouwde server doet, probet eerst zelf.
 	BodyReader io.Reader
 	BodyLen    int64
 
@@ -182,7 +197,19 @@ type Call struct {
 	// IP), zodat een TLS-dialer zijn SNI kan zetten. Bij een redirect naar een
 	// andere host wordt Dial opnieuw geroepen met die nieuwe host — wie SNI uit
 	// addr haalt, volgt dus automatisch mee.
+	//
+	// CONTRACT: een Dial hoort zélf eindig te zijn (een eigen dial- en
+	// handshake-termijn). De totaaltermijn (Timeout) begrenst alleen hoe lang
+	// dit pakket erop wácht (dialBounded); annuleren kan hij niet — wie dat
+	// wil, zet DialContext.
 	Dial func(network, addr string) (net.Conn, error)
+
+	// DialContext is Dial mét annulering: de context draagt de totaaltermijn
+	// (Timeout, over álle redirects heen) en de dialer hoort op ctx.Done() op
+	// te geven — dan leeft er bij een verlopen termijn ook geen dial-goroutine
+	// meer door (review 13-08, vijftiende ronde). Als beide gezet zijn gaat
+	// DialContext vóór. Zelfde addr-contract als Dial.
+	DialContext func(ctx context.Context, network, addr string) (net.Conn, error)
 
 	// NoFollow geeft de 3xx aan de aanroeper in plaats van hem te volgen.
 	//
@@ -193,13 +220,6 @@ type Call struct {
 	// wie er wel een heeft, loopt de keten zelf af en past per stap zijn
 	// cookies toe.
 	NoFollow bool
-
-	// keepAlive wordt door [Client] gezet: dan vraagt het verzoek om een
-	// verbinding die blijft staan, en geeft de body hem terug aan de pool.
-	// Niet exported — een losse Do heeft geen pool om iets aan terug te geven.
-	keepAlive bool
-	pool      *Client
-	addrKey   string
 }
 
 // Response is één antwoord. Body is de ongelezen responsebody; sluit hem (dat
@@ -250,6 +270,12 @@ func GetCall(c Call) (*Response, error) {
 	if err != nil {
 		return nil, err
 	}
+	return checkGet(resp)
+}
+
+// checkGet zijn de Get-eisen op een al-ontvangen antwoord: een 200 mét
+// Content-Length. Gedeeld door GetCall en Client.Get.
+func checkGet(resp *Response) (*Response, error) {
 	switch {
 	case resp.StatusCode != StatusOK:
 		resp.Body.Close()
@@ -272,16 +298,60 @@ func GetCall(c Call) (*Response, error) {
 // geen body heeft; met body (of BodyReader) krijgt de aanroeper de 3xx zelf te
 // zien, want een POST opnieuw afvuren op een ander pad is niet aan dit pakket —
 // en een stroom is niet eens opnieuw te versturen.
-func Do(c Call) (*Response, error) {
+func Do(c Call) (*Response, error) { return doVia(c, nil) }
+
+// doVia is Do mét zijn transport: via is de Client wiens pool en dialer deze
+// call draagt, of nil voor de kale éénmalige vorm. Een parameter en geen
+// Call-veld, want dat veld moest élk constructiepad correct zetten — drie
+// reviewrondes op precies die naad (pool-bypass in Get, plaintext-443 op een
+// redirect, per-call-Dial-menging) kwamen alle drie neer op "de pool-dialer
+// vermomd als Call.Dial" (review 13-08, zesde ronde).
+func doVia(c Call, via *Client) (*Response, error) {
+	// Eén absolute termijn voor de HELE call, redirects inbegrepen: de klok
+	// startte eerst pas ná de dial en elke redirect kreeg een verse Timeout —
+	// een call met Timeout: 1s kon zo lang dialen en per hop opnieuw een
+	// seconde krijgen (review 13-08, tiende ronde).
+	var total time.Time
+	if c.Timeout > 0 {
+		total = time.Now().Add(c.Timeout)
+	}
 	loc := c.URL
 	for range maxRedirects + 1 {
-		resp, err := do(c, loc)
+		resp, err := do(c, via, loc, total)
+		if err != nil && errors.Is(err, errStalePooled) && c.BodyReader == nil &&
+			(c.Method == "" || c.Method == "GET" || c.Method == "HEAD") &&
+			!errors.Is(err, os.ErrDeadlineExceeded) && !errors.Is(err, context.DeadlineExceeded) {
+			// Eén veilige herkansing (zie errStalePooled) — en alléén voor
+			// GET/HEAD: "geen BodyReader" was te ruim, een bodyloze POST of
+			// DELETE is niet replay-safe. Timeouts tellen niet als stale (de
+			// herkansing zou toch meteen verlopen). En de herkansing OMZEILT
+			// de pool: met twee stale verbindingen erin (de standaardcap)
+			// verloor één herkansing anders alsnog — een eigen DialContext op
+			// de call dwingt een verse verbinding af, en het antwoord poolt
+			// daarna gewoon weer (review 13-08, achtentwintigste ronde).
+			fresh := c
+			fresh.DialContext = normalizeDial(via.DialContext, via.Dial)
+			resp, err = do(fresh, via, loc, total)
+		}
 		if err != nil {
 			return nil, err
 		}
+		// Automatisch volgen alleen voor de vijf échte redirect-statussen
+		// (301/302/303/307/308, RFC 9110 §15.4) en alleen voor GET/HEAD.
+		// "Geen body" was een proxy voor "veilig te herhalen", maar een
+		// bodyloze POST of DELETE is dat niet (die werd stil op de nieuwe URL
+		// heruitgevoerd), een 303 hoort een POST juist naar een retrieval om
+		// te zetten, en een 304 is een cache-validatieantwoord — geen
+		// doorverwijzing, ook niet mét Location (review 13-08,
+		// tweeëntwintigste ronde). Elke andere methode of status krijgt de
+		// 3xx gewoon terug, zoals bij NoFollow: de aanroeper beslist.
 		next := ""
-		if c.Body == nil && c.BodyReader == nil && !c.NoFollow && resp.StatusCode >= 300 && resp.StatusCode < 400 {
-			next = resp.Header.Get("Location")
+		if !c.NoFollow && c.Body == nil && c.BodyReader == nil &&
+			(c.Method == "" || c.Method == "GET" || c.Method == "HEAD") {
+			switch resp.StatusCode {
+			case 301, 302, 303, 307, 308:
+				next = resp.Header.Get("Location")
+			}
 		}
 		if next == "" {
 			return resp, nil
@@ -298,13 +368,124 @@ func Do(c Call) (*Response, error) {
 		if err != nil {
 			return nil, fmt.Errorf("leanhttp: bad Location %q: %w", next, err)
 		}
-		loc = base.ResolveReference(ref).String() // een relatieve Location mag
+		dest := base.ResolveReference(ref)
+		// Gevoelige headers reizen alleen mee binnen dezelfde ORIGIN: schema
+		// én host én poort. Alleen de hostnaam vergelijken liet een token mee
+		// naar een andere poort (een tweede dienst op dezelfde machine) of
+		// over een https→http-degradatie het plaintext-net op
+		// (review 13-08, tweede ronde).
+		sameOrigin := originOf(dest) == originOf(base)
+		if !sameOrigin && len(c.Header) > 0 {
+			trimmed := Header{}
+			for k, v := range c.Header {
+				switch {
+				case strings.EqualFold(k, "Authorization"),
+					strings.EqualFold(k, "Proxy-Authorization"),
+					strings.EqualFold(k, "Cookie"):
+					continue
+				}
+				trimmed[k] = v
+			}
+			c.Header = trimmed
+		}
+		loc = dest.String() // een relatieve Location mag
 	}
 	return nil, fmt.Errorf("leanhttp: too many redirects (>%d) starting at %s", maxRedirects, c.URL)
 }
 
-// do doet één ronde: verbinden, verzoek schrijven, antwoordkop lezen.
-func do(c Call, raw string) (_ *Response, err error) {
+// Intern bestaat er maar ÉÉN dialervorm: die van DialContext. De totaaltermijn
+// reist als context-deadline; do() en Client.dial normaliseren de andere
+// gedaantes aan de rand — een kale Dial via dialBounded, géén dialer via de
+// stdlib (net.Dialer combineert zijn Timeout zelf al met de ctx-deadline, wie
+// het eerst om is wint). Acht gedaantes en een vierarmige switch werden zo één
+// zin (review 13-08, achttiende ronde).
+
+// normalizeDial vouwt de twee publieke dialer-gedaantes naar de ene interne
+// vorm (zie dialBounded): DialContext zoals hij is, een kale Dial door de
+// adapter, en niets = de stdlib-dialer (net.Dialer combineert zijn Timeout
+// zelf met de ctx-deadline; wie het eerst om is wint). Call- en
+// Client-dialers gaan hier allebei doorheen en zijn dus per constructie
+// identiek genormaliseerd — "de twee dialer-ingangen liepen uiteen" was
+// letterlijk de bugklasse die drie rondes kostte (review 13-08,
+// zesentwintigste ronde).
+func normalizeDial(dc func(context.Context, string, string) (net.Conn, error),
+	d func(string, string) (net.Conn, error)) func(context.Context, string, string) (net.Conn, error) {
+	switch {
+	case dc != nil:
+		return dc
+	case d != nil:
+		return func(ctx context.Context, network, addr string) (net.Conn, error) {
+			return dialBounded(ctx, d, network, addr)
+		}
+	}
+	return (&net.Dialer{Timeout: dialTimeout}).DialContext
+}
+
+// errStalePooled markeert een verzoek dat op een HERGEBRUIKTE verbinding
+// faalde vóór de eerste antwoordbyte: vrijwel altijd een server die zijn idle
+// keep-alive net sloot. doVia herkanst dan één keer — veilig, want er is
+// niets geconsumeerd en het hele verzoek gaat opnieuw (review 13-08,
+// vijfentwintigste ronde).
+var errStalePooled = errors.New("leanhttp: pooled connection went stale")
+
+// originOf normaliseert schema+host+poort tot één origin: http zonder poort
+// ís poort 80, https 443 — http://host en http://host:80 zijn dezelfde origin
+// en gevoelige headers hoorden daartussen gewoon mee te reizen (review 13-08,
+// vijfentwintigste ronde).
+func originOf(u *url.URL) string {
+	host := u.Host
+	if u.Port() == "" {
+		switch strings.ToLower(u.Scheme) {
+		case "http":
+			host += ":80"
+		case "https":
+			host += ":443"
+		}
+	}
+	return strings.ToLower(u.Scheme) + "://" + strings.ToLower(host)
+}
+
+// dialBounded is de adapter van een kale Dial naar de interne vorm: hij dwingt
+// de ctx-deadline af op een dialer die alleen (network, addr) kent en dus in
+// zijn TCP-connect of TLS-handshake kan blijven hangen terwijl de termijn al
+// om is — een leanhttps-dial naar een zwijgende host trok zo een verlopen
+// S3-call alsnog tien seconden open (review 13-08, twaalfde ronde). Het
+// dialer-contract blijft ongemoeid: hij draait in een goroutine door tot zijn
+// éigen einde; levert hij de verbinding te laat alsnog op, dan gaat die dicht.
+//
+// Wees eerlijk over de grens: dit begrenst het WACHTEN, niet de dialer zelf.
+// Een dialer die nooit terugkeert lekt zijn goroutine (en zijn socket) — het
+// contract is dus dat een dialer eindig is (onze eigen leantls.Dial is dat:
+// dial- én handshake-termijn). Wie écht annuleren wil, zet DialContext.
+func dialBounded(ctx context.Context, dial func(network, addr string) (net.Conn, error), network, addr string) (net.Conn, error) {
+	if ctx.Done() == nil {
+		return dial(network, addr) // geen termijn: niets te bewaken
+	}
+	type result struct {
+		c   net.Conn
+		err error
+	}
+	ch := make(chan result, 1)
+	go func() {
+		c, err := dial(network, addr)
+		ch <- result{c, err}
+	}()
+	select {
+	case r := <-ch:
+		return r.c, r.err
+	case <-ctx.Done():
+		go func() {
+			if r := <-ch; r.c != nil {
+				r.c.Close()
+			}
+		}()
+		return nil, ctx.Err()
+	}
+}
+
+// do doet één ronde: verbinden, verzoek schrijven, antwoordkop lezen. via is
+// het transport (zie doVia); nil = kale call.
+func do(c Call, via *Client, raw string, total time.Time) (_ *Response, err error) {
 	u, err := url.Parse(raw)
 	if err != nil {
 		return nil, fmt.Errorf("leanhttp: bad URL %q: %w", raw, err)
@@ -313,10 +494,22 @@ func do(c Call, raw string) (_ *Response, err error) {
 	// https-URL een configuratiefout die je op de console hoort te zien — mét
 	// de twee uitwegen erin, want een fout die niet zegt wat te doen kost een
 	// zoektocht.
+	//
+	// plainDial: de pool-dialer van een Client zonder eigen (TLS-)Dial spreekt
+	// per definitie geen TLS. Afgeleid uit de pool zelf — als apart veld moest
+	// élk Call-constructiepad hem correct zetten. En de toets staat hiér, per
+	// ronde, omdat een 301 van http naar https het verzoek anders alsnog
+	// plaintext naar poort 443 droeg, inclusief Authorization (review 13-08,
+	// derde ronde: dat heropende precies het gat dat de schemewacht op de
+	// eerste URL dichtte).
+	// TLS kan uit twee hoeken komen: een expliciete Call.Dial(Context), of de
+	// eigen Dial(Context) van de Client die deze call draagt.
+	hasTLS := c.Dial != nil || c.DialContext != nil ||
+		(via != nil && (via.Dial != nil || via.DialContext != nil))
 	port := "80"
 	switch {
 	case u.Scheme == "http":
-	case u.Scheme == "https" && c.Dial != nil:
+	case u.Scheme == "https" && hasTLS:
 		port = "443"
 	case u.Scheme == "https":
 		return nil, fmt.Errorf("leanhttp: https:// needs a Call.Dial that returns an "+
@@ -332,18 +525,28 @@ func do(c Call, raw string) (_ *Response, err error) {
 		addr = net.JoinHostPort(addr, port)
 	}
 
-	req, err := requestBytes(c, u)
+	req, err := requestBytes(c, u, via != nil)
 	if err != nil {
 		return nil, err
 	}
 
-	dial := c.Dial
-	if dial == nil {
-		dial = func(network, addr string) (net.Conn, error) {
-			return net.DialTimeout(network, addr, dialTimeout)
-		}
+	// Normaliseren naar de ene interne dialervorm (zie dialBounded): de
+	// totaaltermijn reist als context-deadline, dus élk pad — ook de pool en
+	// de kale stdlib-dial — leeft erbinnen (review 13-08, elfde/twaalfde
+	// ronde: beide gaten waren precies een pad dat total niet kende).
+	ctx := context.Background()
+	if !total.IsZero() {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithDeadline(ctx, total)
+		defer cancel()
 	}
-	conn, err := dial("tcp4", addr)
+	var dial func(ctx context.Context, network, addr string) (net.Conn, error)
+	if c.DialContext == nil && c.Dial == nil && via != nil {
+		dial = via.dial // pool eerst; de staart normaliseert de Client-dialers
+	} else {
+		dial = normalizeDial(c.DialContext, c.Dial)
+	}
+	conn, err := dial(ctx, "tcp4", addr)
 	if err != nil {
 		return nil, fmt.Errorf("leanhttp: dial %s: %w", addr, err)
 	}
@@ -361,23 +564,32 @@ func do(c Call, raw string) (_ *Response, err error) {
 	// De termijn dekt álles tot en met het lezen van de body — dat is wat een
 	// aanroeper met een timeout bedoelt. Geen timeout = een blijvende stream
 	// (een SSE-staart hoort niet af te lopen).
-	// total is het ENE moment waarop de hele call om is (nulwaarde = nooit). De
-	// kop mag daarbinnen zijn eigen, kortere grens hebben; na de kop gaat de
-	// deadline terug naar total, zodat de body de RESTERENDE tijd krijgt en niet
-	// een verse termijn.
-	var total time.Time
-	if c.Timeout > 0 {
-		total = time.Now().Add(c.Timeout)
-		conn.SetDeadline(total)
-	}
-	if c.HeaderTimeout > 0 {
-		if head := time.Now().Add(c.HeaderTimeout); total.IsZero() || head.Before(total) {
-			conn.SetDeadline(head)
+	// total is het ENE moment waarop de hele call om is (nulwaarde = nooit) en
+	// komt van doVia: één absolute deadline over álle redirects heen. De kop
+	// mag daarbinnen zijn eigen, kortere grens hebben; na de kop gaat de
+	// deadline terug naar total, zodat de body de RESTERENDE tijd krijgt en
+	// niet een verse termijn.
+	if !total.IsZero() {
+		// Een transport dat de termijn weigert is onbruikbaar: doorgaan
+		// zónder termijn is precies de hang die de aanroeper wilde uitsluiten
+		// (review 13-08, achtentwintigste ronde).
+		if err := conn.SetDeadline(total); err != nil {
+			return nil, fmt.Errorf("leanhttp: set deadline: %w", err)
 		}
 	}
-
+	// pooled: dit verzoek rijdt op een hergebruikte verbinding. Faalt die vóór
+	// de eerste antwoordbyte, dan is dat vrijwel altijd een server die zijn
+	// idle keep-alive net sloot — doVia mag dan één keer veilig opnieuw (er is
+	// niets van het antwoord geconsumeerd en het hele verzoek gaat opnieuw).
+	_, pooled := conn.(*pooledConn)
+	stale := func(err error) error {
+		if pooled {
+			return fmt.Errorf("%w: %w", errStalePooled, err)
+		}
+		return err
+	}
 	if _, err := conn.Write(req); err != nil {
-		return nil, fmt.Errorf("leanhttp: write request: %w", err)
+		return nil, stale(fmt.Errorf("leanhttp: write request: %w", err))
 	}
 	if c.BodyReader != nil {
 		// Precies BodyLen bytes: dat is wat de Content-Length de server belooft.
@@ -396,71 +608,130 @@ func do(c Call, raw string) (_ *Response, err error) {
 			return nil, fmt.Errorf("leanhttp: write body: %w", err)
 		}
 	}
+	// De kop-termijn gaat pas NU in: het contract zegt "alleen het wachten op
+	// de antwoordkop", en vóór deze verplaatsing stond hij al tijdens de upload
+	// aan — een trage S3-upload sneuvelde dan op de header-timeout terwijl er
+	// niets mis was (review 13-08, negende ronde). Binnen total blijven.
+	if c.HeaderTimeout > 0 {
+		if head := time.Now().Add(c.HeaderTimeout); total.IsZero() || head.Before(total) {
+			if err := conn.SetDeadline(head); err != nil {
+				return nil, fmt.Errorf("leanhttp: set header deadline: %w", err)
+			}
+		}
+	}
 
 	// Een verbinding uit de pool draagt zijn eigen bufio.Reader mee: daar kunnen
 	// bytes in staan die al van de socket gelezen zijn (de server stuurde kop en
 	// body in één pakket). Een nieuwe Reader maken zou die bytes weggooien en
 	// het volgende antwoord half laten beginnen.
 	var br *bufio.Reader
-	if pc, ok := conn.(*pooledConn); ok && pc.br != nil {
-		br = pc.br
+	if pc, ok := conn.(*pooledConn); ok {
+		br = pc.br // de pool bewaart de reader bij de verbinding, altijd
 	} else {
 		br = bufio.NewReaderSize(conn, bufSize)
 	}
-	c.addrKey = addr
 	budget := maxHeaderBytes
 
-	line, err := readLine(br, &budget)
-	if err != nil {
-		return nil, fmt.Errorf("leanhttp: read status line: %w", err)
+	// Interim-antwoorden (1xx) zijn geen eindantwoord: een 100 Continue of een
+	// 103 Early Hints heeft een eigen kopblok en daarná komt het echte antwoord
+	// op dezelfde verbinding. Ze als eindantwoord teruggeven desynchroniseert
+	// een keep-alive-verbinding onmiddellijk (review 13-08). Het budget is
+	// cumulatief over de interims — de totale kop blijft begrensd. 101 is een
+	// protocolwissel en die spreken we niet.
+	var code int
+	var proto, status string
+	firstRead := true
+	for {
+		line, err := readLine(br, &budget)
+		if err != nil {
+			if firstRead {
+				// Nog geen antwoordbyte gezien: op een gepoolde verbinding is
+				// dit het stale-keep-alive-geval en mag doVia herkansen. Ná
+				// een gelezen interim niet meer — er is dan al geconsumeerd.
+				return nil, stale(fmt.Errorf("leanhttp: read status line: %w", err))
+			}
+			return nil, fmt.Errorf("leanhttp: read status line: %w", err)
+		}
+		firstRead = false
+		if code, proto, err = statusCode(line); err != nil {
+			return nil, err
+		}
+		if code < 100 || code > 199 {
+			_, status, _ = strings.Cut(line, " ") // "HTTP/1.1 404 Not Found" → "404 Not Found"
+			break
+		}
+		if code == 101 {
+			return nil, fmt.Errorf("leanhttp: server switched protocols (101); this package speaks HTTP/1.1 only")
+		}
+		// De (meestal lege) kop van het interim-antwoord wegslikken.
+		if err := readHeaderBlock(br, &budget, nil); err != nil {
+			return nil, fmt.Errorf("leanhttp: read interim headers: %w", err)
+		}
 	}
-	code, proto, err := statusCode(line)
-	if err != nil {
-		return nil, err
-	}
-	_, status, _ := strings.Cut(line, " ") // "HTTP/1.1 404 Not Found" → "404 Not Found"
 
 	hdr := Header{}
 	var setCookie []string
 	var length int64 = -1
 	var chunked bool
-	for {
-		line, err := readLine(br, &budget)
-		if err != nil {
-			return nil, fmt.Errorf("leanhttp: read headers: %w", err)
-		}
-		if line == "" {
-			break // lege regel: einde headers
-		}
-		k, v, found := strings.Cut(line, ":")
-		if !found {
-			return nil, fmt.Errorf("leanhttp: malformed header %q", line)
-		}
-		v = strings.TrimSpace(v)
+	headerErr := readHeaderBlock(br, &budget, func(k, v string) error {
 		switch {
 		case strings.EqualFold(k, "Content-Length"):
 			// Een tweede, andere lengte is een smokkel-signaal, geen
 			// laatste-wint-geval: falen.
 			if length >= 0 {
-				return nil, fmt.Errorf("leanhttp: duplicate Content-Length")
+				return fmt.Errorf("leanhttp: duplicate Content-Length")
 			}
-			if length, err = strconv.ParseInt(v, 10, 64); err != nil || length < 0 {
-				return nil, fmt.Errorf("leanhttp: bad Content-Length %q", v)
+			// parseDecimal, geen ParseInt: alleen kale cijfers ("+5" is bij een
+			// andere parser in de keten een 5, bij weer een andere een fout).
+			n, ok := parseDecimal(v)
+			if !ok {
+				return fmt.Errorf("leanhttp: bad Content-Length %q", v)
 			}
+			length = n
 		case strings.EqualFold(k, "Transfer-Encoding"):
-			chunked = !strings.EqualFold(v, "identity")
+			// Alleen exact "chunked": élke andere codering als chunked lezen
+			// legt het lichaamseinde op de verkeerde plek (review 13-08). En
+			// maar één keer: elke regel werd los goedgekeurd waarna alleen de
+			// boolean won — twee parsers kunnen op zo'n dubbelzinnig antwoord
+			// een ander einde zien, en deze verbinding kon daarna de pool in
+			// (review 13-08, zeventiende ronde).
+			if chunked {
+				return fmt.Errorf("leanhttp: duplicate Transfer-Encoding in response")
+			}
+			if !strings.EqualFold(v, "chunked") {
+				return fmt.Errorf("leanhttp: unsupported Transfer-Encoding %q in response", v)
+			}
+			chunked = true
 		case strings.EqualFold(k, "Set-Cookie"):
 			// Niet vouwen, niet in Header: zie Response.SetCookie.
 			setCookie = append(setCookie, v)
-			continue
+			return nil
 		}
 		hdr.add(k, v)
+		return nil
+	})
+	if headerErr != nil {
+		return nil, fmt.Errorf("leanhttp: read headers: %w", headerErr)
+	}
+	// Beide framings tegelijk is aan de serverkant al een 400 (RFC 9112 §6.1)
+	// en hier net zo hard een fout: "chunked wint" liet de verbinding met een
+	// dubbelzinnig geframed antwoord gewoon de pool in, terwijl twee parsers
+	// op zo'n antwoord een ander einde kunnen zien (review 13-08, zeventiende
+	// ronde). Een fout sluit de verbinding — dat is precies de bedoeling.
+	if chunked && length >= 0 {
+		return nil, fmt.Errorf("leanhttp: both Transfer-Encoding and Content-Length in response")
 	}
 
-	// Chunked wint van Content-Length (RFC 9112 §6.1) — en een antwoord met
-	// beide is smokkel-verdacht, dus de lengte gaat overboord.
+	// Een antwoord op HEAD draagt de kop van het GET-antwoord maar géén body
+	// (RFC 9112 §6.3): een Content-Length betekent daar niet dat er bytes
+	// komen. Zonder deze regel las de client body-bytes die niet bestaan —
+	// het volgende antwoord op de verbinding — als de body van de HEAD
+	// (review 13-08). Length blijft de geadverteerde waarde (informatief).
+	isHEAD := c.Method == "HEAD" // exact: methode-tokens zijn hoofdlettergevoelig (RFC 9110 §9.1)
 	var rd io.Reader
 	switch {
+	case isHEAD:
+		rd, chunked = emptyBody{}, false
 	case !bodyAllowed(code):
 		// 204 en 304 hebben per definitie geen body (RFC 9112 §6.3), ook niet
 		// als de server een lengte of Transfer-Encoding meestuurde. Zonder deze
@@ -471,11 +742,20 @@ func do(c Call, raw string) (_ *Response, err error) {
 		// staan tot de tegenpartij hem verveeld dichtgooide (in de test: een
 		// `go test` die zijn eigen timeout haalde). De serverkant kende deze
 		// regel al; de clientkant niet.
-		rd, length, chunked = emptyBody{}, 0, false
+		rd, chunked = emptyBody{}, false
+		if code == StatusNoContent {
+			length = 0 // een 204 draagt per definitie niets
+		}
+		// Een 304 mag een informatieve Content-Length dragen (RFC 9110 §8.6):
+		// Length blijft dan de geadverteerde waarde, zoals bij HEAD
+		// (review 13-08, vijfentwintigste ronde). Body blijft leeg.
 	case chunked:
 		rd, length = &chunkReader{br: br}, -1
 	case length >= 0:
-		rd = io.LimitReader(br, length)
+		// Geen io.LimitReader: die geeft een kale io.EOF, óók als de verbinding
+		// halverwege stierf — en dan eindigt een half antwoord als "compleet
+		// maar kort bestand". lengthReader kent het verschil (review 13-08).
+		rd = &lengthReader{r: br, n: length}
 	default:
 		rd = br // geen lengte, geen chunks: de body loopt tot EOF
 	}
@@ -484,7 +764,9 @@ func do(c Call, raw string) (_ *Response, err error) {
 	// de nulwaarde), dan wist dit de deadline en mag de body zo lang duren als
 	// hij duurt — een artifact van 30MB hoort niet af te lopen.
 	if c.HeaderTimeout > 0 {
-		conn.SetDeadline(total)
+		if err := conn.SetDeadline(total); err != nil {
+			return nil, fmt.Errorf("leanhttp: restore deadline: %w", err)
+		}
 	}
 
 	// Hergebruik mag alleen als we het einde van de body kunnen vinden EN de
@@ -498,15 +780,24 @@ func do(c Call, raw string) (_ *Response, err error) {
 	// herbruikbare verbinding. Gevolg op ijzer: élke tweede artifact-download van
 	// zo'n server viel om met "read status line: EOF", en op de server bleven
 	// verbindingen staan die niemand meer las.
-	keepAliveOK := proto != "HTTP/1.0" ||
-		strings.Contains(strings.ToLower(hdr.Get("Connection")), "keep-alive")
-	reuse := c.keepAlive && keepAliveOK && (chunked || length >= 0) &&
-		!strings.EqualFold(hdr.Get("Connection"), "close")
+	connHdr := hdr.Get("Connection")
+	keepAliveOK := proto != "HTTP/1.0" || connectionHas(connHdr, "keep-alive")
+	bodyless := isHEAD || !bodyAllowed(code)
+	reuse := via != nil && keepAliveOK && (bodyless || chunked || length >= 0) &&
+		!connectionHas(connHdr, "close")
 
 	handedOff = true
-	b := body{r: rd, c: conn}
+	b := body{r: rd, c: conn, deadline: total}
+	// Een bewezen-lege body is meteen "gelezen": HEAD/204/304 en een
+	// niet-chunked lengte 0 dragen per definitie nul bytes, dus een caller die
+	// alleen netjes Close doet (de DELETE→204-route) hoort de verbinding te
+	// poolen in plaats van te sluiten (review 13-08, drieëntwintigste ronde).
+	// Chunked blijft pas bewezen ná de nul-chunk.
+	if bodyless || (!chunked && length == 0) {
+		b.done = true
+	}
 	if reuse {
-		b.pool, b.key, b.br = c.pool, c.addrKey, br
+		b.pool, b.key, b.br = via, addr, br
 	}
 	return &Response{
 		StatusCode: code,
@@ -523,10 +814,15 @@ func do(c Call, raw string) (_ *Response, err error) {
 
 // requestBytes bouwt de verzoekkop. Header-waarden mogen geen CR/LF bevatten:
 // dat zou een tweede verzoek in het eerste smokkelen.
-func requestBytes(c Call, u *url.URL) ([]byte, error) {
+func requestBytes(c Call, u *url.URL, keepAlive bool) ([]byte, error) {
 	method := c.Method
 	if method == "" {
 		method = "GET"
+	} else if !validToken(method) {
+		// Een methode met een spatie of CRLF erin is een tweede verzoek in
+		// vermomming (request-line-injectie) — zelfde wacht als de
+		// headernamen (review 13-08, vijfde ronde).
+		return nil, fmt.Errorf("leanhttp: invalid method %q", c.Method)
 	}
 	var b bytes.Buffer
 	// Accept-Encoding: identity is de DEFAULT, niet een wet — wij pakken niets
@@ -539,7 +835,7 @@ func requestBytes(c Call, u *url.URL) ([]byte, error) {
 		enc = v
 	}
 	conn := "close"
-	if c.keepAlive {
+	if keepAlive {
 		conn = "keep-alive"
 	}
 	// Host zonder poort-default, net als net/http.
@@ -558,9 +854,14 @@ func requestBytes(c Call, u *url.URL) ([]byte, error) {
 	}
 	for k, v := range c.Header {
 		switch {
-		case strings.ContainsAny(k, "\r\n: ") || k == "":
+		case !validToken(k):
+			// Zelfde tokenwacht als overal: ook een tab of andere control-byte
+			// in de naam is een injectie, niet een header (review 13-08,
+			// zevende ronde).
 			return nil, fmt.Errorf("leanhttp: illegal header name %q", k)
-		case strings.ContainsAny(v, "\r\n"):
+		case !validFieldValue(v):
+			// Zelfde grammatica als inkomend (validFieldValue): ook een NUL of
+			// VT is een injectievector, niet alleen CR/LF.
 			return nil, fmt.Errorf("leanhttp: illegal value for header %q", k)
 		// De vier hierboven zijn van ons; stil laten overschrijven zou het
 		// verzoek onbegrijpelijk maken.
@@ -576,9 +877,50 @@ func requestBytes(c Call, u *url.URL) ([]byte, error) {
 	return b.Bytes(), nil
 }
 
-// readLine leest één CRLF-regel en trekt hem van het budget af. ReadSlice
-// begrenst de regel op de buffergrootte (ErrBufferFull = te lang) i.p.v.
-// ongebonden te groeien zoals ReadString zou doen.
+// readHeaderBlock leest regels tot de lege regel en geeft elke header als
+// (naam, getrimde waarde) aan each. Dit is de ENE plek waar client én server
+// een kopblok ontleden — twee eigen lussen waren al aan het uiteenlopen, en
+// headers horen aan beide kanten voor altijd hetzelfde te parsen
+// (review 13-08, zesde ronde). each mag nil zijn (kop wegslikken, zoals bij
+// een 1xx-interim).
+func readHeaderBlock(br *bufio.Reader, budget *int, each func(k, v string) error) error {
+	for {
+		line, err := readLine(br, budget)
+		if err != nil {
+			return err
+		}
+		if line == "" {
+			return nil // lege regel: einde kop
+		}
+		k, v, found := strings.Cut(line, ":")
+		if !found {
+			return fmt.Errorf("leanhttp: malformed header %q", line)
+		}
+		// De naam moet een strak token zijn, zónder witruimte vóór de dubbele
+		// punt (RFC 9112 §5.1). Tolerantie is een smokkelgat: "Content-Length
+		// : 5" werd een onbekende header en de vijf bodybytes het begin van
+		// het VOLGENDE bericht (review 13-08). Hier, zodat client en server
+		// dit gegarandeerd hetzelfde doen.
+		if !validToken(k) {
+			return fmt.Errorf("leanhttp: invalid header name %q", k)
+		}
+		if each == nil {
+			continue
+		}
+		if err := each(k, trimOWS(v)); err != nil {
+			return err
+		}
+	}
+}
+
+// readLine leest één CRLF-regel en trekt hem van het budget af. Strikt: de
+// regel MOET op precies \r\n eindigen (kale LF geweigerd, losse CR's blijven
+// staan en vallen op de CTL-wacht hieronder), en control-bytes in de regel
+// zijn een fout. Een parser die zulke vormen stil normaliseert leest een
+// bericht anders af dan de proxy ervóór, en dat verschil ís het smokkelgat —
+// na alle eerdere hardening was dit de overgebleven parserdifferentiaal
+// (review 13-08, dertiende ronde). ReadSlice begrenst de regel op de
+// buffergrootte (ErrBufferFull = te lang) i.p.v. ongebonden te groeien.
 func readLine(br *bufio.Reader, budget *int) (string, error) {
 	raw, err := br.ReadSlice('\n')
 	if err == bufio.ErrBufferFull {
@@ -590,24 +932,134 @@ func readLine(br *bufio.Reader, budget *int) (string, error) {
 	if *budget -= len(raw); *budget < 0 {
 		return "", fmt.Errorf("headers exceed %d bytes", maxHeaderBytes)
 	}
+	if len(raw) < 2 || raw[len(raw)-2] != '\r' {
+		return "", fmt.Errorf("leanhttp: line not terminated by CRLF")
+	}
 	// raw wijst in de bufio-buffer en is na de volgende read ongeldig — de
 	// string-conversie hieronder kopieert, dus dat is hier afgehandeld.
-	return strings.TrimRight(string(raw), "\r\n"), nil
+	line := string(raw[:len(raw)-2])
+	if !validFieldValue(line) {
+		return "", fmt.Errorf("leanhttp: control byte in line %q", line)
+	}
+	return line, nil
+}
+
+// validFieldValue toetst tegen de veldwaarde-grammatica van RFC 9110 §5.5:
+// HTAB, zichtbare ASCII en obs-text (≥0x80) mogen, elke andere control-byte
+// niet. Dit is bewust ÉÉN functie voor de reader (readLine) én beide writers
+// (requestBytes, writeHead): inkomend werden NUL/VT/FF/DEL al geweigerd
+// terwijl uitgaand alleen CR/LF sneuvelde — dan zet je een header op de draad
+// die je zelf zou weigeren (review 13-08, vijftiende ronde).
+func validFieldValue(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if c := s[i]; (c < 0x20 && c != '\t') || c == 0x7f {
+			return false
+		}
+	}
+	return true
+}
+
+// trimOWS trimt uitsluitend HTTP-witruimte (SP en HTAB, RFC 9110 §5.6.3).
+// strings.TrimSpace nam ook \r, \v, \f en Unicode-spaties mee — ruimer dan de
+// grammatica, en élke tolerantie hier is een kans op een parserdifferentiaal
+// (review 13-08, dertiende ronde).
+func trimOWS(s string) string {
+	for len(s) > 0 && (s[0] == ' ' || s[0] == '\t') {
+		s = s[1:]
+	}
+	for len(s) > 0 && (s[len(s)-1] == ' ' || s[len(s)-1] == '\t') {
+		s = s[:len(s)-1]
+	}
+	return s
+}
+
+// parseDecimal parseert uitsluitend ASCII-cijfers. strconv.ParseInt accepteert
+// ook "+5", en een Content-Length die wij anders lezen dan de proxy vóór ons
+// is precies het framing-verschil waar request smuggling op drijft
+// (review 13-08, dertiende ronde). De lengtegrens houdt het product binnen
+// int64 zonder overloop-acrobatiek.
+func parseDecimal(s string) (int64, bool) {
+	if s == "" || len(s) > 18 {
+		return 0, false
+	}
+	var n int64
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c < '0' || c > '9' {
+			return 0, false
+		}
+		n = n*10 + int64(c-'0')
+	}
+	return n, true
+}
+
+// parseHex is parseDecimal voor chunk-groottes: uitsluitend hex-cijfers.
+func parseHex(s string) (int64, bool) {
+	if s == "" || len(s) > 15 {
+		return 0, false
+	}
+	var n int64
+	for i := 0; i < len(s); i++ {
+		var d int64
+		switch c := s[i]; {
+		case c >= '0' && c <= '9':
+			d = int64(c - '0')
+		case c >= 'a' && c <= 'f':
+			d = int64(c-'a') + 10
+		case c >= 'A' && c <= 'F':
+			d = int64(c-'A') + 10
+		default:
+			return 0, false
+		}
+		n = n<<4 | d
+	}
+	return n, true
+}
+
+// connectionHas toetst of de Connection-header een token draagt: de waarde is
+// een kommalijst ("upgrade, close"), en een substring- of hele-string-toets
+// mist dan de close die erin staat — waarna een verbinding gepoold wordt die
+// de server sluit (review 13-08, tweede ronde).
+func connectionHas(header, token string) bool {
+	// strings.Cut in plaats van Split: dit loopt per verzoek/antwoord en hoeft
+	// er geen slice voor te alloceren.
+	for header != "" {
+		var part string
+		part, header, _ = strings.Cut(header, ",")
+		if strings.EqualFold(trimOWS(part), token) {
+			return true
+		}
+	}
+	return false
 }
 
 // statusCode pelt code én protocol uit "HTTP/1.1 200 OK". Het protocol telt:
 // zie de hergebruik-regel in do.
 func statusCode(line string) (int, string, error) {
 	proto, rest, found := strings.Cut(line, " ")
+	// De prefix-toets is functioneel gedekt door de exacte versietoets eronder;
+	// hij bestaat om de melding — "geen HTTP" is een andere diagnose dan "een
+	// HTTP-versie die we niet spreken" (zelfde afweging als checkGet's
+	// chunked-tak).
 	if !found || !strings.HasPrefix(proto, "HTTP/") {
 		return 0, "", fmt.Errorf("leanhttp: malformed status line %q", line)
 	}
+	if proto != "HTTP/1.0" && proto != "HTTP/1.1" {
+		// Alleen de twee versies die we spréken: al het andere accepteren
+		// betekent gokken over framing en persistentie — een "HTTP/9.9" kon
+		// zo de keep-alive-pool in (review 13-08, negende ronde).
+		return 0, "", fmt.Errorf("leanhttp: unsupported protocol in status line %q", line)
+	}
+	// parseDecimal + exact drie cijfers (RFC 9112 §4): Atoi accepteerde ook
+	// "+200", en de statuscode stuurt bodyAllowed, de 1xx-lus én de
+	// hergebruik-beslissing — het parserdifferentiaal-argument van de
+	// Content-Length geldt hier onverkort (review 13-08, veertiende ronde).
 	num, _, _ := strings.Cut(rest, " ")
-	code, err := strconv.Atoi(num)
-	if err != nil || code < 100 || code > 599 {
+	code, ok := parseDecimal(num)
+	if !ok || len(num) != 3 || code < 100 || code > 599 {
 		return 0, "", fmt.Errorf("leanhttp: malformed status line %q", line)
 	}
-	return code, proto, nil
+	return int(code), proto, nil
 }
 
 // body koppelt de (eventueel ge-de-chunkte) lezer aan de verbinding, zodat
@@ -629,24 +1081,105 @@ type body struct {
 	br   *bufio.Reader
 	pool *Client
 	key  string
+
+	// deadline is de totaaltermijn van de call: de conn-deadline dekt alleen
+	// SOCKET-reads, en bytes die de bufio al vooruitgelezen had kwamen daar
+	// nooit langs — een verlopen Call.Timeout las dan vrolijk door
+	// (review 13-08, vijfentwintigste ronde).
+	deadline time.Time
+
+	// mu bewaakt done/shut: het contract staat een Close toe die een
+	// geblokkeerde Read afbreekt, en dat waren twee goroutines op dezelfde
+	// velden (review 13-08, vijfentwintigste ronde).
+	mu   sync.Mutex
 	done bool // de body is tot het einde gelezen
 	shut bool // Close is al geweest
 }
 
 func (b *body) Read(p []byte) (int, error) {
+	if !b.deadline.IsZero() && time.Now().After(b.deadline) {
+		return 0, os.ErrDeadlineExceeded
+	}
 	n, err := b.r.Read(p)
 	if err == io.EOF {
+		// Alleen een BEWEZEN einde telt voor de pool: exact Content-Length
+		// bytes, of de nul-chunk met afgesloten trailers. Een framing-lezer
+		// die het einde niet kan bewijzen geeft io.ErrUnexpectedEOF (RFC 9112
+		// §8: incomplete message) en komt hier dus niet. De tot-EOF-body komt
+		// hier wél, maar die verbinding was al onherbruikbaar (pool staat uit).
+		b.mu.Lock()
 		b.done = true
+		b.mu.Unlock()
 	}
 	return n, err
 }
 
+// lengthReader is de Content-Length-lezer: precies n bytes, en een verbinding
+// die eerder sterft is io.ErrUnexpectedEOF — nooit een kale EOF, want dat is
+// het verschil tussen "bestand compleet" en "half bestand als succes"
+// (review 13-08).
+type lengthReader struct {
+	r io.Reader
+	n int64
+
+	// connEOF: de onderliggende verbinding gaf een EOF, ook al was de body op
+	// dat moment compleet (data + EOF in één Read — een TLS-close_notify kan
+	// dat). De body is dan geldig, maar de verbinding is DOOD: wie hem poolt,
+	// geeft het volgende verzoek een "read status line: EOF" zonder tweede
+	// kans (review 13-08, derde ronde).
+	connEOF bool
+}
+
+func (l *lengthReader) Read(p []byte) (int, error) {
+	if l.n <= 0 {
+		return 0, io.EOF
+	}
+	if int64(len(p)) > l.n {
+		p = p[:l.n]
+	}
+	n, err := l.r.Read(p)
+	l.n -= int64(n)
+	if err == io.EOF {
+		l.connEOF = true
+		if l.n > 0 {
+			return n, io.ErrUnexpectedEOF
+		}
+		err = nil // de body is compleet; de vólgende Read geeft de nette EOF
+	}
+	// Bij l.n == 0 is het einde nu bewezen; de volgende Read geeft de nette EOF.
+	return n, err
+}
+
 func (b *body) Close() error {
+	b.mu.Lock()
 	if b.shut {
+		b.mu.Unlock()
 		return nil
 	}
 	b.shut = true
-	if b.pool != nil && b.done && b.pool.put(b.key, b.c, b.br) {
+	done := b.done
+	b.mu.Unlock()
+	if !done {
+		// Niet compleet: nooit poolen, en — belangrijker — geen énkele blik
+		// op de reader: een geblokkeerde Read kan er nog middenin zitten
+		// (het contract staat Close-als-afbreker toe), en connEOF/Buffered
+		// lezen naast een lopende Read is een datarace (review 13-08,
+		// achtentwintigste ronde). De mutex hierboven geeft happens-before
+		// met de Read die done wél zette: daarná is de reader stil.
+		return b.c.Close()
+	}
+	// Een complete body over een verbinding die intussen zelf een EOF gaf
+	// (lengthReader.connEOF) is klaar om te LEZEN maar dood om te HERGEBRUIKEN.
+	dead := false
+	if lr, ok := b.r.(*lengthReader); ok {
+		dead = lr.connEOF
+	}
+	// En nooit poolen met ongelezen bytes in de reader: na een bewezen-lege
+	// body kán daar alleen een ongevraagd, vooruitgestuurd "antwoord" staan —
+	// call 2 zou zijn verzoek schrijven en dát lezen (review 13-08,
+	// vierentwintigste ronde).
+	clean := b.br == nil || b.br.Buffered() == 0
+	if b.pool != nil && !dead && clean && b.pool.put(b.key, b.c, b.br) {
 		return nil // de verbinding leeft door in de pool
 	}
 	return b.c.Close()
@@ -679,9 +1212,22 @@ func (c *chunkReader) Read(p []byte) (int, error) {
 	}
 	n, err := c.br.Read(p)
 	c.n -= int64(n)
+	if err == io.EOF {
+		// Élke EOF hier is een incompleet bericht (RFC 9112 §8): ook als hij
+		// precies op de chunkgrens valt is de afsluitende CRLF — laat staan de
+		// nul-chunk — nooit gezien (review 13-08, derde ronde).
+		err = io.ErrUnexpectedEOF
+	}
 	if c.n == 0 && err == nil {
 		// Einde chunk: de afsluitende CRLF hoort niet bij de data.
 		crlf, err := c.line()
+		if err == io.EOF {
+			// Sterft de verbinding exact vóór die CRLF ("5\r\nhallo" en
+			// dicht), dan gaf dit een kale EOF door: de body gold als compleet
+			// en de dóde verbinding ging de pool in (review 13-08, derde
+			// ronde).
+			return n, io.ErrUnexpectedEOF
+		}
 		if err != nil {
 			return n, err
 		}
@@ -701,27 +1247,88 @@ func (c *chunkReader) line() (string, error) {
 	return readLine(c.br, &budget)
 }
 
+// forbiddenTrailers zijn de velden die per RFC 9110 §6.5.1 nooit in een
+// trailer thuishoren: framing, routing, verbindingsbeheer, authenticatie,
+// caching/conditionals en content-verwerking. Wij negeren trailer-inhoud
+// sowieso, maar een parser verderop in de keten misschien niet — fail-closed
+// (review 13-08, twintigste ronde: de eerste lijst dekte alleen framing).
+var forbiddenTrailers = map[string]bool{
+	"transfer-encoding": true, "content-length": true, "host": true,
+	"connection": true, "upgrade": true, "te": true, "trailer": true,
+	"content-type": true, "content-encoding": true, "content-range": true,
+	"cache-control": true, "expect": true, "max-forwards": true,
+	"pragma": true, "range": true, "if-match": true, "if-none-match": true,
+	"if-modified-since": true, "if-unmodified-since": true, "if-range": true,
+	"authorization": true, "www-authenticate": true, "cookie": true,
+	"set-cookie": true, "proxy-authenticate": true, "proxy-authorization": true,
+	"age": true, "location": true, "retry-after": true, "vary": true,
+}
+
 // next leest de eerstvolgende chunk-kop; done wordt gezet op de nul-chunk.
 func (c *chunkReader) next() error {
 	line, err := c.line()
+	if err == io.EOF {
+		// Geen nul-chunk gezien: de body is niet compleet, hoe netjes de
+		// verbinding ook sloot (review 13-08).
+		return io.ErrUnexpectedEOF
+	}
 	if err != nil {
 		return err
 	}
-	// "1a3; ext=foo" — de extensie is voor ons betekenisloos.
-	size, _, _ := strings.Cut(line, ";")
-	n, err := strconv.ParseInt(strings.TrimSpace(size), 16, 64)
-	if err != nil || n < 0 {
+	// "1a3;ext=foo" — de extensie is voor ons betekenisloos. parseHex, geen
+	// ParseInt(…, 16, …): die accepteert ook "+1a3" — en géén OWS-trim: een
+	// chunk-size is exact 1*HEXDIG (RFC 9112 §7.1), en juist bij framing is
+	// elke tolerantie een parserdifferentiaal (review 13-08, zeventiende
+	// ronde).
+	size, ext, hasExt := strings.Cut(line, ";")
+	n, ok := parseHex(size)
+	if !ok {
 		return fmt.Errorf("leanhttp: malformed chunk size %q", line)
 	}
+	if hasExt {
+		// BEWUSTE AFWIJKING van RFC 9112 §7.1.1: een ontvanger hoort
+		// onbekende maar sýntactisch geldige chunk-extensies te negeren, en
+		// dit weigert ze categorisch — óók een geldige "5;foo=bar". De
+		// afweging: "geldig" toetsen vergt een quote-bewuste ABNF-parser
+		// (x="a;b" is geldig, x=a b niet, BWS vóór ";" wel) voor iets dat
+		// geen van onze tegenpartijen ooit stuurt, en half valideren was
+		// aantoonbaar zelf een parserdifferentiaal (ronde 19→20).
+		// Fail-closed op framing weegt hier zwaarder dan de MUST-ignore;
+		// duikt er ooit een peer op die ze stuurt, dan hoort hier die parser
+		// (review 13-08, eenentwintigste ronde).
+		_ = ext
+		return fmt.Errorf("leanhttp: chunk extensions are not supported: %q", line)
+	}
 	if n == 0 {
-		c.done = true
 		// Trailers wegslikken tot de lege regel — die is er altijd; hier telt
 		// het cumulatieve budget wél, want dit blok is eindig en eenmalig.
+		// Fouten tellen: een verbinding die sterft vóór de lege regel heeft
+		// het einde niet bewezen, en done blijft dan uit zodat de pool deze
+		// verbinding nooit krijgt (review 13-08).
 		budget := maxHeaderBytes
 		for {
 			t, err := readLine(c.br, &budget)
-			if err != nil || t == "" {
+			if err == io.EOF {
+				return io.ErrUnexpectedEOF
+			}
+			if err != nil {
+				return err
+			}
+			if t == "" {
+				c.done = true
 				return nil
+			}
+			// Trailerregels volgen de header-grammatica, en framing/routing
+			// hoort er niet in (RFC 9110 §6.5.1): een "trailer" die
+			// Content-Length of Transfer-Encoding zegt is een smokkelpoging,
+			// geen metadata (review 13-08, negentiende ronde). De inhoud
+			// blijft verder genegeerd.
+			k, _, found := strings.Cut(t, ":")
+			if !found || !validToken(k) {
+				return fmt.Errorf("leanhttp: malformed trailer line %q", t)
+			}
+			if forbiddenTrailers[strings.ToLower(k)] {
+				return fmt.Errorf("leanhttp: forbidden trailer field %q", k)
 			}
 		}
 	}

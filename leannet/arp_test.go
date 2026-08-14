@@ -143,8 +143,8 @@ func TestARPForeignReplyIgnored(t *testing.T) {
 	if len(tab.entries) != 0 {
 		t.Fatal("foreign reply created an entry")
 	}
-	if tab.cntIgnored != 1 {
-		t.Fatalf("cntIgnored = %d, want 1", tab.cntIgnored)
+	if tab.cnt.Ignored != 1 {
+		t.Fatalf("cntIgnored = %d, want 1", tab.cnt.Ignored)
 	}
 
 	// Ook een aan óns gerichte reply voor een IP zonder pending query maakt
@@ -180,8 +180,8 @@ func TestARPGratuitousRefresh(t *testing.T) {
 	if !ok || mac != newMAC {
 		t.Fatalf("gratuitous refresh: mac = %v, %v; want %v, true", mac, ok, newMAC)
 	}
-	if tab.cntMACChanged != 1 {
-		t.Fatalf("cntMACChanged = %d, want 1", tab.cntMACChanged)
+	if tab.cnt.MACChanged != 1 {
+		t.Fatalf("cntMACChanged = %d, want 1", tab.cnt.MACChanged)
 	}
 
 	// De refresh verlengde de TTL: op t=130s (verlopen t.o.v. t=0, niet
@@ -238,8 +238,8 @@ func TestARPRetryAndGiveUp(t *testing.T) {
 	if got := arpDrain(t, tab, giveUp); got != 0 {
 		t.Fatal("query emitted after give-up point")
 	}
-	if tab.cntGaveUp != 1 {
-		t.Fatalf("cntGaveUp = %d, want 1", tab.cntGaveUp)
+	if tab.cnt.GaveUp != 1 {
+		t.Fatalf("cntGaveUp = %d, want 1", tab.cnt.GaveUp)
 	}
 	if !tab.noAnswer(arpTestPeerIP, giveUp) {
 		t.Fatal("noAnswer = false after give-up")
@@ -264,8 +264,8 @@ func TestARPRetryAndGiveUp(t *testing.T) {
 	if got := arpDrain(t, tab, fresh); got != 1 {
 		t.Fatalf("emitted %d queries on fresh cycle, want 1", got)
 	}
-	if tab.cntGaveUp != 1 {
-		t.Fatalf("cntGaveUp = %d after restart, want still 1", tab.cntGaveUp)
+	if tab.cnt.GaveUp != 1 {
+		t.Fatalf("cntGaveUp = %d after restart, want still 1", tab.cnt.GaveUp)
 	}
 }
 

@@ -1,6 +1,7 @@
 package leanhttps
 
 import (
+	"context"
 	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/tls"
@@ -72,14 +73,14 @@ func TestGepindeSleutel(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	inner := call.Dial
-	call.Dial = func(network, addr2 string) (net.Conn, error) {
+	inner := call.DialContext // call() zet sinds de vijftiende ronde DialContext
+	call.DialContext = func(ctx context.Context, network, addr2 string) (net.Conn, error) {
 		// De naam die leanhttp wil bereiken moet in addr staan (voor SNI),
 		// maar de TCP-verbinding gaat naar de testserver.
 		if !strings.HasPrefix(addr2, "leader.internal:") {
 			t.Errorf("dial-adres = %q, want leader.internal:443", addr2)
 		}
-		return inner(network, addr)
+		return inner(ctx, network, addr)
 	}
 	resp, err := leanhttp.Do(call)
 	if err != nil {
@@ -106,8 +107,8 @@ func TestVerkeerdePin(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	inner := call.Dial
-	call.Dial = func(network, _ string) (net.Conn, error) { return inner(network, addr) }
+	inner := call.DialContext
+	call.DialContext = func(ctx context.Context, network, _ string) (net.Conn, error) { return inner(ctx, network, addr) }
 	if _, err := leanhttp.Do(call); err == nil {
 		t.Fatal("verkeerde pin werd geaccepteerd — dat is de hele belofte van de pin")
 	}
@@ -146,7 +147,7 @@ func TestIPZonderPin(t *testing.T) {
 	c := Client{TLS: &leantls.Config{
 		VerifyPeer: func([][]byte, string) (leantls.SignatureVerifier, error) { return nil, nil },
 	}}
-	_, err := c.dial("tcp", "10.0.0.5:443")
+	_, err := c.dial(context.Background(), "tcp", "10.0.0.5:443")
 	if err == nil || !strings.Contains(err.Error(), "IP address") {
 		t.Fatalf("err = %v — een keten tegen een IP moet weigeren", err)
 	}
@@ -156,7 +157,7 @@ func TestIPZonderPin(t *testing.T) {
 	// Mag niet op de IP-check stuiten; de dial faalt hierna op de verbinding
 	// zelf en dat is prima. Loopback met poort 1: dat weigert meteen, waar een
 	// routeerbaar adres een minuut TCP-timeout zou kosten.
-	if _, err := cp.dial("tcp", "127.0.0.1:1"); err != nil && strings.Contains(err.Error(), "IP address") {
+	if _, err := cp.dial(context.Background(), "tcp", "127.0.0.1:1"); err != nil && strings.Contains(err.Error(), "IP address") {
 		t.Fatalf("pin + IP werd geweigerd op de naam: %v", err)
 	}
 }
@@ -169,7 +170,7 @@ func TestConfigNietGemuteerd(t *testing.T) {
 	pub, _, _ := ed25519.GenerateKey(rand.Reader)
 	cfg := &leantls.Config{PeerKey: pub}
 	c := Client{TLS: cfg}
-	c.dial("tcp", "eerste.example:443") // faalt (niets luistert), dat mag
+	c.dial(context.Background(), "tcp", "eerste.example:443") // faalt (niets luistert), dat mag
 	if cfg.ServerName != "" {
 		t.Fatalf("Config.ServerName is gemuteerd naar %q", cfg.ServerName)
 	}

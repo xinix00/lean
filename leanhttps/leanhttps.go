@@ -59,6 +59,7 @@
 package leanhttps
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net"
@@ -108,11 +109,22 @@ func (c Client) Do(call leanhttp.Call) (*leanhttp.Response, error) {
 // poolt die versleutelde verbindingen (keep-alive over TLS). Dat is de vorm die
 // een browser wil — dertig resources van één host over één handshake.
 //
-//	pool := &leanhttp.Client{Dial: leanhttps.Dialer(tlsCfg)}
+//	pool := &leanhttp.Client{DialContext: leanhttps.DialerContext(tlsCfg)}
 //
 // De config wordt niet gemuteerd en ServerName komt per verbinding uit het
-// dial-adres, net als bij [Client].
+// dial-adres, net als bij [Client]. Neem [DialerContext] waar het kan: die
+// vorm kan de totaaltermijn van een call ook echt annuleren; deze blijft voor
+// wie alleen een Dial-gat heeft.
 func Dialer(cfg *leantls.Config) func(network, addr string) (net.Conn, error) {
+	c := Client{TLS: cfg}
+	return func(network, addr string) (net.Conn, error) {
+		return c.dial(context.Background(), network, addr)
+	}
+}
+
+// DialerContext is [Dialer] mét annulering — voor [leanhttp.Client.DialContext]
+// en [leanhttp.Call.DialContext].
+func DialerContext(cfg *leantls.Config) func(ctx context.Context, network, addr string) (net.Conn, error) {
 	return Client{TLS: cfg}.dial
 }
 
@@ -129,13 +141,17 @@ func (c Client) call(call leanhttp.Call) (leanhttp.Call, error) {
 	if call.Timeout == 0 {
 		call.Timeout = c.Timeout
 	}
-	call.Dial = c.dial
+	// DialContext, niet Dial: dan draagt de totaaltermijn van de call als
+	// context-deadline door tot in de TCP-dial en de handshake — een dial die
+	// leanhttp allang opgaf leeft dan ook zelf niet meer door (review 13-08,
+	// vijftiende ronde).
+	call.DialContext = c.dial
 	return call, nil
 }
 
 // dial verbindt versleuteld. De SNI-naam komt uit addr — dus uit de host die
 // leanhttp op DIT moment wil bereiken, niet uit de oorspronkelijke URL.
-func (c Client) dial(network, addr string) (net.Conn, error) {
+func (c Client) dial(ctx context.Context, network, addr string) (net.Conn, error) {
 	host := addr
 	if h, _, err := net.SplitHostPort(addr); err == nil {
 		host = h
@@ -149,5 +165,5 @@ func (c Client) dial(network, addr string) (net.Conn, error) {
 	}
 	cfg := *c.TLS // kopie: de dialer mag de config van de aanroeper niet muteren
 	cfg.ServerName = strings.TrimSuffix(host, ".")
-	return leantls.Dial(network, addr, &cfg)
+	return leantls.DialContext(ctx, network, addr, &cfg)
 }
