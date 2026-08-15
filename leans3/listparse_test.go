@@ -7,13 +7,6 @@ import (
 	"testing"
 )
 
-// De maatstaf is encoding/xml: op elk antwoord dat een S3 kan sturen moet deze
-// parser hetzelfde zeggen. Dat is de enige reden dat hij mag bestaan, dus staat
-// het als test in de gate en niet als bewering in een comment.
-
-// refParse leest hetzelfde document met encoding/xml — de implementatie die we
-// vervingen, hier alleen als orakel in de test (tests linken niet mee in een
-// image).
 func refParse(t *testing.T, doc string) (*listBucketResult, error) {
 	t.Helper()
 	var ref struct {
@@ -46,8 +39,6 @@ func gelijk(a, b *listBucketResult) bool {
 	return true
 }
 
-// echtAntwoord is de vorm die MinIO en AWS sturen: declaratie, namespace op de
-// wortel, velden die wij niet lezen ertussen.
 const echtAntwoord = `<?xml version="1.0" encoding="UTF-8"?>
 <ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
   <Name>hop-apps</Name>
@@ -125,8 +116,6 @@ func veelKeys(n int) string {
 	return b.String()
 }
 
-// Het gevaar van een eigen parser is een stille misread. Deze twee dingen
-// moeten dus juist wél een fout zijn.
 func TestParseWeigert(t *testing.T) {
 	cases := map[string]string{
 		"leeg":                       "",
@@ -159,17 +148,13 @@ func TestParseWeigert(t *testing.T) {
 	}
 }
 
-// Een afgekapt antwoord is het ene geval waar een stille fout data kost: de
-// aanroeper zou denken dat de listing compleet is en de rest van de bucket
-// vergeten. encoding/xml faalt hier ook, en dat is precies waarom deze test er
-// apart staat.
 func TestAfgekaptAntwoordIsAltijdEenFout(t *testing.T) {
 	for i := 1; i < len(echtAntwoord); i++ {
 		half := echtAntwoord[:i]
 		_, refErr := refParse(t, half)
 		_, err := parseListPage([]byte(half))
 		if refErr == nil {
-			continue // encoding/xml vindt dit een geldig document: wij ook goed
+			continue
 		}
 		if err == nil {
 			t.Fatalf("afgekapt op %d bytes gaf geen fout, encoding/xml wel:\n%q", i, half)
@@ -178,15 +163,14 @@ func TestAfgekaptAntwoordIsAltijdEenFout(t *testing.T) {
 }
 
 func TestIsTruncatedVarianten(t *testing.T) {
-	// "1"/"0" zijn geldige XML-booleans; S3 stuurt ze niet, maar een
-	// S3-compatibele server mag het.
+
 	for doc, wil := range map[string]bool{
 		`<r><IsTruncated>1</IsTruncated></r>`:      true,
 		`<r><IsTruncated>0</IsTruncated></r>`:      false,
 		`<r><IsTruncated>true</IsTruncated></r>`:   true,
 		`<r><IsTruncated>false</IsTruncated></r>`:  false,
 		`<r><IsTruncated> true </IsTruncated></r>`: true,
-		`<r></r>`: false, // afwezig = niet afgekapt
+		`<r></r>`: false,
 	} {
 		got, err := parseListPage([]byte(doc))
 		if err != nil {

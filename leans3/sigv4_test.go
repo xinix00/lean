@@ -1,11 +1,5 @@
 package leans3
 
-// De signeer-tests. Ze komen uit hoplock/s3, waar deze code tegen echte
-// providers gelopen heeft: de verwachte vormen hieronder mogen NIET veranderen,
-// want ze zijn de vorm die AWS, R2, MinIO en Ceph RGW accepteren. Verandert er
-// één, dan is de canonieke vorm gebroken en hoort de code gerepareerd te
-// worden, niet de test.
-
 import (
 	"encoding/hex"
 	"net/url"
@@ -91,7 +85,7 @@ func TestDeriveSigningKeyDeterministisch(t *testing.T) {
 	if len(k1) != 32 {
 		t.Errorf("signing key length = %d, want 32 (sha256 output)", len(k1))
 	}
-	// Andere invoer moet een andere sleutel geven.
+
 	if hex.EncodeToString(k1) == hex.EncodeToString(deriveSigningKey("secret", "20260102", "us-east-1")) {
 		t.Error("signing key did not change with different date")
 	}
@@ -100,7 +94,6 @@ func TestDeriveSigningKeyDeterministisch(t *testing.T) {
 	}
 }
 
-// mustURL is de request-URL waar een signeer-test tegen signeert.
 func mustURL(t *testing.T, raw string) *url.URL {
 	t.Helper()
 	u, err := url.Parse(raw)
@@ -113,8 +106,7 @@ func mustURL(t *testing.T, raw string) *url.URL {
 func TestSignRequestZetDeVerwachteHeaders(t *testing.T) {
 	t.Parallel()
 	u := mustURL(t, "https://bucket.s3.us-east-1.amazonaws.com/lock.json")
-	// Alleen wat de aanroeper zet: Content-Length staat er met opzet niet in,
-	// want leanhttp schrijft hem en de signatuur dekte hem nooit.
+
 	hdr := leanhttp.Header{"Content-Type": "application/json", "If-None-Match": "*"}
 
 	now := time.Date(2026, 1, 15, 12, 0, 0, 0, time.UTC)
@@ -139,8 +131,7 @@ func TestSignRequestZetDeVerwachteHeaders(t *testing.T) {
 			t.Errorf("Authorization missing %q: %q", marker, auth)
 		}
 	}
-	// SignedHeaders moet de Content-Type en de conditionele headers dekken die
-	// wij zetten, plus host en de twee x-amz-headers van de signeerder.
+
 	signedHeaders := extractSignedHeaders(auth)
 	for _, want := range []string{"content-type", "host", "if-none-match", "x-amz-content-sha256", "x-amz-date"} {
 		if !contains(signedHeaders, want) {
@@ -186,10 +177,6 @@ func TestSignRequestDeterministischBijVasteKlok(t *testing.T) {
 	}
 }
 
-// De gesigneerde header-verzameling is het ene ding dat een aanroeper niet kan
-// zien en een server in zijn geheel afwijst: host komt uit de URL,
-// "authorization" blijft eruit, en Content-Length wordt niet gesigneerd omdat
-// leanhttp hem schrijft.
 func TestCanonicalRequestGesigneerdeHeaders(t *testing.T) {
 	t.Parallel()
 	u := mustURL(t, "https://bucket.s3.us-east-1.amazonaws.com/lock.json")
@@ -211,9 +198,6 @@ func TestCanonicalRequestGesigneerdeHeaders(t *testing.T) {
 	}
 }
 
-// De hash van een lege body is een constante die in de specificatie staat; hij
-// staat hier zodat een verkeerde berekening niet stil elke GET verkeerd
-// signeert.
 func TestLegePayloadHash(t *testing.T) {
 	t.Parallel()
 	const want = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"

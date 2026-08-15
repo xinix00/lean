@@ -1,26 +1,13 @@
 package leandhcp
 
-// keepalive.go — de lease levend houden ná de bring-up, als de netstack er is.
+// keepalive.go maintains a lease after network-stack bring-up. Acquire must use
+// raw frames before a stack exists, but afterward the lock-free NIC RX rings
+// need one owner. Renew and Rebind therefore use stack UDP sockets.
 //
-// Twee dingen scheiden dit van leandhcp.go. Het eerste is de weg: Acquire praat
-// in rauwe frames omdat er dan nog geen stack is, maar zodra hopnet's rxLoop de
-// NIC-RX bezit (de driverringen zijn lock-vrij, dus een tweede Receive-lus zou
-// ze desynchroniseren) mag hier geen NIC meer aan te pas komen. Renew en Rebind
-// openen dus een UDP-socket op de stack, en die doet de RX-demux en de
-// TX-serialisatie zelf.
-//
-// Het tweede is de RFC-2131-staatmachine (§4.4.5), en die was hier eerder
-// samengevouwen: KeepAlive deed de T1-renew en probeerde daarna zes keer met
-// dertig seconden ertussen, wat op niets uit de lease sloeg. Dat is het gat dat
-// telt: de unicast-renew gaat naar de lessor, en juist als DIE weg is (nieuwe
-// router, verhuisde DHCP-server) faalt hij tot in het oneindige terwijl er een
-// andere server op het segment staat die de lease zou verlengen. Daarvoor
-// bestaat REBINDING: op T2 stapt de client over op broadcast en vraagt het aan
-// wie het wil horen. Zonder die stap verliest de node zijn IP bij precies de
-// storing waar DHCP een antwoord voor heeft.
-//
-// De hele machine is testbaar zonder sockets en zonder te wachten: alle tijd en
-// al het verkeer lopen door de naden van keeper (sleep/renew/rebind/logf).
+// It implements the RFC 2131 §4.4.5 state machine. At T2, rebinding switches
+// from the original lessor to broadcast so another server can preserve a lease
+// when the original disappears. Injected keeper seams make the full lifecycle
+// testable without sockets or real-time waits.
 
 import (
 	"errors"
@@ -30,14 +17,14 @@ import (
 	"time"
 )
 
-// State is de RFC-2131-staat van een lease.
+// State is an RFC 2131 lease state.
 type State uint8
 
 const (
-	StateBound     State = iota // we hebben een geldig adres, niets te doen
-	StateRenewing               // vanaf T1: unicast naar de lessor
-	StateRebinding              // vanaf T2: broadcast naar elke server
-	StateExpired                // voorbij de lease-tijd: het adres is niet meer van ons
+	StateBound     State = iota // valid address, no action
+	StateRenewing               // from T1: unicast to the lessor
+	StateRebinding              // from T2: broadcast to any server
+	StateExpired                // past expiry: the address is no longer ours
 )
 
 func (s State) String() string {
@@ -54,28 +41,20 @@ func (s State) String() string {
 	return "unknown"
 }
 
-// Tijden van het onderhoudspad. requestTimeout is hoe lang één poging op een
-// ACK wacht; retryFloor is de RFC-2131-vloer onder de tijd tussen pogingen (hij
-// bestaat om een server niet te bestormen).
+// Maintenance timing. requestTimeout bounds one ACK wait; retryFloor is the
+// RFC 2131 minimum interval that prevents retry storms.
 const (
 	requestTimeout = 10 * time.Second
 	retryFloor     = 60 * time.Second
 )
 
-// errRefused is een DHCPNAK: de server zegt dat dit adres niet (meer) van ons
-// is. Dat is geen "probeer straks nog eens" — het is een weigering, en er
-// doorheen blijven praten op dat IP is actief fout.
+// errRefused is DHCPNAK: the address is no longer ours, so retrying on it would
+// be actively wrong.
 var errRefused = errors.New("server refused the lease (DHCPNAK)")
 
-// timers geeft de drie momenten van een lease, gerekend vanaf het binnenkomen
-// van de ACK: T1 (renewen), T2 (rebinden) en het einde. Alle drie nul betekent
-// "niets te timen" — een oneindige (0xFFFFFFFF) of onbekende lease.
-//
-// De server mag T1 en T2 zelf kiezen, maar niet alles wat hij stuurt is
-// bruikbaar: er zijn routers in het veld die T1 = T2 = lease sturen, en dan zou
-// de rebind-fase nul tijd hebben. Alles buiten de orde 0 < T1 < T2 < lease valt
-// daarom terug op de RFC-2131-verhoudingen (0.5 en 0.875) in plaats van de
-// staatmachine te laten ontsporen op een getal van iemand anders.
+// timers returns T1, T2, and expiry from ACK receipt. All zero means an infinite
+// or unknown lease. Invalid ordering falls back to RFC 2131 ratios 0.5 and
+// 0.875; real routers have sent T1 = T2 = expiry, which erases rebinding.
 func (l Lease) timers() (t1, t2, expiry time.Duration) {
 	if l.LeaseSecs == 0 || l.LeaseSecs == 0xFFFFFFFF {
 		return 0, 0, 0
@@ -89,17 +68,14 @@ func (l Lease) timers() (t1, t2, expiry time.Duration) {
 	if t2 <= t1 || t2 >= expiry {
 		t2 = expiry / 8 * 7
 	}
-	if t1 >= t2 { // de server zette T1 bóven 0.875·lease: dan is T1 het foute getal
+	if t1 >= t2 { // T1 above 0.875·lease is the invalid value.
 		t1 = expiry / 2
 	}
 	return t1, t2, expiry
 }
 
-// retryAfter geeft de wachttijd tot de volgende poging: de helft van wat er nog
-// rest tot de volgende fase, met retryFloor als vloer (RFC 2131 §4.4.5). Nooit
-// méér dan wat er rest — anders zouden we de fasegrens voorbij slapen en de
-// rebind te laat beginnen, en de vloer beschermt de server tegen een storm, niet
-// de grens tegen zichzelf.
+// retryAfter returns half the time left to the next phase, floored by RFC 2131
+// and capped at the phase boundary so rebinding never starts late.
 func retryAfter(left time.Duration) time.Duration {
 	wait := left / 2
 	if wait < retryFloor {
@@ -111,33 +87,26 @@ func retryAfter(left time.Duration) time.Duration {
 	return wait
 }
 
-// Renew vernieuwt de lease bij de lessor: een unicast REQUEST met ciaddr =
-// lease-IP en zonder optie 50/54 (RFC 2131 §4.3.2). Dit is de goedkope weg —
-// één pakket naar één server die ons al kent.
+// Renew sends a unicast REQUEST to the lessor with ciaddr set to the lease IP
+// and without options 50/54 (RFC 2131 §4.3.2).
 func Renew(l Lease, mac [6]byte, timeout time.Duration) (Lease, error) {
 	return request(l, mac, timeout, l.Server, StateRenewing)
 }
 
-// Rebind is dezelfde REQUEST als broadcast, voor als de lessor niet meer
-// antwoordt: elke DHCP-server op het segment mag hem beantwoorden. De
-// broadcast-flag in de BOOTP-header blijft UIT — we hebben een geldig IP en
-// kunnen unicast ontvangen, dus het antwoord komt op ciaddr terug. Dat is geen
-// detail: onze eigen ingress negeert broadcast-IP's, dus een geantwoord
-// broadcast zouden we niet zien.
+// Rebind broadcasts the same REQUEST so any server may answer when the lessor
+// is unavailable. The BOOTP broadcast flag remains clear because the valid
+// ciaddr accepts unicast replies; local ingress intentionally ignores broadcast
+// IP replies.
 func Rebind(l Lease, mac [6]byte, timeout time.Duration) (Lease, error) {
 	return request(l, mac, timeout, [4]byte{255, 255, 255, 255}, StateRebinding)
 }
 
-// renewXID levert een verse transactie-id per poging. Niet uit de wandklok: die
-// stapt bij boot (SNTP) en is dus geen bron van uniciteit; een teller in het
-// proces is dat wél. De "HOP"-voorloop maakt onze pakketten herkenbaar in een
-// capture, net als bij Acquire.
+// renewXID supplies a fresh transaction ID per attempt. A process counter stays
+// unique across SNTP wall-clock jumps; the HOP prefix aids packet captures.
 var renewXID atomic.Uint32
 
-// leaseConn is de UDP-socket die request gebruikt; *net.UDPConn voldoet eraan.
-// Hij bestaat als type zodat de logica erboven (NAK herkennen, late pakketten
-// overslaan, de lease samenvoegen) los van een echte socket te proeven is. De
-// bind zelf is één regel en die staat wél op ijzer en in QEMU.
+// leaseConn abstracts *net.UDPConn so NAK handling, late-packet filtering, and
+// lease merging can be tested without a real socket.
 type leaseConn interface {
 	WriteToUDP(b []byte, addr *net.UDPAddr) (int, error)
 	ReadFromUDP(b []byte) (int, *net.UDPAddr, error)
@@ -145,14 +114,13 @@ type leaseConn interface {
 	Close() error
 }
 
-// listenLease opent de client-poort op ons eigen adres. Poort 68 is niet
-// onderhandelbaar: servers antwoorden daarop.
+// listenLease opens DHCP client port 68 on the leased address.
 var listenLease = func(ip [4]byte) (leaseConn, error) {
 	return net.ListenUDP("udp4", &net.UDPAddr{IP: net.IP(ip[:]), Port: 68})
 }
 
-// request doet één REQUEST naar server (de lessor of het broadcastadres) en
-// wacht op de ACK. Een NAK is een fout die errRefused draagt.
+// request sends one REQUEST to the lessor or broadcast address and waits for an
+// ACK. A NAK wraps errRefused.
 func request(l Lease, mac [6]byte, timeout time.Duration, server [4]byte, state State) (Lease, error) {
 	conn, err := listenLease(l.IP)
 	if err != nil {
@@ -179,15 +147,13 @@ func request(l Lease, mac [6]byte, timeout time.Duration, server [4]byte, state 
 		if _, ok := parseBootp(buf[:n], mac, xid, msgNAK); ok {
 			return Lease{}, fmt.Errorf("dhcp %s: %w", state, errRefused)
 		}
-		// Iets anders of iets laats op :68 — binnen de deadline doorlezen.
+		// Ignore unrelated or late port-68 traffic within the deadline.
 	}
 }
 
-// merge legt een vers antwoord over de bestaande lease. Een ACK op een RENEW
-// herhaalt masker/router/DNS/server vaak niet, en soms zelfs de lease-tijden
-// niet; wat ontbreekt draagt de oude lease. Zonder deze regel zou een karige
-// server ons LeaseSecs op nul zetten en daarmee de hele timing (en dus het
-// onderhoud) stilzwijgend uitzetten.
+// merge overlays a sparse renewal ACK on the current lease. Preserving omitted
+// fields prevents a terse server from silently setting LeaseSecs to zero and
+// disabling maintenance.
 func merge(old, fresh Lease) Lease {
 	if fresh.IP == ([4]byte{}) {
 		fresh.IP = old.IP
@@ -211,17 +177,13 @@ func merge(old, fresh Lease) Lease {
 	return fresh
 }
 
-// KeepAlive houdt de lease levend in een eigen goroutine, volgens RFC 2131
-// §4.4.5: slapen tot T1, dan RENEWING (unicast naar de lessor, met halverende
-// pogingen); antwoordt die niet vóór T2, dan REBINDING (broadcast, idem tot de
-// lease-tijd om is); daarna is het adres niet meer van ons en zegt het dat luid.
-//
-// RX-veilig: alles loopt over de netstack, dus dit raakt de NIC-RX niet en mag
-// náást hopnet's rxLoop draaien. Start het PAS nadat hopnet de stack in
-// net.SocketFunc hing (hopnet.Up doet dat op het juiste moment).
+// KeepAlive maintains a lease according to RFC 2131 §4.4.5: sleep until T1,
+// renew by unicast with halving retries, rebind by broadcast after T2, and fail
+// loudly at expiry. Start it only after hopnet installs the stack in
+// net.SocketFunc; all traffic then stays clear of NIC RX ownership.
 func KeepAlive(mac [6]byte, lease Lease) {
 	if !lease.Acquired {
-		return // niets te onderhouden; een statische config heeft geen lease
+		return // Static configuration has no lease to maintain.
 	}
 	k := &keeper{
 		mac:    mac,
@@ -234,10 +196,8 @@ func KeepAlive(mac [6]byte, lease Lease) {
 	k.run()
 }
 
-// keeper is de staatmachine los van de buitenwereld. De vier naden onderaan
-// dragen álle tijd en álle pakketten, zodat een test de hele cyclus (bound →
-// renewing → rebinding → expired) in microseconden doorloopt in plaats van in
-// dagen — en dus ook de paden die je op ijzer nooit uitlokt.
+// keeper isolates the state machine behind injected time, traffic, and logging
+// seams so tests can cover a multi-day lifecycle in microseconds.
 type keeper struct {
 	mac   [6]byte
 	lease Lease
@@ -252,14 +212,12 @@ func (k *keeper) run() {
 	for {
 		t1, t2, expiry := k.lease.timers()
 		if t1 <= 0 {
-			return // oneindige of onbekende lease: er is niets te timen
+			return // Infinite or unknown lease: nothing to schedule.
 		}
 		k.sleep(t1)
 
-		// elapsed is de tijd sinds de ACK, door ONS geteld uit de eigen slaapjes.
-		// Niet van de klok afgelezen: tamago heeft één tijdbasis en die stapt bij
-		// boot (epoch → nu, via SNTP), dus een wandklok-deadline zou hier in één
-		// keer aflopen. Dezelfde les als sleepChunked.
+		// Count elapsed time from our sleeps. Tamago's wall clock jumps from epoch
+		// during boot SNTP, which would expire a wall-clock deadline immediately.
 		elapsed := t1
 		state := StateRenewing
 		var fresh Lease
@@ -302,11 +260,9 @@ func (k *keeper) run() {
 			return
 		}
 
-		// Een rebind mag bij een ándere server uitkomen, en die mag een ánder
-		// adres geven. Dat kunnen we niet toepassen: de stack is bij bring-up op
-		// één IP geconfigureerd. Doorgaan zou betekenen dat de server denkt dat
-		// we het nieuwe adres hebben terwijl we het oude gebruiken — en dan deelt
-		// hij ons oude adres straks aan iemand anders uit.
+		// A different server may assign another address during rebind. The running
+		// stack cannot apply it; continuing would use an address the server may
+		// reassign to another client.
 		if fresh.IP != k.lease.IP {
 			k.logf("dhcp: server offered %s instead of %s; a running node cannot change address — "+
 				"a reboot picks up the new one HOPOS_DHCP_MOVED\n", fresh.IPString(), k.lease.IPString())
@@ -318,10 +274,8 @@ func (k *keeper) run() {
 	}
 }
 
-// sleepChunked slaapt d in plakken van een minuut en telt zelf: tamago heeft
-// ÉÉN tijdbasis, dus een SNTP-kloksprong (epoch→nu bij boot) laat een kale
-// Sleep(d) in één keer aflopen — dat wás de "renewal bij boot" (gemeten
-// 2026-07-11). Geplakt kost een sprong hooguit één plak.
+// sleepChunked limits a Tamago SNTP wall-clock jump to one minute of schedule
+// error. A single long Sleep caused renewal at boot (measured 2026-07-11).
 func sleepChunked(d time.Duration) {
 	const chunk = time.Minute
 	for ; d > chunk; d -= chunk {

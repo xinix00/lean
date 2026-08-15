@@ -1,28 +1,20 @@
 package leanhttp
 
-// De serverkant. Een client-only pakket helpt de apps niet die zélf serveren:
-// de SURF-display serveert /screen.png, de frame-stream en de web-KVM op :80 —
-// precies de app die het meeste baat heeft bij een image zonder TLS.
+// The server side supports small applications that serve content themselves,
+// including SURF's screen image, frame stream, and web KVM.
 //
-// Het model is bewust klein: één handler (routeer zelf op r.Path — een mux is
-// een switch, en die kun je beter zien), antwoorden met Content-Length tenzij
-// de handler Flush aanroept (dan chunked), en Hijack voor wie de verbinding
-// overneemt (de WebSocket van de KVM-pagina). Geen HTTP/2, geen TLS, geen
-// pipelining.
+// The model is intentionally small: one handler, Content-Length responses until
+// Flush switches to chunked, and Hijack for protocols such as WebSocket. It has
+// no HTTP/2, TLS, or pipelining.
 //
-// Wat er wél in zit omdat het anders niet werkt:
+// Essential features are:
 //
-//   - keep-alive voor antwoorden met bekende lengte: een pagina die frames
-//     pollt hoort niet per frame een TCP-handdruk te betalen.
-//   - Flush: zonder tussentijds duwen is een frame-stream of een SSE-staart
-//     onmogelijk.
-//   - Hijack: de WebSocket-handshake is HTTP, de rest niet.
-//   - Request.Done: een handler die eindeloos pusht moet kunnen merken dat de
-//     kijker weg is, anders blijft er per dode kijker een goroutine draaien.
+//   - keep-alive for known-length responses;
+//   - Flush for frame streams and SSE;
+//   - Hijack after an HTTP protocol upgrade;
+//   - Request.Done so streaming handlers detect disconnected clients.
 //
-// Een panic in een handler wordt NIET opgevangen. Dat is geen omissie: op
-// HopOS is een panic dodelijk by design (KILL on PANIC) — een display die half
-// werkt is erger dan een die herstart.
+// Handler panics are not recovered. HopOS treats panic as fatal by design.
 
 import (
 	"bufio"
@@ -39,99 +31,74 @@ import (
 )
 
 const (
-	// maxBodyBytes begrenst het verzoek-lichaam. Dit pakket serveert API's en
-	// kleine formulieren, geen uploads; wie meer nodig heeft leest r.Body van
-	// een handler die zijn eigen grens kent.
+	// This server handles APIs and small forms rather than uploads.
 	maxBodyBytes = 1 << 20
 
-	// autoChunkBytes is de drempel waarboven een antwoord zonder aangekondigde
-	// Content-Length overschakelt op chunked in plaats van dóór te bufferen.
-	// Zonder drempel buffert een vergeten lengte onbegrensd — op een node van
-	// 64MB is één zo'n handler een OOM (review 13-08). 64K houdt de gewone
-	// API-antwoorden op het één-kop-één-lengte-pad.
+	// Switch unknown-length responses to chunked above this threshold so a
+	// forgotten Content-Length cannot buffer into an OOM.
 	autoChunkBytes = 64 << 10
 
-	// requestTimeout: hoe lang een verse verbinding over zijn verzoekkop mag
-	// doen. Een half verzoek dat blijft hangen kost anders een goroutine.
+	// Bound a fresh connection's request header to avoid stalled goroutines.
 	requestTimeout = 15 * time.Second
 
-	// idleTimeout: hoe lang een hergebruikte verbinding stil mag blijven
-	// voordat we hem opruimen.
+	// Close reused connections after this much inactivity.
 	idleTimeout = 60 * time.Second
 
-	// writeTimeout geldt per schrijfronde, niet per antwoord: een stream mag
-	// uren openstaan, maar één plas bytes die er in een halve minuut niet uit
-	// komt betekent een client die niet meer leest.
+	// Apply per write, not per response, so long streams survive but stalled
+	// clients do not retain a goroutine.
 	writeTimeout = 30 * time.Second
 
-	// drainTimeout: hoe lang we een afgewezen verzoek nog laten uitpraten
-	// zodat het antwoord (413, 400) aankomt in plaats van een RST.
+	// Drain rejected requests briefly so the response arrives instead of RST.
 	drainTimeout = 2 * time.Second
 
-	// bodyTimeout begrenst het lezen van de verzoekbody dóór de handler: een
-	// client die een Content-Length belooft en dan stilvalt hield anders een
-	// goroutine (en zijn fd) onbeperkt vast in io.ReadAll — de drain ná de
-	// handler had wel een termijn, maar werd dan nooit bereikt (review 13-08,
-	// tiende ronde). De body is begrensd op maxBodyBytes (1MiB), dus dit is op
-	// élke link die deze server dient ruim.
+	// Bound handler body reads so a client cannot promise Content-Length and then
+	// retain a goroutine and descriptor indefinitely.
 	bodyTimeout = 5 * time.Second
 )
 
-// Handler behandelt één verzoek. Routeren doe je zelf op r.Path.
+// Handler serves one request. Route on r.Path or use Mux.
 type Handler func(w ResponseWriter, r *Request)
 
-// ResponseWriter is de schrijfkant van één antwoord. Anders dan bij net/http
-// zijn Flush en Hijack geen optionele interfaces om naar te casten: een server
-// zonder TLS en zonder HTTP/2 kan ze altijd, dus staan ze gewoon in het
-// contract.
+// ResponseWriter writes one response. Flush and Hijack are always available.
 type ResponseWriter interface {
-	// Header zijn de headers van het antwoord; wijzig ze vóór de eerste Write.
+	// Header returns response headers; modify them before the first Write.
 	Header() Header
 
-	// WriteHeader legt de statuscode vast (default 200). Alleen de eerste
-	// aanroep telt.
+	// WriteHeader sets the status code; the default is 200 and only the first call counts.
 	WriteHeader(status int)
 
-	// Write schrijft body-bytes. Zolang er geen Content-Length in de headers
-	// staat en er niet geflusht is, wordt het antwoord gebufferd — dan telt de
-	// server de lengte zelf.
+	// Write writes body bytes. Without Content-Length or Flush, the server buffers
+	// the response and calculates its length.
 	Write(p []byte) (int, error)
 
-	// Flush duwt wat er staat naar de client. De eerste Flush zonder
-	// Content-Length maakt het antwoord chunked; daarna is het antwoord een
-	// stream en bepaalt de handler wanneer hij ophoudt.
+	// Flush sends pending output. The first Flush without Content-Length switches
+	// to chunked streaming.
 	Flush() error
 
-	// Hijack geeft de rauwe verbinding aan de aanroeper (WebSocket-upgrade).
-	// Daarna schrijft de server zelf niets meer; sluiten is aan de aanroeper.
-	// Mag niet nadat het antwoord al begonnen is.
+	// Hijack transfers the raw connection before the response starts. The caller
+	// becomes responsible for writing and closing it.
 	Hijack() (net.Conn, *bufio.ReadWriter, error)
 }
 
-// Request is één binnengekomen verzoek.
+// Request is one incoming request.
 type Request struct {
 	Method string // "GET", "POST", …
-	// Path is het pad: %-gedecodeerd en geschoond (geen "..", geen dubbele
-	// slashes). Ambigue escapes — een segment dat naar "/", "." of ".."
-	// decodeert — zijn bij het parsen al geweigerd (400), dus deze ene vorm
-	// is voor middleware, Mux en handler dezelfde, en een rewrite door
-	// middleware telt gewoon (review 13-08, zevenentwintigste ronde).
+	// Path is percent-decoded and canonical. Parsing rejects ambiguous escapes,
+	// dot segments, and duplicate slashes so middleware, Mux, and handlers share
+	// one interpretation.
 	Path       string
-	RawQuery   string // alles achter de "?" (zie Query)
+	RawQuery   string // everything after "?"; see Query
 	Proto      string // "HTTP/1.1"
 	Header     Header
-	Body       io.Reader // nooit nil; begrensd op maxBodyBytes
+	Body       io.Reader // never nil; bounded by maxBodyBytes
 	RemoteAddr string
 
-	// ContentLength is de aangekondigde bodylengte, of -1 als er geen
-	// Content-Length was (chunked of geen body). Zelfde betekenis als bij
-	// net/http, zodat een handler die hem leest niets hoeft te weten van welke
-	// server eronder staat.
+	// ContentLength is the declared body length, or -1 when absent, matching net/http.
 	ContentLength int64
 
 	c *conn
 
-	vals      map[string]string // door de Mux gevuld uit {wildcards}
+	vals      map[string]string // populated by Mux wildcards
 	query     url.Values
 	queryOnce sync.Once
 	doneOnce  sync.Once
@@ -139,48 +106,29 @@ type Request struct {
 	keepAlive bool
 }
 
-// PathValue geeft wat een {wildcard} in het gematchte patroon opving, of "" als
-// het patroon die naam niet had. Zie mux.go.
+// PathValue returns a matched wildcard value, or "" when absent.
 func (r *Request) PathValue(name string) string { return r.vals[name] }
 
-// Query ontleedt de querystring (één keer, daarna gecachet).
+// Query parses and caches the query string.
 func (r *Request) Query() url.Values {
 	r.queryOnce.Do(func() {
-		r.query, _ = url.ParseQuery(r.RawQuery) // kromme query = lege waarden
+		r.query, _ = url.ParseQuery(r.RawQuery) // malformed queries yield empty values
 	})
 	return r.query
 }
 
-// Done sluit zodra de client de verbinding verbreekt — voor handlers die
-// eindeloos pushen (frame-stream, SSE) en anders per verdwenen kijker een
-// goroutine op een dode socket laten wachten.
+// Done closes when the client disconnects, allowing long-running stream
+// handlers to stop.
 //
-// Wie Done aanroept verklaart zichzelf tot streamer: vanaf dat moment leest een
-// wachthond de verbinding leeg (zo mérken we het einde) en wordt hij na dit
-// antwoord niet hergebruikt. Roep hem dus niet aan vóórdat je r.Body gelezen
-// hebt — de wachthond zou die bytes opeten. En roep hem VÓÓR je eerste Flush
-// aan: de kop moet "Connection: close" kunnen zeggen (zie writeHead), en die
-// is na de eerste Flush al de deur uit.
+// Calling Done claims the read side for a watcher and disables reuse. Read the
+// request body first, and call Done before the first Flush so the response can
+// advertise Connection: close.
 //
-// Done en Hijack sluiten elkaar uit: de leeskant heeft precies één eigenaar —
-// HTTP zelf, de wachthond van Done, óf de overnemer van Hijack. Done ná een
-// Hijack panickt: de wachthond zou de bytes van de overnemer (WebSocket-frames)
-// opeten, en dat is een bedradingsfout, geen storing (review 13-08,
-// eenendertigste ronde).
+// Done and Hijack are mutually exclusive because the read side has one owner.
+// Done after Hijack, or after response headers were sent, panics as a handler bug.
 //
-// De Hijack- en kop-regel zijn sinds de tweeëndertigste ronde AFGEDWONGEN,
-// fail-fast bij de éérste aanroep: die twee condities zijn puur
-// handler-gestuurd, dus een overtreding is een bedradingsfout van óns. Een
-// ongelezen body is dat NIET: "GET /stream" mét "Content-Length: 1" is
-// volkomen geldig HTTP van de klant, en de fail-fast-panic die hier één ronde
-// stond maakte dat een remote kill — op HopOS is een panic een node-herstart,
-// herhaalbaar per verzoek (review 13-08, zesendertigste ronde). Dus: een
-// niet-gedrainde body wordt hier begrensd wéggedraineerd (zelfde
-// drainTimeout-recept als serveConn) vóór de wachthond start; wat er dan nog
-// zou druppelen eet de wachthond toch. Het contract "lees éérst je body"
-// blijft gelden voor handlers die de body daadwerkelijk willen.
-// Latere aanroepen (een streamer die per lusronde r.Done()/Context() vraagt)
-// zijn vrij: het eigenaarschap is dan al geclaimd.
+// An unread body is client input, not a handler bug, so Done drains it briefly
+// rather than panicking. Repeated Done calls are safe after ownership is claimed.
 func (r *Request) Done() <-chan struct{} {
 	if r.done == nil {
 		switch {
@@ -197,39 +145,24 @@ func (r *Request) Done() <-chan struct{} {
 	r.doneOnce.Do(func() {
 		r.done = make(chan struct{})
 		r.c.watched = true
-		// De leestermijn wissen, net als Hijack: op een body-dragend verzoek
-		// staat de bodyTimeout van serveConn nog aan, en de wachthond hieronder
-		// leest op diezelfde verbinding — zijn read liep dan na ~5s op die
-		// termijn stuk, en een read-fout betekent voor hem "de kijker is weg".
-		// Een POST-streamer die eerst netjes zijn body las en dán Done aanriep
-		// zag zijn stream zo spontaan verlaten (review 13-08, elfde ronde).
+		// Clear the body deadline so the watcher does not mistake its expiry for
+		// a disconnected stream client.
 		r.c.nc.SetReadDeadline(time.Time{})
 		go func() {
 			defer close(r.done)
-			// Wat er nog binnenkomt is oninteressant; we wachten op het einde,
-			// en dat is precies wat een read met een fout ons vertelt (FIN,
-			// RST, of onze eigen Close als de handler klaar is).
+			// Discard input until FIN, RST, or local Close ends the read.
 			io.Copy(io.Discard, r.c.br)
 		}()
 	})
 	return r.done
 }
 
-// Serve draait de accept-lus tot de listener sluit; elke verbinding krijgt zijn
-// eigen goroutine.
+// Serve accepts until the listener closes and serves each connection in a goroutine.
 func Serve(l net.Listener, h Handler) error {
-	// De accept-lus mag nooit vrij kunnen rondtollen. Een listener die een
-	// tijdelijke fout of — zoals gemeten 27-07 op de app-netstack — een lege
-	// accept (nil, nil) teruggeeft, maakte hiervan een spin die de hele core
-	// opat: de app stond op 100% CPU en antwoordde nooit, zonder één logregel.
-	// net/http heeft datzelfde vangnet (oplopende pauze bij een tijdelijke
-	// fout); leanhttp had het niet, en dat verschil was precies het verschil
-	// tussen een werkende en een dode display.
+	// Back off temporary accept errors to prevent a faulty listener from spinning
+	// at 100% CPU.
 	//
-	// Tijdelijk = even wachten en opnieuw. Een lege accept zónder fout is geen
-	// toestand waar we onszelf uit kunnen redden: dan stoppen we mét reden, zodat
-	// de app het logt en de node hem herstart (fail loudly — een display die
-	// stilletjes niets doet is erger dan een die opnieuw begint).
+	// A nil connection without error is unrecoverable and fails explicitly.
 	const maxDelay = 100 * time.Millisecond
 	var delay time.Duration
 	for {
@@ -237,11 +170,7 @@ func Serve(l net.Listener, h Handler) error {
 		switch {
 		case err != nil:
 			var ne net.Error
-			// Ook Temporary(): een EMFILE (fd's op) is geen reden om de hele
-			// server te laten sterven — even wachten en opnieuw, net als
-			// net/http (review 13-08, vijfentwintigste ronde). De methode is
-			// deprecated, maar het onderscheid dat hij maakt is precies wat
-			// hier nodig is.
+			// Retry timeout and Temporary errors such as descriptor exhaustion.
 			if !errors.As(err, &ne) || (!ne.Timeout() && !ne.Temporary()) {
 				return err
 			}
@@ -260,7 +189,7 @@ func Serve(l net.Listener, h Handler) error {
 	}
 }
 
-// ListenAndServe luistert op addr (":80") en serveert daar.
+// ListenAndServe listens on addr, such as ":80", and serves requests.
 func ListenAndServe(addr string, h Handler) error {
 	l, err := net.Listen("tcp", addr)
 	if err != nil {
@@ -270,23 +199,18 @@ func ListenAndServe(addr string, h Handler) error {
 	return Serve(l, h)
 }
 
-// conn is één verbinding in behandeling.
+// conn is one connection being served.
 type conn struct {
 	nc       net.Conn
 	br       *bufio.Reader
 	bw       *bufio.Writer
-	hijacked bool // de handler nam de verbinding over
-	watched  bool // Done(): er leest een wachthond mee, dus niet hergebruiken
-	headSent bool // de responsekop is de deur uit (writeHead) — Done is dan te laat
+	hijacked bool // handler owns the connection
+	watched  bool // Done watcher owns reads, so do not reuse
+	headSent bool // response head was sent; Done is now too late
 }
 
-// timedWriter is de ENE plek die de socket schrijft, en elke write draagt
-// zijn eigen schrijftermijn — letterlijk "per schrijfronde, niet per
-// antwoord". De bufio erboven beslist wanneer er geschreven wordt (flush,
-// overloop, grote passthrough); dit type hoeft alleen te weten dát het de
-// socket raakt. De hele arm/clear-choreografie die eerst rond élke mogelijk-
-// spillende operatie stond (armWrite/armIfSpills/clearWrite, marges, en de
-// vergeten-wis-valkuil) verdween hiermee (review 13-08, achttiende ronde).
+// timedWriter applies a deadline to every actual socket write. bufio decides
+// when writes occur, keeping deadline setup out of higher-level operations.
 type timedWriter struct{ nc net.Conn }
 
 func (t *timedWriter) Write(p []byte) (int, error) {
@@ -313,18 +237,12 @@ func serveConn(nc net.Conn, h Handler) {
 
 		r, err := readRequest(c)
 		if err != nil {
-			// EOF/deadline: de client is gewoon weg. Al het andere is een
-			// kapot verzoek en verdient een antwoord vóór we ophangen.
+			// EOF and timeout mean the client left; malformed requests get a response.
 			var perr parseError
 			if errors.As(err, &perr) {
 				writeBare(nc, perr.status, perr.Error())
-				// Alleen als er een aangekondigde body onderweg is (413,
-				// TE+CL, kapotte lengte) lezen we begrensd mee tot de client
-				// uitgesproken is: meteen sluiten gaf hem een RST i.p.v. ons
-				// antwoord. Bij een kale syntaxfout is het verzoek al binnen
-				// en was de onvoorwaardelijke drain een cadeautje: elke
-				// malformed request pinde goroutine, socket en leannet-budget
-				// twee volle seconden (review 13-08, vijftiende ronde).
+				// Drain only when headers announced a body. This lets an error
+				// response arrive without letting bare syntax errors retain resources.
 				if perr.drain {
 					nc.SetReadDeadline(time.Now().Add(drainTimeout))
 					io.CopyN(io.Discard, c.br, maxBodyBytes)
@@ -332,27 +250,17 @@ func serveConn(nc net.Conn, h Handler) {
 			}
 			return
 		}
-		// Vanaf hier bepaalt de handler het tempo — behálve voor het lezen van
-		// een verzoekbody: die is begrensd (bodyTimeout, zie boven). Valt er
-		// niets te lezen, dan géén leestermijn: een handler leest dan toch
-		// niets, en een SSE-stroom mag uren duren (de schrijftermijn blijft het
-		// vangnet). bodyDrained en niet een typetoets op emptyBody: een
-		// Content-Length: 0 draagt een lengthReader{n: 0} en is nét zo goed
-		// bodyloos (review 13-08, elfde ronde).
+		// Body reads retain their timeout; bodyless requests clear it so an SSE
+		// handler may stream indefinitely. Content-Length: 0 is also drained.
 		if bodyDrained(r.Body) {
 			nc.SetReadDeadline(time.Time{})
 		} else {
 			nc.SetReadDeadline(time.Now().Add(bodyTimeout))
 		}
 
-		// (De 100-Continue-machine die hier stond is gesloopt: élke Expect is
-		// bij het parsen al een 417 — eenendertigste ronde.)
-		// Exact "HEAD", geen EqualFold: methode-tokens zijn hoofdlettergevoelig
-		// (RFC 9110 §9.1) — "head" is een ándere, custom methode, en die de
-		// body onderdrukken terwijl de kop een lengte belooft liet de client
-		// op bytes wachten die nooit komen (review 13-08, drieëntwintigste
-		// ronde).
-		c.headSent = false // per verzoek: de vorige ronde op deze keep-alive telt niet
+		// Every Expect was rejected during parsing; there is no 100-Continue state.
+		// Method tokens are case-sensitive, so only exact HEAD suppresses a body.
+		c.headSent = false // reset per request on a reused connection
 		w := &respWriter{c: c, hdr: Header{}, status: StatusOK, keepAlive: r.keepAlive,
 			head: r.Method == "HEAD", declared: -1}
 		h(w, r)
@@ -360,26 +268,16 @@ func serveConn(nc net.Conn, h Handler) {
 			return
 		}
 		if err := w.finish(); err != nil || !w.keepAlive || c.watched {
-			// Ook vóór een NETTE sluiting hoort het ongelezen restant van een
-			// geldige body begrensd weggeslikt: een Close met ontvangen-maar-
-			// ongelezen bytes wordt op TCP een RST, en een RST gooit óók de
-			// zendwachtrij weg — het antwoord dat hierboven net verstuurd is
-			// kon zo bij de client stukbreken vóór hij het las (review 13-08,
-			// eenendertigste ronde). Niet na een schrijffout (verbinding is al
-			// kapot) en niet als de Done-wachthond de lezer bezit.
+			// Before a clean close, briefly drain unread valid body bytes. Closing
+			// with unread TCP data may reset and discard the response send queue.
 			if err == nil && !c.watched && !bodyDrained(r.Body) {
 				nc.SetReadDeadline(time.Now().Add(drainTimeout))
 				io.Copy(io.Discard, r.Body)
 			}
 			return
 		}
-		// Het restant van de body wegslikken, anders begint het volgende
-		// verzoek middenin de vorige. Mét termijn: een client die een lengte
-		// belooft en dan stilvalt hield anders deze goroutine onbeperkt vast
-		// (review 13-08). Lukt het niet, dan is hergebruik onveilig. Is de body
-		// al op (geen body, of helemaal gelezen — het gewone geval), dan slaan
-		// we ook de deadline-wissels over: op leannet is elke SetReadDeadline
-		// een stack-brede wek (review 13-08, vijfde ronde).
+		// Drain before reuse so the next request starts at its own line. Bound the
+		// drain; failure makes reuse unsafe. Avoid deadline churn when already drained.
 		if !bodyDrained(r.Body) {
 			nc.SetReadDeadline(time.Now().Add(drainTimeout))
 			if _, err := io.Copy(io.Discard, r.Body); err != nil {
@@ -390,10 +288,7 @@ func serveConn(nc net.Conn, h Handler) {
 	}
 }
 
-// bodyDrained rapporteert of er aan een verzoekbody niets (meer) te lezen valt:
-// er was er geen, hij was leeg (Content-Length: 0), of hij is al tot het einde
-// gelezen. Dit zijn ook de enige twee bodyvormen die bestaan: chunked uploads
-// zijn gesloopt (eenendertigste ronde).
+// bodyDrained reports no body, Content-Length zero, or fully consumed fixed length.
 func bodyDrained(r io.Reader) bool {
 	switch b := r.(type) {
 	case emptyBody:
@@ -404,12 +299,8 @@ func bodyDrained(r io.Reader) bool {
 	return false
 }
 
-// parseError is een kapot verzoek: de status die de client verdient, plus het
-// waarom. drain: de headers kondigen een body aan die (mogelijk) nog
-// binnenkomt — dan eerst begrensd leeglezen zodat het antwoord aankomt in
-// plaats van een RST. Voor een pure syntaxfout staat hij uit: daar is het
-// verzoek al binnen en was de drain alleen een vasthoudlus (review 13-08,
-// vijftiende ronde).
+// parseError carries the response status and whether an announced body should
+// be drained briefly so the response arrives instead of RST.
 type parseError struct {
 	status int
 	msg    string
@@ -422,13 +313,10 @@ func badRequest(format string, args ...any) error {
 	return parseError{status: StatusBadRequest, msg: fmt.Sprintf(format, args...)}
 }
 
-// readRequest leest verzoekregel, headers en de body-omhulling van één verzoek.
+// readRequest parses one request line, header block, and body framing.
 func readRequest(c *conn) (*Request, error) {
-	// EOF of deadline op de verzoekregel: de client is gewoon weg, geen
-	// antwoord nodig. Maar een regel die er wél is en niet deugt — kale LF,
-	// control-bytes, te lang (zie readLine) — is een verzóek, en dat verdient
-	// een 400 in plaats van een stille close (review 13-08, dertiende ronde:
-	// readLine werd strikt en daarmee kreeg dit pad echte syntaxfouten).
+	// EOF or timeout means the client left. A present but malformed request line
+	// deserves 400 rather than a silent close.
 	classify := func(err error) error {
 		if errors.Is(err, io.EOF) {
 			return err
@@ -444,7 +332,7 @@ func readRequest(c *conn) (*Request, error) {
 	if err != nil {
 		return nil, classify(err)
 	}
-	if line == "" { // een losse CRLF vóór het verzoek mag (RFC 9112 §2.2)
+	if line == "" { // RFC 9112 §2.2 permits one leading CRLF
 		if line, err = readLine(c.br, &budget); err != nil {
 			return nil, classify(err)
 		}
@@ -455,64 +343,41 @@ func readRequest(c *conn) (*Request, error) {
 		return nil, badRequest("leanhttp: malformed request line %q", line)
 	}
 	if !validToken(method) {
-		// Zelfde tokenwacht als uitgaand: een "methode" met rare bytes is
-		// achter een proxy een bekende bron van afwijkende routering
-		// (review 13-08, tiende ronde).
+		// Strict method tokens avoid proxy routing differentials.
 		return nil, badRequest("leanhttp: invalid method %q", method)
 	}
 	if method == "CONNECT" {
-		// CONNECT is een tunnelopdracht, geen verzoek — en deze server is
-		// nooit een tunnel. De origin-form-toets hieronder ving alleen de
-		// authority-form; "CONNECT / HTTP/1.1" bereikte de handler als was
-		// het een gewone methode (review 13-08, tweeëndertigste ronde).
+		// CONNECT requests a tunnel, which this server never provides.
 		return nil, parseError{StatusNotImplemented, "leanhttp: CONNECT is not supported", false}
 	}
 	target, proto, ok := strings.Cut(rest, " ")
 	if !ok {
 		return nil, badRequest("leanhttp: malformed request line %q", line)
 	}
-	// Onderscheid: "HTTP/2" is een versie die we niet doen (505), al het andere
-	// op die plek is geen verzoekregel (400).
+	// Unsupported HTTP versions get 505; non-HTTP syntax gets 400.
 	if !strings.HasPrefix(proto, "HTTP/") {
 		return nil, badRequest("leanhttp: malformed request line %q", line)
 	}
 	if proto != "HTTP/1.1" {
-		// Exact, geen prefix (HasPrefix("HTTP/1.") accepteerde HTTP/1.9). En
-		// alléén 1.1: niets in of rond HopOS spreekt nog HTTP/1.0 tégen ons —
-		// de 1.0-tak (omgekeerde keep-alive-default, geen chunked, eigen
-		// statusregel, Host optioneel) was puur reviewvlak (review 13-08,
-		// negenentwintigste ronde, "minder code = minder fouten"). De CLIENT
-		// blijft 1.0-antwoorden wél verstaan: Python's http.server spreekt
-		// het, gemeten 12-08.
+		// Server input is exactly HTTP/1.1. The client still accepts HTTP/1.0
+		// responses for servers such as Python's http.server.
 		return nil, parseError{status: 505, msg: fmt.Sprintf("leanhttp: unsupported protocol %q", proto)}
 	}
 	if target == "" || target[0] != '/' {
-		// Uitsluitend de origin-form ("/pad?query", RFC 9112 §3.2.1). De
-		// asterisk-form (OPTIONS *) gaf als pad "/*" een verzonnen route
-		// (review 13-08, achtentwintigste ronde); de absolute-form droeg een
-		// tweede authority naast Host en daarmee een blijvende
-		// consistentie-plicht; de authority-form is CONNECT en dat is een
-		// tunnel die deze server nooit zal zijn. Eén toets weigert alle drie
-		// (review 13-08, eenendertigste ronde: weigeren wat je niet draagt).
+		// Support only origin-form targets (RFC 9112 §3.2.1). Asterisk invents a
+		// route, absolute-form duplicates Host authority, and CONNECT owns authority-form.
 		return nil, badRequest("leanhttp: only origin-form request targets are supported, got %q", target)
 	}
 	u, err := url.ParseRequestURI(target)
 	if err != nil {
 		return nil, badRequest("leanhttp: bad request target %q", target)
 	}
-	// Ambigue escapes weigeren we aan de deur (zie cleanEscapes in mux.go):
-	// een segment dat naar "/", "." of ".." decodeert is ná decoderen niet
-	// meer van echte padstructuur te onderscheiden (review 13-08,
-	// zevenentwintigste ronde).
+	// Reject escapes that decode into path structure; see cleanEscapes.
 	if !cleanEscapes(u.EscapedPath()) {
 		return nil, badRequest("leanhttp: ambiguous percent-escape in path %q", u.EscapedPath())
 	}
-	// En het gedecodeerde pad moet CANONIEK zijn: geen lege segmenten
-	// ("//admin"), geen dot-segmenten. Normaliseren (cleanPath) was een tweede
-	// interpretatiemoment — "//admin" werd stil "/admin", en dat is precies de
-	// klasse differentialen die de deur-weigering hierboven dichtgooide. Eén
-	// predicaat, gedeeld met de Mux: hier een 400, daar een 404
-	// (review 13-08, tweeëndertigste ronde; cleanPath is gesloopt).
+	// Require the same canonical decoded path predicate as Mux. Reject rather
+	// than normalize to avoid a second interpretation.
 	if !canonicalPath(u.Path) {
 		return nil, badRequest("leanhttp: non-canonical request path %q", u.Path)
 	}
@@ -520,12 +385,8 @@ func readRequest(c *conn) (*Request, error) {
 	hdr := Header{}
 	hosts, cls, tes := 0, 0, 0
 	if err := readHeaderBlock(c.br, &budget, func(k, v string) error {
-		// De tokenwacht op de naam zit in readHeaderBlock zelf (één parser
-		// voor beide kanten); hier alleen tellen en opslaan. De framing-
-		// headers tellen per FYSIEKE regel: hdr.add vouwt waarden en liet een
-		// lege eerste zelfs verdwijnen — "Content-Length:" plus
-		// "Content-Length: 5" werd zo één geldige lengte, een klassiek
-		// smuggling-differentiaal (review 13-08, vierentwintigste ronde).
+		// Count framing headers per physical line before hdr.add folds values;
+		// otherwise an empty first Content-Length can disappear into a valid second one.
 		switch {
 		case strings.EqualFold(k, "Host"):
 			hosts++
@@ -537,32 +398,21 @@ func readRequest(c *conn) (*Request, error) {
 		hdr.add(k, v)
 		return nil
 	}); err != nil {
-		// Alles hier — kapotte header, ongeldige naam, afgebroken verbinding —
-		// is een kapot verzoek van een client die al begonnen was: 400.
+		// Once a request started, any malformed or interrupted header block is 400.
 		return nil, badRequest("leanhttp: read headers: %v", err)
 	}
 
-	// HTTP/1.1 eist precies één niet-lege Host (RFC 9112 §3.2): geen, leeg of
-	// meerdere is achter een proxy een routerings-smokkelgat (review 13-08,
-	// tiende ronde). Meerdere regels zijn door hdr.add al tot een kommalijst
-	// gevouwen — vandaar de teller.
-	// Geen TrimSpace: readHeaderBlock levert waarden al getrimd af.
-	// Precies één niet-lege Host (RFC 9112 §3.2) — en verder NIETS: de
-	// half-algemene vorm-parser (hostnaam-grammatica, [v6], poortcijfers) uit
-	// de dertigste ronde is er in de eenendertigste weer uit. Deze server
-	// routeert en autoriseert nergens op Host, dus elke vormtolerantie of
-	// -strengheid was dode zorg; de dag dat Host wél iets bepaalt hoort hier
-	// een expliciete allowlist, geen grammatica. De regel die overblijft is de
-	// smuggling-wacht: geen, leeg of meerdere is achter een proxy een
-	// routerings-differentiaal. Waarden zijn al CTL-vrij (readLine).
+	// HTTP/1.1 requires exactly one non-empty Host (RFC 9112 §3.2). Missing,
+	// empty, or repeated values create proxy routing differentials. This server
+	// does not route by Host; if that changes, add an explicit allowlist.
 	if hosts != 1 || hdr.Get("Host") == "" {
 		return nil, badRequest("leanhttp: HTTP/1.1 requires exactly one non-empty Host header (got %d)", hosts)
 	}
 
 	r := &Request{
-		ContentLength: -1, // geen Content-Length gezien; hieronder gezet als hij er is
+		ContentLength: -1, // no Content-Length seen; set below when present
 		Method:        method,
-		Path:          u.Path, // canoniek bewezen (canonicalPath hierboven)
+		Path:          u.Path, // proven canonical above
 		RawQuery:      u.RawQuery,
 		Proto:         proto,
 		Header:        hdr,
@@ -570,19 +420,12 @@ func readRequest(c *conn) (*Request, error) {
 		RemoteAddr:    c.nc.RemoteAddr().String(),
 		c:             c,
 	}
-	// HTTP/1.1 houdt de verbinding open tenzij iemand "close" zegt.
-	// Connection is een tokenlijst; de client-kant toetst al zo (connectionHas)
-	// en een substring-toets is te ruim (review 13-08, vierde ronde).
+	// HTTP/1.1 stays open unless the Connection token list contains close.
 	r.keepAlive = !connectionHas(hdr.Get("Connection"), "close")
 
-	// Iedere Expect is een 417 en de verbinding gaat dicht (RFC 9110 §10.1.1
-	// staat dat toe: een server MAG elke verwachting afwijzen). De hele
-	// 100-Continue-machine aan de serverkant — het interim-antwoord, de
-	// wachttijd-afstemming met de bodyTimeout — bestond voor precies nul
-	// interne bellers: onze eigen client stuurt Expect alleen bij een
-	// BodyReader, en niets in de keten streamt een upload naar déze server
-	// (review 13-08, eenendertigste ronde: minder machine = minder reviewvlak).
-	// drain=false: een client met Expect wacht juist met zijn body.
+	// Reject all Expect values with 417, which RFC 9110 §10.1.1 permits. No
+	// internal caller needs the 100-Continue state machine. Do not drain because
+	// an Expect client is waiting before sending its body.
 	if hdr.Get("Expect") != "" {
 		return nil, parseError{StatusExpectationFailed,
 			fmt.Sprintf("leanhttp: Expect %q is not supported", hdr.Get("Expect")), false}
@@ -590,34 +433,24 @@ func readRequest(c *conn) (*Request, error) {
 
 	switch {
 	case cls > 1 || tes > 1:
-		// Herhaalde framingheaders (ook met lege waarden) zijn per regel
-		// geteld en per definitie verdacht: weigeren (RFC 9112 §6).
+		// Reject repeated framing headers, including empty lines (RFC 9112 §6).
 		return nil, parseError{StatusBadRequest,
 			"leanhttp: repeated framing header", true}
 	case tes == 1 && cls == 1:
-		// Beide framings tegelijk is hét smokkelsignaal (RFC 9112 §6.1): twee
-		// parsers in de keten kiezen dan elk hun eigen lichaamseinde. Weigeren,
-		// en de verbinding is niet meer te vertrouwen.
+		// TE plus CL lets intermediaries disagree on body boundaries (RFC 9112 §6.1).
 		return nil, parseError{StatusBadRequest,
 			"leanhttp: both Transfer-Encoding and Content-Length", true}
 	case tes == 1:
-		// Verzoeklichamen dragen een Content-Length, punt: chunked uploads —
-		// mét hun trailers, extensies en limiet-op-de-lezer — zijn gesloopt
-		// (review 13-08, eenendertigste ronde). Geen van onze afnemers
-		// verstuurde er ooit één (de eigen client chunkt bewust niet), en de
-		// chunk-parser aan deze kant was puur reviewvlak. De CLIENT blijft
-		// chunked ANTWOORDEN wél lezen — dat is niet optioneel voor SSE.
+		// Request bodies require Content-Length. No consumer uses chunked uploads;
+		// the client still supports chunked responses for SSE.
 		return nil, parseError{StatusNotImplemented,
 			"leanhttp: Transfer-Encoding is not supported for requests; send a Content-Length", true}
 	case cls == 1:
-		// parseDecimal, geen ParseInt: "+5" moet hier een 400 zijn, geen 5 —
-		// een lengte die wij anders lezen dan de proxy vóór ons is precies het
-		// framing-verschil waar smuggling op drijft (review 13-08, dertiende
-		// ronde).
+		// Strict decimal parsing rejects forms such as "+5" that a proxy may
+		// interpret differently.
 		n, ok := parseDecimal(hdr.Get("Content-Length"))
 		if !ok {
-			// drain: er ís een Content-Length, dus de client stuurt
-			// (waarschijnlijk) een body achter dit kopblok aan.
+			// Content-Length suggests a body may already be arriving; drain briefly.
 			return nil, parseError{StatusBadRequest,
 				fmt.Sprintf("leanhttp: bad Content-Length %q", hdr.Get("Content-Length")), true}
 		}
@@ -626,24 +459,20 @@ func readRequest(c *conn) (*Request, error) {
 				fmt.Sprintf("leanhttp: body of %d bytes exceeds the %d-byte limit", n, maxBodyBytes), true}
 		}
 		r.ContentLength = n
-		// Zelfde exacte-lengte-semantiek als de clientkant (lengthReader): een
-		// client die na 5 van de 10 beloofde bytes sluit is een AFGEBROKEN
-		// verzoek (io.ErrUnexpectedEOF), geen kortere body — de handler
-		// verwerkte anders een half verzoek als compleet (review 13-08).
+		// Exact-length reads turn an early close into io.ErrUnexpectedEOF rather
+		// than letting the handler treat a partial request as complete.
 		r.Body = &lengthReader{r: c.br, n: n}
 	}
 	return r, nil
 }
 
-// emptyBody is de body van een bericht dat er geen heeft: leesbaar, meteen op.
-// Aan de serverkant een verzoek zonder body, aan de clientkant een 204/304.
+// emptyBody is an immediately exhausted readable body.
 type emptyBody struct{}
 
 func (emptyBody) Read([]byte) (int, error) { return 0, io.EOF }
 
-// validToken toetst een headernaam aan het token-alfabet van RFC 9110 §5.6.2.
-// Witruimte valt daar per constructie buiten — dus ook de spatie-vóór-de-
-// dubbele-punt die een smokkelaar gebruikt om een framing-header te verstoppen.
+// validToken implements RFC 9110 §5.6.2, excluding whitespace that can hide a
+// framing header before its colon.
 func validToken(s string) bool {
 	if s == "" {
 		return false
@@ -660,58 +489,42 @@ func validToken(s string) bool {
 	return true
 }
 
-// respWriter is de ResponseWriter van één verzoek.
+// respWriter is one request's ResponseWriter.
 type respWriter struct {
 	c         *conn
 	hdr       Header
 	status    int
 	statusSet bool
-	buf       bytes.Buffer // gebufferd tot finish: zo kennen we de lengte
-	started   bool         // de kop is de deur uit
+	buf       bytes.Buffer // buffered until finish determines the length
+	started   bool         // response head was sent
 	chunked   bool
-	written   int64 // body-bytes de deur uit (voor de lengte-controle)
-	declared  int64 // beloofde Content-Length op het rechtstreekse pad; -1 = geen
+	written   int64 // body bytes sent, for length validation
+	declared  int64 // wire Content-Length on the direct path; -1 means absent
 	keepAlive bool
-	head      bool // antwoord op HEAD: kop als bij GET, maar géén body-bytes
+	head      bool // HEAD response has GET headers but no body bytes
 	err       error
 }
 
-// errWroteTooMuch: de handler schreef voorbij zijn eigen Content-Length. De
-// surplus-bytes gaan NIET de deur uit — op een keep-alive-verbinding zouden ze
-// het begin van het volgende antwoord zijn (review 13-08, vijfde ronde).
+// errWroteTooMuch prevents bytes beyond Content-Length from becoming the next
+// response on a keep-alive connection.
 var errWroteTooMuch = errors.New("leanhttp: handler wrote past its declared Content-Length")
 
 var errHijacked = errors.New("leanhttp: connection was hijacked")
 
 func (w *respWriter) Header() Header { return w.hdr }
 
-// suppressBody: dit antwoord draagt per definitie geen body-bytes — HEAD, of
-// een status zonder body (204/304). De kop (inclusief Content-Length) blijft
-// wat hij is; de bytes worden geslikt (RFC 9110 §9.3.2 en 9112 §6.3). Vóór de
-// fix werden ze gewoon geschreven en stond de volgende lezer op de verkeerde
-// byte (review 13-08).
+// suppressBody keeps headers but discards body bytes for HEAD and bodyless statuses.
 func (w *respWriter) suppressBody() bool { return w.head || !bodyAllowed(w.status) }
 
 func (w *respWriter) WriteHeader(status int) {
 	if status < 200 || status > 599 {
-		// Alleen finale statussen (200–599): 0, negatief, viercijferig én élke
-		// 1xx is een bedradingsfout in de handler. Interim-antwoorden verstuurt
-		// deze server per contract niet — de WebSocket-101 loopt uitsluitend
-		// via Hijack, waar de overnemer zijn eigen statusregel schrijft
-		// (review 13-08, dertigste + eenendertigste ronde; het stille
-		// 1xx-negeren van de vijfentwintigste is daarmee ook weg).
+		// Only final 200–599 statuses are valid. Protocol upgrades use Hijack and
+		// write their own 101 response.
 		panic("leanhttp: WriteHeader with a non-final status")
 	}
-	// (205 is gewoon een finale status: hij wordt als zichzelf gedragen en is
-	// per definitie bodyloos — zie bodyAllowed. De remap naar 204 die hier één
-	// ronde stond veranderde de status stil, en de panic van de ronde ervóór
-	// was via hop's status-kopiërende proxy van buiten voedbaar. KAM: "de
-	// writer verandert haar niet stil in een andere status" — review 13-08,
-	// zevendertigste ronde.)
+	// 205 remains 205 and is bodyless; the writer must not silently remap status.
 	if w.statusSet || w.started || w.buf.Len() > 0 {
-		// De eerste keer telt — en een Write telt óók als commit: Write("ok")
-		// gevolgd door WriteHeader(500) leverde anders een 500 met de "ok"
-		// als foutbody (review 13-08, achtentwintigste ronde).
+		// First commit wins; buffered Write also commits status.
 		return
 	}
 	w.status, w.statusSet = status, true
@@ -724,16 +537,13 @@ func (w *respWriter) Write(p []byte) (int, error) {
 	case w.err != nil:
 		return 0, w.err
 	case !w.started:
-		// Zonder aangekondigde lengte bufferen we: bij finish weten we hoeveel
-		// het geworden is en gaat er een Content-Length op. Een handler die de
-		// lengte zélf zet (een gecachete PNG bijvoorbeeld) schrijft rechtstreeks
-		// door — dan hoeft die megabyte niet nog eens in een buffer.
+		// Buffer unknown length until finish can add Content-Length. A declared
+		// length writes directly and avoids duplicating large bodies in memory.
 		if w.hdr.Get("Content-Length") == "" {
 			if w.buf.Len()+len(p) <= autoChunkBytes {
 				return w.buf.Write(p)
 			}
-			// Drempel voorbij: de lengte komt er toch nooit meer, en
-			// dóórbufferen is de OOM van een vergeten Content-Length.
+			// Beyond the threshold, switch to chunked instead of unbounded buffering.
 			if err := w.startChunked(); err != nil {
 				return 0, err
 			}
@@ -744,16 +554,13 @@ func (w *respWriter) Write(p []byte) (int, error) {
 	return w.writeBody(p)
 }
 
-// startChunked schakelt over op chunked; gedeeld door Write (drempel) en
-// Flush (expliciet).
+// startChunked is shared by threshold-triggered Write and explicit Flush.
 func (w *respWriter) startChunked() error {
 	w.chunked = true
 	return w.flushHead()
 }
 
-// flushHead schrijft de kop plus wat gebufferd stond, en laat de buffer écht
-// los (een Reset houdt de backing array vast voor de rest van een streamende
-// response — review 13-08, derde ronde).
+// flushHead sends headers and buffered data, then releases the backing array.
 func (w *respWriter) flushHead() error {
 	pending := w.buf.Bytes()
 	w.writeHead()
@@ -773,16 +580,14 @@ func (w *respWriter) Flush() error {
 	case w.err != nil:
 		return w.err
 	case !w.started:
-		// Tussentijds duwen zonder aangekondigde lengte: de lengte komt er dus
-		// nooit — chunked. Wat al gebufferd stond gaat als eerste chunk mee.
+		// Flushing unknown length selects chunked; buffered data is the first chunk.
 		if w.hdr.Get("Content-Length") == "" {
 			if err := w.startChunked(); err != nil {
 				return err
 			}
 			break
 		}
-		// De handler beloofde wél een lengte: kop plus buffer eruit, framing
-		// blijft de lengte.
+		// Declared length remains the framing after flushing buffered output.
 		if err := w.flushHead(); err != nil {
 			return err
 		}
@@ -792,45 +597,30 @@ func (w *respWriter) Flush() error {
 
 func (w *respWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 	if w.started || w.buf.Len() > 0 || w.statusSet {
-		// Ook gebúfferde writes en een gezette status tellen als begonnen: de
-		// aanroep rapporteerde succes, en een geslaagde Hijack liet dat werk
-		// stil verdwijnen (review 13-08, vijfentwintigste en achtentwintigste
-		// ronde).
+		// Buffered writes and status also commit; Hijack must not discard them.
 		return nil, nil, errors.New("leanhttp: Hijack after the response already started")
 	}
 	if w.c.watched {
-		// De leeskant heeft al een eigenaar: de wachthond van Request.Done
-		// leest deze verbinding leeg. Hem tóch overdragen liet twee lezers om
-		// dezelfde bytes racen — de wachthond at dan WebSocket-frames op
-		// (review 13-08, eenendertigste ronde). Done, Hijack of gewoon HTTP:
-		// kies er één.
+		// Request.Done already owns reads; Hijack cannot introduce a second reader.
 		return nil, nil, errors.New("leanhttp: Hijack after Request.Done — the read side already has an owner")
 	}
 	if w.c.hijacked {
 		return nil, nil, errHijacked
 	}
 	w.c.hijacked = true
-	// De leestermijn wissen: op een body-dragend verzoek staat de bodyTimeout
-	// nog aan (serveConn), en de overnemer bepaalt vanaf hier zijn eigen
-	// termijnen.
+	// Clear request deadlines; the hijacker owns timing from here.
 	w.c.nc.SetDeadline(time.Time{})
-	// Een VERSE writer rechtstreeks op de socket: c.bw schrijft door de
-	// timedWriter en zou de overnemer de 30s-per-write laten erven, terwijl
-	// het contract zegt dat de overnemer zijn eigen termijnen bepaalt. Er
-	// staat niets in c.bw (Hijack kan alleen vóór de eerste write).
+	// Use a fresh direct writer so the hijacker does not inherit timedWriter's
+	// per-write deadline. c.bw is empty because Hijack precedes writes.
 	return w.c.nc, bufio.NewReadWriter(w.c.br, bufio.NewWriterSize(w.c.nc, bufSize)), nil
 }
 
-// writeHead schrijft statusregel + headers in de buffer.
+// writeHead writes the status line and headers into the output buffer.
 func (w *respWriter) writeHead() {
 	w.started = true
-	w.c.headSent = true // vanaf hier is Done() te laat: de kop staat op de draad
-	// Casevarianten eerst deterministisch oplossen, vóór élke validatie:
-	// directe mapwrites konden "Content-Length: 2" én "content-length: 5"
-	// dragen, waarna Get willekeurig de één valideerde en de schrijf-lus de
-	// ander uitgaf (review 13-08, zevenentwintigste ronde). Gelijke waarden
-	// vouwen samen; conflicterende gaan er allemaal uit en de verbinding
-	// sluit — framing op EOF is dan de enige eerlijke vorm.
+	w.c.headSent = true // Done is too late once the head is on the wire
+	// Resolve case variants before validation. Merge equal values; remove all
+	// conflicting variants and close so EOF is the only unambiguous framing.
 	byFold := make(map[string][]string, len(w.hdr))
 	for k := range w.hdr {
 		lk := strings.ToLower(k)
@@ -852,47 +642,31 @@ func (w *respWriter) writeHead() {
 			w.keepAlive = false
 		}
 	}
-	// De framing is van de WRITER, nooit van de handler: een handler die zelf
-	// Transfer-Encoding zette terwijl de writer op het lengte-pad zat, stuurde
-	// TE én Content-Length met een ongechunkte body — ongeldig én
-	// smokkel-verdacht bij de ontvanger (review 13-08, tweede ronde).
+	// The writer owns framing; ignore handler-supplied Transfer-Encoding to avoid
+	// TE plus Content-Length with an unchunked body.
 	w.hdr.Del("Transfer-Encoding")
-	// Een handler die zelf "Connection: close" zegt, meent dat: de writer
-	// overschreef hem met keep-alive (review 13-08, vijfentwintigste ronde).
+	// Respect an explicit handler request to close.
 	if connectionHas(w.hdr.Get("Connection"), "close") {
 		w.keepAlive = false
 	}
 	if w.suppressBody() {
-		w.chunked = false // een bodyloos antwoord framet niets, ook geen nul-chunk
+		w.chunked = false // bodyless responses have no framing or zero chunk
 		if w.status == StatusNoContent {
-			// Een 204 draagt nooit een lengte (RFC 9110 §8.6, MUST NOT); een
-			// 304 mág hem juist informatief dragen — die bleef eerst ook niet
-			// staan (review 13-08, vijfentwintigste ronde). HEAD houdt hem
-			// sowieso: daar is de lengte de informatie.
+			// 204 must not carry length; 304 and HEAD may carry it as metadata.
 			w.hdr.Del("Content-Length")
 		}
 		if w.status == 205 && !w.head {
-			// 205 staat niet in het framingloos-bodyloze rijtje van RFC 9112
-			// §6.3: zonder expliciete nul las een standaardclient tot EOF.
+			// RFC 9112 §6.3 requires explicit zero framing for 205.
 			w.hdr.Set("Content-Length", "0")
 		}
 	}
 	if w.chunked {
 		w.hdr.Set("Transfer-Encoding", "chunked")
-		// Chunked framet zichzelf: élke Content-Length gaat eruit — ook een
-		// LEGE ("Content-Length:"), want die ontweek de validatie hieronder
-		// (Get geeft "") en stond dan naast de Transfer-Encoding op de draad:
-		// TE+CL tegelijk is precies het dubbelzinnige antwoord dat we inkomend
-		// als smokkelsignaal weigeren (review 13-08, eenendertigste ronde).
+		// Chunked is self-framing; remove even an empty Content-Length to avoid TE+CL.
 		w.hdr.Del("Content-Length")
 	}
-	// Zelfde strikte parser als inkomend, en voor ÉLKE kop die een
-	// Content-Length draagt — ook een HEAD-antwoord (suppressBody) houdt hem
-	// als informatie en glipte er eerst langs (review 13-08, negentiende
-	// ronde): "abc" of "+5" is zichtbare ASCII en passeerde validFieldValue,
-	// mét een keep-alive-belofte erbij, terwijl we zo'n lengte inkomend als
-	// 400 weigeren (zeventiende ronde). Ongeldig = kop eraf en de verbinding
-	// dicht: het antwoord framet dan op EOF.
+	// Strictly parse every Content-Length, including HEAD metadata. Invalid
+	// values are removed and force EOF framing rather than unsafe keep-alive.
 	if cl := w.hdr.Get("Content-Length"); cl != "" {
 		n, ok := parseDecimal(cl)
 		switch {
@@ -900,15 +674,11 @@ func (w *respWriter) writeHead() {
 			w.hdr.Del("Content-Length")
 			w.keepAlive = false
 		case !w.chunked && !w.suppressBody():
-			w.declared = n // vanaf nu is élke write hieraan gebonden
+			w.declared = n // every later write is bounded by this wire value
 		}
 	}
-	// De wachthond van Done() leest mee op deze verbinding, dus hij is na dit
-	// antwoord op — en dan mag de kop géén keep-alive beloven. Deed hij dat
-	// wel, dan legt een client met een pool hem netjes weg en loopt het
-	// VOLGENDE verzoek op een dode verbinding: GEMETEN 12-08 op ijzer als
-	// 200/502/200/502 door hop's agent-proxy, want die bouwde per verzoek een
-	// context uit Done().
+	// Request.Done's watcher consumes the connection after this response, so it
+	// must advertise close rather than leave a dead connection in a client pool.
 	if w.keepAlive && !w.c.watched {
 		w.hdr.Set("Connection", "keep-alive")
 	} else {
@@ -916,13 +686,8 @@ func (w *respWriter) writeHead() {
 	}
 	fmt.Fprintf(w.c.bw, "HTTP/1.1 %d %s\r\n", w.status, statusText(w.status))
 	for k, v := range w.hdr {
-		// Dezelfde token- en waardewacht als inkomend (validToken,
-		// validFieldValue): een naam of waarde met control-bytes zou een
-		// tweede antwoord in dit antwoord smokkelen — overslaan, niet
-		// doorgeven. En één regel per naam, hoe de map ook bespeeld is:
-		// directe mapwrites konden twee case-varianten van Content-Length
-		// dragen waarvan er maar één gevalideerd was (review 13-08,
-		// vijfentwintigste ronde).
+		// Drop invalid names or control-bearing values that could inject another
+		// response. Case variants were already collapsed to one line.
 		if !validToken(k) || !validFieldValue(v) {
 			continue
 		}
@@ -931,41 +696,33 @@ func (w *respWriter) writeHead() {
 	w.c.bw.WriteString("\r\n")
 }
 
-// writeBody schrijft body-bytes in de gekozen framing.
+// writeBody writes body bytes using the selected framing.
 func (w *respWriter) writeBody(p []byte) (int, error) {
 	if len(p) == 0 {
 		return 0, w.err
 	}
 	if w.suppressBody() {
-		// De handler mag schrijven (dezelfde code bedient GET en HEAD); de
-		// bytes verlaten alleen nooit de node. len(p) terugmelden is het
-		// net/http-contract: de handler hoort geen fout te zien.
+		// Let shared GET/HEAD handlers write successfully while suppressing bytes.
 		return len(p), nil
 	}
 	if w.declared >= 0 {
-		// De belofte is de grens, PER write: de surplus-bytes tegenhouden ná
-		// verzending kan niet meer — finish zag de overschrijding pas toen ze
-		// al op de draad stonden, klaar om als het volgende antwoord gelezen
-		// te worden. Short-write plus fout, en de verbinding is op.
+		// Enforce Content-Length per write; surplus bytes could otherwise become
+		// the next response before finish notices.
 		if allowed := w.declared - w.written; int64(len(p)) > allowed {
 			p = p[:allowed]
 			n := 0
 			if len(p) > 0 {
 				n, _ = w.writeBodyRaw(p)
 			}
-			// De fout gaat naar de HANDLER, niet naar w.err: dat veld is de
-			// transportstatus en finish geeft hem terug — dan sloot de
-			// verbinding alsnog, terwijl er na het afkappen een exact
-			// kloppende response op de draad staat en de kop keep-alive al
-			// beloofd had (review 13-08, zevende ronde). Elke vólgende write
-			// komt hier opnieuw (allowed is dan 0) en faalt opnieuw luid.
+			// Report this handler error directly. The truncated wire response still
+			// matches its promised length, so transport state remains usable.
 			return n, errWroteTooMuch
 		}
 	}
 	return w.writeBodyRaw(p)
 }
 
-// writeBodyRaw schrijft in de gekozen framing, zonder de lengte-wacht.
+// writeBodyRaw writes selected framing without length validation.
 func (w *respWriter) writeBodyRaw(p []byte) (int, error) {
 	if w.chunked {
 		fmt.Fprintf(w.c.bw, "%x\r\n", len(p))
@@ -981,9 +738,8 @@ func (w *respWriter) writeBodyRaw(p []byte) (int, error) {
 	return n, err
 }
 
-// flush duwt de bufio naar de socket; de schrijftermijn zit per write in de
-// timedWriter eronder — een client die niet meer leest mag geen goroutine
-// gijzelen.
+// flush sends bufio output; timedWriter prevents a non-reading client from
+// retaining the goroutine.
 func (w *respWriter) flush() error {
 	err := w.c.bw.Flush()
 	if err != nil && w.err == nil {
@@ -992,8 +748,7 @@ func (w *respWriter) flush() error {
 	return err
 }
 
-// finish rondt het antwoord af: het normale (gebufferde) geval krijgt hier zijn
-// Content-Length, een chunked antwoord zijn nul-chunk.
+// finish adds Content-Length to buffered responses or the final zero chunk.
 func (w *respWriter) finish() error {
 	if w.c.hijacked {
 		return nil
@@ -1001,15 +756,10 @@ func (w *respWriter) finish() error {
 	switch {
 	case !w.started:
 		body := w.buf.Bytes()
-		// writeBody slikt de bytes van een 204/304 zelf al in (suppressBody);
-		// hier beslist alleen de kop: wel of geen Content-Length.
+		// suppressBody handles bytes; here only headers decide whether length is valid.
 		if bodyAllowed(w.status) && !(w.head && w.hdr.Get("Content-Length") != "") {
-			// Ook voor HEAD: de Content-Length hoort te zeggen wat GET zou
-			// geven (RFC 9110 §9.3.2) — de buffer ís dat antwoord. MAAR een
-			// handler die op HEAD zélf een (correcte) lengte zette zonder de
-			// bytes te schrijven, zag die met nul overschreven worden
-			// (review 13-08, vijfentwintigste ronde). writeBody slikt de
-			// bytes daarna in.
+			// HEAD reports the corresponding GET length (RFC 9110 §9.3.2), but
+			// preserve an explicit handler length when it wrote no body bytes.
 			w.hdr.Set("Content-Length", strconv.Itoa(len(body)))
 		}
 		w.writeHead()
@@ -1017,14 +767,8 @@ func (w *respWriter) finish() error {
 	case w.chunked:
 		w.c.bw.WriteString("0\r\n\r\n")
 	default:
-		// Het rechtstreekse pad: de handler beloofde een lengte. Klopt die
-		// niet met wat hij schreef, dan staat de volgende lezer op deze
-		// verbinding op de verkeerde byte — hergebruik is dan uitgesloten.
-		// De maat is w.declared — wat er op de DRAAD staat — en nooit de
-		// header-map: die is mutabel, en een handler die de lengte ná zijn
-		// eerste write "bijwerkte" praatte de controle anders om terwijl de
-		// kop al verstuurd was (review 13-08, zevende ronde). Een onderdrukte
-		// body (HEAD/204/304) is juist een bewezen einde: die slaan we over.
+		// On the direct path, mismatch against the immutable wire declaration
+		// disables reuse. Later header-map mutations cannot alter framing already sent.
 		if !w.suppressBody() && (w.declared < 0 || w.declared != w.written) {
 			w.keepAlive = false
 		}
@@ -1035,41 +779,35 @@ func (w *respWriter) finish() error {
 	return w.err
 }
 
-// bodyAllowed: 1xx, 204, 205 en 304 hebben per definitie geen body (RFC 9110;
-// voor 205 §15.3.6: "does not generate content"). LET OP voor 205 aan de
-// schrijfkant: RFC 9112 §6.3 noemt hem NIET in het rijtje dat een ontvanger
-// zonder framing als bodyloos leest — dus krijgt hij een expliciete
-// Content-Length: 0 mee (zie writeHead), anders las een standaardclient tot
-// EOF (review 13-08, zevendertigste ronde).
+// bodyAllowed excludes informational, 204, 205, and 304 responses. 205 still
+// receives explicit Content-Length: 0 because RFC 9112 §6.3 does not make it
+// implicitly bodyless for framing.
 func bodyAllowed(status int) bool {
 	return status >= 200 && status != StatusNoContent && status != 205 && status != 304
 }
 
-// writeBare antwoordt op een verzoek dat we niet eens konden lezen. Kort, en
-// daarna gaat de verbinding dicht.
+// writeBare responds to an unreadable request and closes the connection.
 func writeBare(nc net.Conn, status int, msg string) {
 	nc.SetWriteDeadline(time.Now().Add(writeTimeout))
 	fmt.Fprintf(nc, "HTTP/1.1 %d %s\r\nContent-Type: text/plain; charset=utf-8\r\n"+
 		"Content-Length: %d\r\nConnection: close\r\n\r\n%s\n", status, statusText(status), len(msg)+1, msg)
 }
 
-// Error antwoordt met een statuscode en een platte-tekst-uitleg.
+// Error sends a status and plain-text explanation.
 func Error(w ResponseWriter, msg string, status int) {
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.WriteHeader(status)
 	io.WriteString(w, msg+"\n")
 }
 
-// Redirect stuurt de client door (302 tenzij anders gevraagd).
+// Redirect sends the requested redirect status and location.
 func Redirect(w ResponseWriter, location string, status int) {
 	w.Header().Set("Location", location)
 	w.WriteHeader(status)
 	io.WriteString(w, "redirecting to "+location+"\n")
 }
 
-// statusText geeft de reden-tekst bij een code. Alleen wat dit pakket en zijn
-// afnemers echt versturen; de rest is "Status" — een client leest de code, niet
-// het proza.
+// statusText covers statuses emitted by this package and its consumers.
 func statusText(status int) string {
 	switch status {
 	case StatusOK:

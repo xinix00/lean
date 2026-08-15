@@ -1,10 +1,5 @@
 package leans3
 
-// De tests van de objectkant. De tegenpartij is net/http's server (de strenge
-// tegenpartij, zoals overal in lean): hij ziet precies wat er op de draad staat,
-// dus de asserties pinnen het gedrag — URL's, headers, paginering — en niet de
-// interne bouw.
-
 import (
 	"bytes"
 	"context"
@@ -23,11 +18,6 @@ import (
 	"time"
 )
 
-// TestGeenNetHTTP is de test die de reden van dit pakket afdwingt. Zodra er
-// ergens één net/http-import binnenglipt, linkt elke gebruiker crypto/tls mee
-// en is de ~2 MB terug — en dat merk je pas als een kern-image niet meer past.
-// De tests hierónder mogen net/http wél gebruiken (de strenge tegenpartij);
-// die staan niet in de dep-lijst van het pakket.
 func TestGeenNetHTTP(t *testing.T) {
 	out, err := exec.Command("go", "list", "-deps", "github.com/xinix00/lean/leans3").Output()
 	if err != nil {
@@ -40,8 +30,6 @@ func TestGeenNetHTTP(t *testing.T) {
 	}
 }
 
-// klant geeft een Client die tegen srv praat, in pad-stijl (een httptest-server
-// heeft geen wildcard-DNS voor een bucket in de hostnaam).
 func klant(t *testing.T, srv *httptest.Server) *Client {
 	t.Helper()
 	c := &Client{
@@ -69,8 +57,7 @@ func TestGetLeestObjectEnETag(t *testing.T) {
 		if r.Header.Get("Authorization") == "" {
 			t.Error("GET not signed")
 		}
-		// Een GET signeert de hash van een LEGE body, niet UNSIGNED-PAYLOAD:
-		// dat laatste mag alleen over https en providers weigeren het.
+
 		if got := r.Header.Get("X-Amz-Content-Sha256"); got != hexSum(nil) {
 			t.Errorf("X-Amz-Content-Sha256 = %q, want the empty-payload hash", got)
 		}
@@ -102,8 +89,6 @@ func TestGetAfwezigIsErrNotFound(t *testing.T) {
 	}
 }
 
-// Een 403 is géén sentinel: hij hoort met status én body terug te komen, want
-// S3 zet de echte reden (SignatureDoesNotMatch, AccessDenied) in die body.
 func TestStatusFoutDraagtDeBody(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "<Error><Code>SignatureDoesNotMatch</Code></Error>", http.StatusForbidden)
@@ -124,7 +109,7 @@ func TestStatusFoutDraagtDeBody(t *testing.T) {
 }
 
 func TestGetToStreamtBody(t *testing.T) {
-	payload := bytes.Repeat([]byte("leans3-stream!"), 4096) // ~57KB
+	payload := bytes.Repeat([]byte("leans3-stream!"), 4096)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet || r.URL.Path != "/bkt/apps/c/j/data.bin" {
 			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
@@ -162,7 +147,6 @@ func TestGetToAfwezigSchrijftNiets(t *testing.T) {
 	}
 }
 
-// failAfter neemt limit bytes aan en faalt dan — het "lokale schijf vol"-pad.
 type failAfter struct{ limit int }
 
 func (f *failAfter) Write(p []byte) (int, error) {
@@ -231,8 +215,6 @@ func TestPutStuurtLengteHashEnBody(t *testing.T) {
 	}
 }
 
-// Een leeg object moet nog steeds een Content-Length: 0 aankondigen: zonder die
-// header antwoordt S3 411 Length Required.
 func TestPutLeegObjectHeeftLengteNul(t *testing.T) {
 	gotLen := int64(-1)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -263,7 +245,7 @@ func TestPutVoorwaardeFaalt(t *testing.T) {
 }
 
 func TestPutFromStuurtLengteHashEnBody(t *testing.T) {
-	payload := bytes.Repeat([]byte("42"), 32<<10) // 64KB
+	payload := bytes.Repeat([]byte("42"), 32<<10)
 	hash := hexSum(payload)
 
 	var gotBody []byte
@@ -307,8 +289,6 @@ func TestPutFromKorteBronFaaltLuid(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	// Kondig 100 bytes aan, lever er 10: het transport moet weigeren een stil
-	// afgekapt object te versturen.
 	_, err := klant(t, srv).PutFrom(context.Background(), "torn",
 		strings.NewReader("0123456789"), 100, hexSum([]byte("whatever")), nil)
 	if err == nil {
@@ -316,8 +296,6 @@ func TestPutFromKorteBronFaaltLuid(t *testing.T) {
 	}
 }
 
-// Zonder hash kan een stroom niet gesigneerd worden, en stil UNSIGNED-PAYLOAD
-// sturen zou de payload-integriteit weggeven zonder dat iemand het ziet.
 func TestPutFromZonderHashWeigert(t *testing.T) {
 	c := &Client{Endpoint: "https://s3.example.com", Bucket: "b", Region: "r", AccessKeyID: "a", SecretAccessKey: "s"}
 	_, err := c.PutFrom(context.Background(), "k", strings.NewReader("x"), 1, "", nil)
@@ -326,10 +304,6 @@ func TestPutFromZonderHashWeigert(t *testing.T) {
 	}
 }
 
-// Een DELETE die met 204 antwoordt is de regressie waar dit pakket bijna in
-// bleef hangen: een 204 heeft geen Content-Length en geen chunks, dus een lezer
-// die "tot EOF" leest wacht op een keep-alive-verbinding tot de server hem
-// verveeld dichtgooit. Deze test faalt met een timeout als die regel weg is.
 func TestDelete204BlijftNietHangen(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodDelete {
@@ -452,9 +426,6 @@ func TestListCapMeldtAfkapping(t *testing.T) {
 	}
 }
 
-// De adresseringsstijl valt niet tegen een httptest-server op 127.0.0.1 te
-// testen (er is geen wildcard-DNS voor "bkt.127.0.0.1"), dus hier staat de
-// URL-samenstelling zelf vast.
 func TestURLSamenstelling(t *testing.T) {
 	t.Parallel()
 	vhost := &Client{Endpoint: "https://s3.example.com", Bucket: "bkt", Region: "r", AccessKeyID: "a", SecretAccessKey: "s"}
@@ -483,7 +454,6 @@ func TestURLSamenstelling(t *testing.T) {
 	}
 }
 
-// Ontbrekende of onmogelijke configuratie faalt luid en vóór het netwerk.
 func TestConfiguratieFaaltLuid(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
@@ -507,9 +477,6 @@ func TestConfiguratieFaaltLuid(t *testing.T) {
 	}
 }
 
-// Een afgebroken context doet geen verzoek. De DEADLINE wordt wél doorgegeven
-// (als leanhttp's termijn); een kale cancel halverwege niet — dat staat in de
-// pakketdoc.
 func TestAfgebrokenContextDoetNiets(t *testing.T) {
 	var hits int
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -528,13 +495,6 @@ func TestAfgebrokenContextDoetNiets(t *testing.T) {
 	}
 }
 
-// ---- eenendertigste ronde ----
-
-// TestRedirectWordtNooitGevolgd — een SigV4-signatuur dekt exact déze host en
-// dit pad, dus op een Location is hij per definitie ongeldig — en de
-// gesigneerde headers (waaronder X-Amz-Security-Token) reisden vóór NoFollow
-// gewoon mee naar waar de server ook maar heen wees (review 13-08,
-// eenendertigste ronde).
 func TestRedirectWordtNooitGevolgd(t *testing.T) {
 	lekken := make(chan string, 1)
 	elders := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -560,10 +520,6 @@ func TestRedirectWordtNooitGevolgd(t *testing.T) {
 	}
 }
 
-// TestUnsignedPayloadEistHTTPS — een niet-gesigneerde payload over plain http
-// is onderweg door iedereen te vervangen zonder dat S3 of wij dat merken; de
-// doc beloofde "alleen over https" maar dwong het niet af (review 13-08,
-// eenendertigste ronde).
 func TestUnsignedPayloadEistHTTPS(t *testing.T) {
 	c := &Client{Endpoint: "http://minio.lan:9000", Bucket: "b", Region: "r",
 		AccessKeyID: "AK", SecretAccessKey: "SK", UsePathStyle: true}
@@ -573,8 +529,6 @@ func TestUnsignedPayloadEistHTTPS(t *testing.T) {
 	}
 }
 
-// TestPutFromNulNeemtHetLengtepad — nul bytes stromen niet: geen Expect-dans,
-// gewoon Content-Length: 0 (review 13-08, eenendertigste ronde).
 func TestPutFromNulNeemtHetLengtepad(t *testing.T) {
 	zagExpect := make(chan string, 1)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -592,10 +546,6 @@ func TestPutFromNulNeemtHetLengtepad(t *testing.T) {
 	}
 }
 
-// TestSentinelHoudtDeVerbinding — een 404/412 is protocol (miss, verloren
-// CAS-race) en komt vaak: zijn kleine body hoort begrensd leeggedronken zodat
-// de (TLS-)verbinding poolbaar blijft in plaats van per miss een handshake te
-// kosten (review 13-08, eenendertigste ronde).
 func TestSentinelHoudtDeVerbinding(t *testing.T) {
 	var verbindingen int32
 	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

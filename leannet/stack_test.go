@@ -9,15 +9,12 @@ import (
 	"net"
 	"os"
 	"strings"
-	"sync/atomic"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
 
-// memDevice is een in-memory NIC: Transmit legt frames in de wachtrij van de
-// peer, Receive popt de eigen wachtrij ((0,nil) = niets, zoals het contract
-// wil). Telt ARP-queries per kant voor de PassivePeers-regressie.
 type memDevice struct {
 	mu   sync.Mutex
 	q    [][]byte
@@ -52,8 +49,6 @@ func (d *memDevice) Receive(buf []byte) (int, error) {
 	return copy(buf, f), nil
 }
 
-// newStackPair bouwt twee stacks op één draad, elk met een RX-lus zoals
-// hopnet die drijft. cleanup stopt alles.
 func newStackPair(t *testing.T, budgetA, budgetB int) (a, b *Stack) {
 	da, db := &memDevice{}, &memDevice{}
 	da.peer, db.peer = db, da
@@ -92,10 +87,6 @@ func newStackPair(t *testing.T, budgetA, budgetB int) (a, b *Stack) {
 	return a, b
 }
 
-// TestStackTCPEchoEndToEnd: het hele huis — dial via ARP, handshake, echo,
-// EOF-propagatie, en na afloop is élke byte terug in de pot. Plus de
-// PassivePeers-regressie: de server leert zijn beller passief en heeft nul
-// eigen ARP-queries nodig.
 func TestStackTCPEchoEndToEnd(t *testing.T) {
 	a, b := newStackPair(t, 1<<20, 1<<20)
 
@@ -110,7 +101,7 @@ func TestStackTCPEchoEndToEnd(t *testing.T) {
 			srvDone <- err
 			return
 		}
-		if _, err := io.Copy(c, c); err != nil { // echo tot EOF van de peer
+		if _, err := io.Copy(c, c); err != nil {
 			srvDone <- err
 			return
 		}
@@ -127,8 +118,7 @@ func TestStackTCPEchoEndToEnd(t *testing.T) {
 	}
 	go func() {
 		c.Write(msg)
-		// Half-close bestaat niet op deze rand; Close na de write en de echo
-		// leest gewoon door tot de FIN via de server terugkomt.
+
 	}()
 	got := make([]byte, 0, len(msg))
 	buf := make([]byte, 4096)
@@ -150,9 +140,6 @@ func TestStackTCPEchoEndToEnd(t *testing.T) {
 		t.Fatalf("server: %v", err)
 	}
 
-	// PassivePeers-regressie: b (de server) hoort zijn beller uit de
-	// SYN-frames geleerd te hebben — nul eigen queries; a heeft er precies
-	// één nodig gehad om b te vinden.
 	da := a.dev.(*memDevice)
 	db := b.dev.(*memDevice)
 	if db.arpQueries != 0 {
@@ -162,8 +149,6 @@ func TestStackTCPEchoEndToEnd(t *testing.T) {
 		t.Errorf("client sent %d ARP queries, want 1", da.arpQueries)
 	}
 
-	// Budget-hygiëne: als alle verbindingen door TIME-WAIT heen zijn is de
-	// pot weer vol. (De actieve sluiter houdt zijn floor ~1s vast.)
 	deadline := time.Now().Add(4 * time.Second)
 	for {
 		a.mu.Lock()
@@ -182,8 +167,6 @@ func TestStackTCPEchoEndToEnd(t *testing.T) {
 	}
 }
 
-// TestStackUDPRoundtrip: DNS-vormig verkeer — dial, vraag, antwoord via
-// ReadFrom/WriteTo, met adressen die kloppen.
 func TestStackUDPRoundtrip(t *testing.T) {
 	a, b := newStackPair(t, 1<<20, 1<<20)
 
@@ -221,15 +204,13 @@ func TestStackUDPRoundtrip(t *testing.T) {
 	}
 }
 
-// TestStackReadDeadline: een stille peer laat Read exact op de deadline los,
-// met een echte timeout-fout — deadline-gedreven, nooit iteration-capped.
 func TestStackReadDeadline(t *testing.T) {
 	a, b := newStackPair(t, 1<<20, 1<<20)
 	l, err := b.Listen(81)
 	if err != nil {
 		t.Fatal(err)
 	}
-	go l.Accept() // accepteren en zwijgen
+	go l.Accept()
 
 	c, err := a.DialTCP([4]byte{10, 0, 0, 2}, 81, time.Now().Add(3*time.Second))
 	if err != nil {
@@ -251,7 +232,6 @@ func TestStackReadDeadline(t *testing.T) {
 	}
 }
 
-// errorsAs zonder errors te schaduwen in de testnaamruimte.
 func errorsAs(err error, target *net.Error) bool {
 	if e, ok := err.(net.Error); ok {
 		*target = e
@@ -260,10 +240,8 @@ func errorsAs(err error, target *net.Error) bool {
 	return false
 }
 
-// TestStackBudgetRefusalSendsRST: is de pot te leeg voor zelfs een floor, dan
-// krijgt de beller een luide RST (refused) in plaats van stilte.
 func TestStackBudgetRefusalSendsRST(t *testing.T) {
-	a, b := newStackPair(t, 1<<20, 0) // b heeft NIETS te vergeven
+	a, b := newStackPair(t, 1<<20, 0)
 
 	if _, err := b.Listen(82); err != nil {
 		t.Fatal(err)
@@ -280,9 +258,6 @@ func TestStackBudgetRefusalSendsRST(t *testing.T) {
 	}
 }
 
-// TestStackICMPEcho: een ping wordt beantwoord — de diagnose-route van de
-// node-watchdog. De test speelt de pinger zélf (geen tweede stack: twee
-// lezers op één wachtrij was exact de meetbank-valkuil van 11-08).
 func TestStackICMPEcho(t *testing.T) {
 	da, db := &memDevice{}, &memDevice{}
 	da.peer, db.peer = db, da
@@ -338,14 +313,12 @@ func TestStackICMPEcho(t *testing.T) {
 		}
 		reply := ip.Payload()
 		if reply[0] == icmpEchoReply && bytes.Equal(reply[8:], []byte("ping")) {
-			return // dáár is hij
+			return
 		}
 	}
 	t.Fatal("no echo reply within 2s")
 }
 
-// TestStackEphemeralSkipsOccupied — lneto's #14: een botsing met een levende
-// poort betekent overslaan en herkiezen, nooit een harde dial-fout.
 func TestStackEphemeralSkipsOccupied(t *testing.T) {
 	da, db := &memDevice{}, &memDevice{}
 	da.peer, db.peer = db, da
@@ -355,7 +328,6 @@ func TestStackEphemeralSkipsOccupied(t *testing.T) {
 	}, 1)
 	t.Cleanup(s.Close)
 
-	// Bezet 49153 expliciet; de teller staat op 49152.
 	if _, err := s.ListenUDP(49153); err != nil {
 		t.Fatal(err)
 	}
@@ -374,9 +346,6 @@ func TestStackEphemeralSkipsOccupied(t *testing.T) {
 	}
 }
 
-// TestStackSeedNeighborSubnetRule — lneto's #21: een seed buiten het subnet
-// zou nooit geraadpleegd worden en wordt dus luid geweigerd; de gateway en
-// binnen-subnet-seeds werken.
 func TestStackSeedNeighborSubnetRule(t *testing.T) {
 	da, db := &memDevice{}, &memDevice{}
 	da.peer, db.peer = db, da
@@ -397,13 +366,11 @@ func TestStackSeedNeighborSubnetRule(t *testing.T) {
 	}
 }
 
-// TestStackSocketShapes — lneto's #4: het Socket-contract levert échte
-// net-typen en fouten als fouten, nooit een fout vermomd als verbinding.
 func TestStackSocketShapes(t *testing.T) {
 	a, b := newStackPair(t, 1<<20, 1<<20)
 
 	ctx := context.Background()
-	// Listener-vorm.
+
 	lsAny, err := b.Socket(ctx, "tcp", afINET, sockSTREAM, &net.TCPAddr{Port: 90}, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -418,7 +385,7 @@ func TestStackSocketShapes(t *testing.T) {
 			c.Close()
 		}
 	}()
-	// Conn-vorm.
+
 	dctx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
 	cAny, err := a.Socket(dctx, "tcp", afINET, sockSTREAM, nil,
@@ -430,7 +397,7 @@ func TestStackSocketShapes(t *testing.T) {
 		t.Fatalf("dial returned %T, want net.Conn", cAny)
 	}
 	cAny.(net.Conn).Close()
-	// PacketConn-vorm.
+
 	pcAny, err := a.Socket(ctx, "udp", afINET, sockDGRAM, &net.UDPAddr{Port: 5353}, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -438,24 +405,20 @@ func TestStackSocketShapes(t *testing.T) {
 	if _, ok := pcAny.(net.PacketConn); !ok {
 		t.Fatalf("udp listen returned %T, want net.PacketConn", pcAny)
 	}
-	// IPv6: nette weigering, geen paniek en geen vermomde waarde.
+
 	if v, err := a.Socket(ctx, "tcp", afINET6, sockSTREAM, nil, &net.TCPAddr{IP: net.IPv6loopback, Port: 1}); err == nil || v != nil {
 		t.Fatalf("ipv6 returned (%v, %v), want (nil, error)", v, err)
 	}
-	// Een dial die faalt levert (nil, err) — de #4-kern.
+
 	fctx, fcancel := context.WithTimeout(ctx, 300*time.Millisecond)
 	defer fcancel()
 	v, err := a.Socket(fctx, "tcp", afINET, sockSTREAM, nil,
-		&net.TCPAddr{IP: net.IP{10, 0, 0, 99}, Port: 1}) // bestaat niet
+		&net.TCPAddr{IP: net.IP{10, 0, 0, 99}, Port: 1})
 	if err == nil || v != nil {
 		t.Fatalf("failed dial returned (%v, %v), want (nil, error)", v, err)
 	}
 }
 
-// TestStackIdleCostsNothing — lneto's #17: een idle listener spinde daar een
-// volledige pool-scan per lege poll. Hier blokkeert Accept op een kanaal en
-// slaapt de pomp zonder deadline: een stack zonder werk heeft geen enkele
-// wektijd staan en verbruikt dus geen CPU.
 func TestStackIdleCostsNothing(t *testing.T) {
 	da, db := &memDevice{}, &memDevice{}
 	da.peer, db.peer = db, da
@@ -476,10 +439,6 @@ func TestStackIdleCostsNothing(t *testing.T) {
 	}
 }
 
-// TestStackGarbageNeverPanics: de onvertrouwde rand. Rommel in élke laag —
-// afgekapt, corrupt, kapotte optielijsten, verkeerde checksums — wordt geteld
-// en gedropt, nooit gepanict. hopnet draait hier een recover omheen, maar
-// daar hoort niets aan te komen.
 func TestStackGarbageNeverPanics(t *testing.T) {
 	da, db := &memDevice{}, &memDevice{}
 	da.peer, db.peer = db, da
@@ -492,7 +451,6 @@ func TestStackGarbageNeverPanics(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Pseudo-willekeurig met vaste seed: reproduceerbaar, geen wandklok.
 	x := uint64(0xdeadbeef)
 	rnd := func() byte {
 		x ^= x << 13
@@ -507,13 +465,13 @@ func TestStackGarbageNeverPanics(t *testing.T) {
 		}
 		return frame[:n]
 	}
-	// Puur ruis in alle maten, inclusief te kort voor ethernet.
+
 	for _, n := range []int{0, 1, 13, 14, 15, 33, 60, 61, 200} {
 		for i := 0; i < 50; i++ {
 			s.RecvInboundPacket(fill(n))
 		}
 	}
-	// Gericht kapot: aan ons geadresseerd zodat de diepere lagen meedoen.
+
 	mkEth := func(payloadLen int) EthFrame {
 		f, _ := ParseEth(frame[:EthernetHeaderSize+payloadLen])
 		f.SetDst([6]byte{2, 0, 0, 0, 0, 1})
@@ -521,33 +479,33 @@ func TestStackGarbageNeverPanics(t *testing.T) {
 		f.SetEtherType(EtherTypeIPv4)
 		return f
 	}
-	// 1: IPv4-header met kapotte checksum.
+
 	mkEth(sizeIPv4)
 	PutIPv4(frame[EthernetHeaderSize:], ProtoTCP, [4]byte{10, 0, 0, 9}, [4]byte{10, 0, 0, 1}, 0)
 	frame[EthernetHeaderSize+10] ^= 0xff
 	s.RecvInboundPacket(frame[:EthernetHeaderSize+sizeIPv4])
-	// 2: geldige IPv4, afgekapte TCP.
+
 	mkEth(sizeIPv4 + 8)
 	PutIPv4(frame[EthernetHeaderSize:], ProtoTCP, [4]byte{10, 0, 0, 9}, [4]byte{10, 0, 0, 1}, 8)
 	s.RecvInboundPacket(frame[:EthernetHeaderSize+sizeIPv4+8])
-	// 3: geldige IPv4 + TCP-SYN met corrupte TCP-checksum.
+
 	mkEth(sizeIPv4 + sizeTCP)
 	PutTCP(frame[EthernetHeaderSize+sizeIPv4:], 999, 80, 1, 0, FlagSYN, 100, nil,
 		[4]byte{10, 0, 0, 9}, [4]byte{10, 0, 0, 1}, 0)
 	frame[EthernetHeaderSize+sizeIPv4+16] ^= 0xff
 	PutIPv4(frame[EthernetHeaderSize:], ProtoTCP, [4]byte{10, 0, 0, 9}, [4]byte{10, 0, 0, 1}, sizeTCP)
 	s.RecvInboundPacket(frame[:EthernetHeaderSize+sizeIPv4+sizeTCP])
-	// 4: SYN met een kapotte optielijst (kind 2, lengte 0 → oneindige-lus-aas).
+
 	mkEth(sizeIPv4 + sizeTCP + 4)
 	PutTCP(frame[EthernetHeaderSize+sizeIPv4:], 999, 80, 1, 0, FlagSYN, 100,
 		[]byte{2, 0, 0, 0}, [4]byte{10, 0, 0, 9}, [4]byte{10, 0, 0, 1}, 0)
 	PutIPv4(frame[EthernetHeaderSize:], ProtoTCP, [4]byte{10, 0, 0, 9}, [4]byte{10, 0, 0, 1}, sizeTCP+4)
 	s.RecvInboundPacket(frame[:EthernetHeaderSize+sizeIPv4+sizeTCP+4])
-	// 5: ARP die geen ethernet/IPv4-ARP is.
+
 	f := mkEth(sizeARP)
 	f.SetEtherType(EtherTypeARP)
 	PutARP(frame[EthernetHeaderSize:], ARPRequest, [6]byte{9}, [4]byte{10, 0, 0, 9}, [6]byte{}, [4]byte{10, 0, 0, 1})
-	frame[EthernetHeaderSize] = 0xff // htype kapot
+	frame[EthernetHeaderSize] = 0xff
 	s.RecvInboundPacket(frame[:EthernetHeaderSize+sizeARP])
 
 	s.mu.Lock()
@@ -561,9 +519,6 @@ func TestStackGarbageNeverPanics(t *testing.T) {
 	}
 }
 
-// TestStackListenerBacklogOverflow: meer voltooide handshakes dan de backlog
-// draagt → de overloop wordt luid geweigerd (abort+RST), en Accept levert
-// precies de backlog. Geen stil vastgehouden restje (de conport-les).
 func TestStackListenerBacklogOverflow(t *testing.T) {
 	a, b := newStackPair(t, 1<<20, 1<<20)
 	l, err := b.Listen(88)
@@ -579,9 +534,7 @@ func TestStackListenerBacklogOverflow(t *testing.T) {
 		}
 		conns = append(conns, c)
 	}
-	// Zonder accepter: de overloop is geaborteerd en gereapt, en b houdt
-	// precies de backlog vast — geen byte meer. (De late handshake-ACKs
-	// druppelen asynchroon binnen, dus even laten settelen.)
+
 	deadline := time.Now().Add(2 * time.Second)
 	for {
 		b.mu.Lock()
@@ -595,11 +548,10 @@ func TestStackListenerBacklogOverflow(t *testing.T) {
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	// De overloop-clients zijn ge-RST: hun Read faalt (geen eeuwige stilte).
+
 	dead := 0
 	for _, c := range conns {
-		// Kort: de ge-RST'e verbindingen falen meteen, de levende kosten elk
-		// hun volle deadline (8 × dit getal is de looptijd van deze test).
+
 		c.SetReadDeadline(time.Now().Add(120 * time.Millisecond))
 		if _, err := c.Read(make([]byte, 1)); err != nil && err != os.ErrDeadlineExceeded {
 			dead++
@@ -608,7 +560,7 @@ func TestStackListenerBacklogOverflow(t *testing.T) {
 	if dead != dials-tcpBacklog {
 		t.Fatalf("%d overflow clients saw the RST, want exactly %d", dead, dials-tcpBacklog)
 	}
-	// En wat er wél wacht is netjes op te halen: precies tcpBacklog stuks.
+
 	for i := 0; i < tcpBacklog; i++ {
 		if _, err := l.Accept(); err != nil {
 			t.Fatalf("accept %d: %v", i, err)
@@ -617,17 +569,8 @@ func TestStackListenerBacklogOverflow(t *testing.T) {
 	l.Close()
 }
 
-// TestStackBudgetRecovery: een pot van precies één verbinding weigert de
-// tweede en accepteert weer zodra de eerste zijn geheugen teruggaf — de
-// kringloop die het OOM-probleem verving.
-//
-// De server houdt zijn verbinding vast tot de test hem vrijgeeft. Dat is geen
-// omslachtigheid maar de fix van een flaky variant: sloot hij meteen na
-// Accept, dan hing "is het slot nog bezet?" aan de vraag of TIME-WAIT (~1s) al
-// verstreken was voordat de tweede dial startte — en onder de race-detector is
-// alles langzamer, dus viel de test daar soms door.
 func TestStackBudgetRecovery(t *testing.T) {
-	a, b := newStackPair(t, 1<<20, tcpFloorRing) // b: exact één verbinding
+	a, b := newStackPair(t, 1<<20, tcpFloorRing)
 	l, err := b.Listen(89)
 	if err != nil {
 		t.Fatal(err)
@@ -641,7 +584,7 @@ func TestStackBudgetRecovery(t *testing.T) {
 				return
 			}
 			accepted <- c
-			<-release // vasthouden tot de test het slot wil terug
+			<-release
 			c.Close()
 		}
 	}()
@@ -654,13 +597,13 @@ func TestStackBudgetRecovery(t *testing.T) {
 	case <-time.After(3 * time.Second):
 		t.Fatal("server never accepted the first connection")
 	}
-	// De pot is nu aantoonbaar vol: de tweede dial krijgt een luide RST.
+
 	if _, err := a.DialTCP([4]byte{10, 0, 0, 2}, 89, time.Now().Add(2*time.Second)); err == nil {
 		t.Fatal("second dial succeeded against a full pot")
 	}
 	close(release)
 	c1.Close()
-	// b's kant loopt door TIME-WAIT (~1s) en dan is de floor terug.
+
 	deadline := time.Now().Add(5 * time.Second)
 	for {
 		c3, err := a.DialTCP([4]byte{10, 0, 0, 2}, 89, time.Now().Add(2*time.Second))
@@ -675,8 +618,6 @@ func TestStackBudgetRecovery(t *testing.T) {
 	}
 }
 
-// TestStackEphemeralWraps: de teller loopt over de rand van het bereik en
-// begint gewoon opnieuw bij de basis.
 func TestStackEphemeralWraps(t *testing.T) {
 	da, db := &memDevice{}, &memDevice{}
 	da.peer, db.peer = db, da
@@ -686,7 +627,7 @@ func TestStackEphemeralWraps(t *testing.T) {
 	}, 1)
 	t.Cleanup(s.Close)
 	s.mu.Lock()
-	s.nextEph = ephemeralEnd // 65535
+	s.nextEph = ephemeralEnd
 	s.mu.Unlock()
 	u1, err := s.ListenUDP(0)
 	if err != nil {
@@ -703,7 +644,6 @@ func TestStackEphemeralWraps(t *testing.T) {
 	}
 }
 
-// drainWire haalt alle frames uit een device-wachtrij (de "buitenwereld").
 func drainWire(d *memDevice) [][]byte {
 	var out [][]byte
 	buf := make([]byte, MTU+EthernetMaximumSize)
@@ -716,10 +656,6 @@ func drainWire(d *memDevice) [][]byte {
 	}
 }
 
-// TestStackRoutesOffSubnetViaGateway: verkeer naar buiten het subnet gaat naar
-// het MAC van de GATEWAY, niet naar een (onmogelijke) ARP voor het
-// bestemmings-IP. Dat is het internet-pad — downloads, TLS, SNTP — en het
-// verdient een expliciete test los van het ijzer.
 func TestStackRoutesOffSubnetViaGateway(t *testing.T) {
 	da, db := &memDevice{}, &memDevice{}
 	da.peer, db.peer = db, da
@@ -730,14 +666,12 @@ func TestStackRoutesOffSubnetViaGateway(t *testing.T) {
 	}, 3)
 	t.Cleanup(s.Close)
 
-	// Dial naar een publiek adres; de stack heeft de gateway-MAC nog niet.
 	done := make(chan error, 1)
 	go func() {
 		_, err := s.DialTCP([4]byte{8, 8, 8, 8}, 443, time.Now().Add(3*time.Second))
 		done <- err
 	}()
 
-	// Op de draad hoort nu een ARP-request voor de GATEWAY te staan.
 	var asked bool
 	deadline := time.Now().Add(2 * time.Second)
 	for !asked && time.Now().Before(deadline) {
@@ -764,8 +698,6 @@ func TestStackRoutesOffSubnetViaGateway(t *testing.T) {
 		t.Fatal("no ARP request for the gateway")
 	}
 
-	// De "router" antwoordt; daarna moet de SYN naar het gateway-MAC gaan,
-	// met het publieke IP als bestemming.
 	reply := make([]byte, 60)
 	ef, _ := ParseEth(reply)
 	ef.SetDst(s.cfg.MAC)
@@ -800,15 +732,12 @@ func TestStackRoutesOffSubnetViaGateway(t *testing.T) {
 	if !sawSYN {
 		t.Fatal("no SYN towards the off-subnet peer after the gateway resolved")
 	}
-	// 8.8.8.8 antwoordt niet: de dial hoort luid op te geven, niet te hangen.
+
 	if err := <-done; err == nil {
 		t.Fatal("dial to a silent peer succeeded")
 	}
 }
 
-// TestStackStaticGatewayMACSkipsARP: met een geplande gateway-MAC (appnet's
-// deterministische net) gaat er nul ARP over de draad — het scheelt een
-// rondje op élke eerste dial naar buiten.
 func TestStackStaticGatewayMACSkipsARP(t *testing.T) {
 	da, db := &memDevice{}, &memDevice{}
 	da.peer, db.peer = db, da
@@ -834,7 +763,7 @@ func TestStackStaticGatewayMACSkipsARP(t *testing.T) {
 				t.Fatal("static gateway MAC still triggered ARP")
 			}
 			if [6]byte(f.Dst()) == gwMAC {
-				return // de SYN ging direct naar het geplande MAC
+				return
 			}
 		}
 		time.Sleep(5 * time.Millisecond)
@@ -842,8 +771,6 @@ func TestStackStaticGatewayMACSkipsARP(t *testing.T) {
 	t.Fatal("no frame towards the planned gateway MAC")
 }
 
-// TestStackUDPAccessors: de kleine net-contract-oppervlakken die het
-// standaard-net-pakket wél gebruikt (deadlines, adressen, dubbel sluiten).
 func TestStackUDPAccessors(t *testing.T) {
 	a, _ := newStackPair(t, 1<<20, 1<<20)
 	u, err := a.ListenUDP(5555)
@@ -865,9 +792,7 @@ func TestStackUDPAccessors(t *testing.T) {
 	if _, _, err := u.ReadFrom(make([]byte, 8)); err != os.ErrDeadlineExceeded {
 		t.Errorf("ReadFrom err = %v, want deadline exceeded", err)
 	}
-	// WriteTo met een verkeerd adrestype of onzinnige poort weigert luid —
-	// zónder verlopen deadline in de buurt: de oude test was daarop
-	// vals-groen (review 13-08, dertigste ronde).
+
 	if err := u.SetWriteDeadline(time.Time{}); err != nil {
 		t.Fatal(err)
 	}
@@ -881,11 +806,11 @@ func TestStackUDPAccessors(t *testing.T) {
 		t.Error("WriteTo accepted port 65536")
 	}
 	u.Close()
-	u.Close() // idempotent
+	u.Close()
 	if _, _, err := u.ReadFrom(make([]byte, 8)); err != net.ErrClosed {
 		t.Errorf("ReadFrom after close = %v, want net.ErrClosed", err)
 	}
-	// De poort is vrij: opnieuw binden moet lukken.
+
 	u2, err := a.ListenUDP(5555)
 	if err != nil {
 		t.Fatalf("rebind after close: %v", err)
@@ -893,7 +818,6 @@ func TestStackUDPAccessors(t *testing.T) {
 	u2.Close()
 }
 
-// TestStackListenerRejectsBusyPortAndReportsAddr: de listener-rand.
 func TestStackListenerRejectsBusyPortAndReportsAddr(t *testing.T) {
 	a, _ := newStackPair(t, 1<<20, 1<<20)
 	l, err := a.Listen(1234)
@@ -911,15 +835,13 @@ func TestStackListenerRejectsBusyPortAndReportsAddr(t *testing.T) {
 	if err != nil {
 		t.Fatalf("relisten after close: %v", err)
 	}
-	// Een wachtende Accept moet door Close losgelaten worden (anders lekt een
-	// goroutine bij elke listener-teardown), en daarna blijft hij ErrClosed
-	// geven.
+
 	released := make(chan error, 1)
 	go func() {
 		_, err := l2.Accept()
 		released <- err
 	}()
-	time.Sleep(20 * time.Millisecond) // Accept zit nu te wachten
+	time.Sleep(20 * time.Millisecond)
 	l2.Close()
 	select {
 	case err := <-released:
@@ -934,12 +856,6 @@ func TestStackListenerRejectsBusyPortAndReportsAddr(t *testing.T) {
 	}
 }
 
-// TestStackFastReaderKeepsFullWindow: de reden dat de rx-vloer 16KiB is en
-// niet 2KiB. Een lezer die sneller leest dan het net levert laat de ring nooit
-// vollopen, dus groeit hij nooit — het venster dat wij adverteren is dan
-// permanent de vloer. Die vloer moet daarom op zichzelf al een
-// initial-cwnd-burst (10 segmenten) kunnen absorberen, anders wordt élke bulk
-// binnenkomst stop-and-wait en meten we onze eigen rem.
 func TestStackFastReaderKeepsFullWindow(t *testing.T) {
 	a, b := newStackPair(t, 1<<20, 1<<20)
 	l, err := b.Listen(91)
@@ -954,10 +870,10 @@ func TestStackFastReaderKeepsFullWindow(t *testing.T) {
 			srvDone <- -1
 			return
 		}
-		// Zo snel lezen als het maar kan: dit is de "snelle lezer".
+
 		n, _ := io.Copy(io.Discard, c)
 		srvDone <- int(n)
-		<-gemeten // de volle close geeft de ring terug (abandonRead): eerst meten
+		<-gemeten
 		c.Close()
 	}()
 
@@ -975,9 +891,6 @@ func TestStackFastReaderKeepsFullWindow(t *testing.T) {
 		t.Fatalf("server read %d of %d bytes", got, len(payload))
 	}
 
-	// De kern van de test: het venster dat de server adverteerde moet een
-	// volle initial-cwnd-burst kunnen dragen, ook al is zijn ring nooit
-	// gegroeid (snelle lezer). 10 × 1460 is de burst die een zender opent.
 	b.mu.Lock()
 	for _, sc := range b.conns {
 		if w := sc.tcp.rx.size(); w < 10*1460 {
@@ -989,17 +902,9 @@ func TestStackFastReaderKeepsFullWindow(t *testing.T) {
 	close(gemeten)
 }
 
-// TestStackSelfDial: een wereld moet bij zichzelf kunnen. Zonder de
-// loopback-naad vroeg een dial naar het eigen IP op de draad "who has
-// <mijzelf>" — een vraag die geen switch beantwoordt (broadcast gaat naar
-// iedereen BEHALVE de bron), dus kwam er na vijf pogingen "no route to host".
-// GEMETEN 12-08 op ijzer: na een rolling update stond cloudflared op het
-// slot-IP dat zijn eigen config als origin noemde, en die fout wees vijf lagen
-// weg van de oorzaak. Zelfde klasse als de watchdog-canary die zijn eigen
-// agent-poort niet kon bereiken.
 func TestStackSelfDial(t *testing.T) {
 	a, _ := newStackPair(t, 1<<20, 1<<20)
-	self := [4]byte{10, 0, 0, 1} // a's eigen adres
+	self := [4]byte{10, 0, 0, 1}
 
 	l, err := a.Listen(7000)
 	if err != nil {
@@ -1012,7 +917,7 @@ func TestStackSelfDial(t *testing.T) {
 			srv <- err
 			return
 		}
-		_, err = io.Copy(c, c) // echo tot de peer sluit
+		_, err = io.Copy(c, c)
 		c.Close()
 		srv <- err
 	}()
@@ -1041,7 +946,6 @@ func TestStackSelfDial(t *testing.T) {
 		t.Fatalf("server side: %v", err)
 	}
 
-	// En geen enkel zelf-frame mag de draad op zijn gegaan.
 	da := a.dev.(*memDevice)
 	da.mu.Lock()
 	queries := da.arpQueries
@@ -1051,10 +955,6 @@ func TestStackSelfDial(t *testing.T) {
 	}
 }
 
-// TestStackSelfDialRefused: is er niets dat luistert op de eigen poort, dan
-// hoort dat "refused" te zijn — niet vijf seconden stilte en dan een
-// route-fout die de operator naar de switch stuurt. Dat was letterlijk de
-// verkeerde diagnose-richting op 12-08.
 func TestStackSelfDialRefused(t *testing.T) {
 	a, _ := newStackPair(t, 1<<20, 1<<20)
 	start := time.Now()
@@ -1070,7 +970,6 @@ func TestStackSelfDialRefused(t *testing.T) {
 	}
 }
 
-// TestStackSelfDialUDP: zelfde naad voor datagrammen (de SNTP/DNS-vorm).
 func TestStackSelfDialUDP(t *testing.T) {
 	a, _ := newStackPair(t, 1<<20, 1<<20)
 	srv, err := a.ListenUDP(7002)
@@ -1102,12 +1001,9 @@ func TestStackSelfDialUDP(t *testing.T) {
 	}
 }
 
-// TestStackClosedPortRefusesFast: het algemene geval van de refused-fix — een
-// dial naar een dichte poort op een ANDERE node hoort ook meteen "nee" te
-// krijgen (RFC 9293 §3.10.7.1), niet de deadline uit te zitten.
 func TestStackClosedPortRefusesFast(t *testing.T) {
 	a, b := newStackPair(t, 1<<20, 1<<20)
-	if _, err := b.Listen(6000); err != nil { // een ándere poort dan we dialen
+	if _, err := b.Listen(6000); err != nil {
 		t.Fatal(err)
 	}
 	start := time.Now()
@@ -1120,9 +1016,6 @@ func TestStackClosedPortRefusesFast(t *testing.T) {
 	}
 }
 
-// TestStackRSTStormResistance: een RST naar een onbekende verbinding mag
-// nooit een RST uitlokken (dat is een storm tussen twee nodes die elkaar
-// beide niet kennen).
 func TestStackRSTStormResistance(t *testing.T) {
 	da, db := &memDevice{}, &memDevice{}
 	da.peer, db.peer = db, da
@@ -1132,10 +1025,9 @@ func TestStackRSTStormResistance(t *testing.T) {
 	}, 5)
 	t.Cleanup(s.Close)
 	if err := s.SeedNeighbor([4]byte{10, 0, 0, 9}, [6]byte{2, 0, 0, 0, 0, 9}); err != nil {
-		t.Fatal(err) // seed onder het stack-slot: de pomp leest de tabel al
+		t.Fatal(err)
 	}
 
-	// Een kale RST voor een verbinding die hier niet bestaat.
 	frame := make([]byte, 60)
 	eth, _ := ParseEth(frame)
 	eth.SetDst(s.cfg.MAC)
@@ -1144,7 +1036,7 @@ func TestStackRSTStormResistance(t *testing.T) {
 	n, _ := PutTCP(frame[EthernetHeaderSize+sizeIPv4:], 1234, 80, 500, 0, FlagRST, 0, nil,
 		[4]byte{10, 0, 0, 9}, [4]byte{10, 0, 0, 1}, 0)
 	PutIPv4(frame[EthernetHeaderSize:], ProtoTCP, [4]byte{10, 0, 0, 9}, [4]byte{10, 0, 0, 1}, n)
-	drainWire(db) // wire leegmaken
+	drainWire(db)
 	s.RecvInboundPacket(frame)
 
 	deadline := time.Now().Add(500 * time.Millisecond)
@@ -1166,12 +1058,6 @@ func TestStackRSTStormResistance(t *testing.T) {
 	}
 }
 
-// TestStackBroadcastGaatNaarFFFF: een datagram aan 255.255.255.255 of aan het
-// subnet-broadcastadres gaat naar ff:ff:ff:ff:ff:ff en lokt GEEN ARP uit. Dit
-// is het pad van een DHCP-rebind (RFC 2131 §4.4.5): als de lessor weg is, is
-// broadcast de enige manier om de lease te houden. Vóór deze regel ging een
-// limited broadcast als unicast naar de gateway en ARP'de een subnet-broadcast
-// zich vijf keer dood.
 func TestStackBroadcastGaatNaarFFFF(t *testing.T) {
 	for _, tc := range []struct {
 		naam string
@@ -1233,9 +1119,6 @@ func TestStackBroadcastGaatNaarFFFF(t *testing.T) {
 	}
 }
 
-// TestIsBroadcastIP dekt de randen die de routelaag zelf niet laat zien: een
-// /31 en /32 hebben GEEN broadcastadres (RFC 3021), en een adres met alle
-// hostbits aan in een ánder subnet is gewoon een unicast-adres elders.
 func TestIsBroadcastIP(t *testing.T) {
 	ip := [4]byte{10, 0, 0, 1}
 	for _, tc := range []struct {
@@ -1244,14 +1127,14 @@ func TestIsBroadcastIP(t *testing.T) {
 		want   bool
 	}{
 		{[4]byte{255, 255, 255, 255}, 24, true},
-		{[4]byte{255, 255, 255, 255}, 32, true}, // limited kan altijd
+		{[4]byte{255, 255, 255, 255}, 32, true},
 		{[4]byte{10, 0, 0, 255}, 24, true},
 		{[4]byte{10, 0, 255, 255}, 16, true},
-		{[4]byte{10, 0, 0, 255}, 16, false}, // hostbits niet allemaal aan
+		{[4]byte{10, 0, 0, 255}, 16, false},
 		{[4]byte{10, 0, 0, 2}, 24, false},
-		{[4]byte{10, 0, 1, 255}, 24, false}, // broadcast van een ánder subnet
-		{[4]byte{10, 0, 0, 1}, 31, false},   // /31: geen broadcast (RFC 3021)
-		{[4]byte{10, 0, 0, 1}, 32, false},   // /32: idem
+		{[4]byte{10, 0, 1, 255}, 24, false},
+		{[4]byte{10, 0, 0, 1}, 31, false},
+		{[4]byte{10, 0, 0, 1}, 32, false},
 		{[4]byte{192, 168, 1, 255}, 24, false},
 	} {
 		if got := isBroadcastIP(tc.dst, ip, tc.prefix); got != tc.want {
@@ -1260,14 +1143,6 @@ func TestIsBroadcastIP(t *testing.T) {
 	}
 }
 
-// TestStackSelfDialMeerdereRondes: MEERDERE vraag-antwoord-rondes over ÉÉN
-// loopback-verbinding, want dat is wat keep-alive doet en het bestaande
-// self-dial-geval deed maar één ronde.
-//
-// GEMETEN 12-08 op ijzer (LicheeRV op 192.168.99.2): hop's agent proxyt naar de
-// leader op dezelfde node, dus over loopback, met een verbinding uit de
-// keep-alive-pool. Uitkomst: 200, 502, 200, 502 — perfect om en om. De eerste
-// ronde van een verse verbinding lukte, de tweede over dezelfde verbinding niet.
 func TestStackSelfDialMeerdereRondes(t *testing.T) {
 	a, _ := newStackPair(t, 1<<20, 1<<20)
 	self := [4]byte{10, 0, 0, 1}
@@ -1306,10 +1181,6 @@ func TestStackSelfDialMeerdereRondes(t *testing.T) {
 	}
 	defer c.Close()
 
-	// Tien rondes: elke ronde ontstaat er tijdens de verwerking van het
-	// binnenkomende frame een uitgaand frame (het antwoord plus zijn ACK), en
-	// dat is precies de situatie waarin een gedeelde wachtrij-array zichzelf
-	// overschrijft.
 	for i := range 10 {
 		c.SetDeadline(time.Now().Add(3 * time.Second))
 		msg := fmt.Appendf(nil, "ronde-%d", i)
@@ -1327,21 +1198,6 @@ func TestStackSelfDialMeerdereRondes(t *testing.T) {
 	}
 }
 
-// TestStackPeerHerstartZelfdeVierTupel bouwt de situatie op het ijzer na: een
-// peer verdwijnt terwijl zijn verbinding openstaat, komt terug als VERSE stack
-// (zelfde IP, zelfde MAC) en belt dezelfde server op dezelfde poort — dus met
-// exact hetzelfde vier-tupel, want elke verse stack begint zijn efemere reeks op
-// 49152.
-//
-// Dat is op HopOS de RÉGEL en niet de uitzondering: HOP herstart een app op
-// hetzelfde slot, dus met hetzelfde IP, en de eerste dial van die app pakt weer
-// 49152. De server weet niets van dat verdwijnen (er is geen keepalive) en
-// challenge-ACKt elke nieuwe SYN op dat tupel (RFC 5961 §4.2). Zonder de reset
-// uit SYN-SENT (RFC 9293 §3.10.7.3) eindigt dat nergens: de nieuwe verbinding
-// komt er nooit, met "i/o timeout" als enige spoor.
-//
-// GEMETEN 12-08 op een LicheeRV: Stulp's attach-poort was voor een herstarte app
-// onbereikbaar terwijl poort 80 van diezelfde Stulp meteen antwoordde.
 func TestStackPeerHerstartZelfdeVierTupel(t *testing.T) {
 	const budget = 1 << 20
 	da, db := &memDevice{}, &memDevice{}
@@ -1399,12 +1255,9 @@ func TestStackPeerHerstartZelfdeVierTupel(t *testing.T) {
 	}
 	port1 := first.LocalAddr().(*net.TCPAddr).Port
 
-	// De peer verdwijnt zoals een kooi verdwijnt: geen FIN, geen RST, niets. Zijn
-	// stack stopt gewoon. De server houdt zijn verbinding dus voor levend.
 	a.Close()
 	<-time.After(50 * time.Millisecond)
 
-	// Hij komt terug als verse stack op hetzelfde adres, met dezelfde MAC.
 	da2 := &memDevice{}
 	da2.peer, db.peer = db, da2
 	a2 := NewStack(da2, cfgA, 999)
@@ -1430,15 +1283,6 @@ func TestStackPeerHerstartZelfdeVierTupel(t *testing.T) {
 	}
 }
 
-// TestStackIdleVerbindingGeeftBuffersTerug — een verbinding die één keer druk was
-// mag zijn gegroeide buffers niet houden. Een gepoolde HTTP-verbinding sluit niet,
-// en MaxBufPerConn is Budget/4: vier zulke verbindingen en de pot is leeg, waarna
-// leannet élke nieuwe verbinding weigert.
-//
-// GEMETEN 12-08 op een LicheeRV: HOP haalde app-images op (5MB per stuk), liet
-// gepoolde verbindingen achter en gaf daarna op élke dial "buffer budget
-// exhausted". De watchdog vraagt voor zijn levensteken juist een VERSE verbinding
-// naar de agent-poort, dus resette de node zichzelf — twee keer op één avond.
 func TestStackIdleVerbindingGeeftBuffersTerug(t *testing.T) {
 	const budget = 512 << 10
 	a, b := newStackPair(t, budget, budget)
@@ -1464,7 +1308,6 @@ func TestStackIdleVerbindingGeeftBuffersTerug(t *testing.T) {
 	srv := <-server
 	defer srv.Close()
 
-	// Genoeg door de verbinding duwen dat beide kanten groeien.
 	payload := make([]byte, 300<<10)
 	for i := range payload {
 		payload[i] = byte(i)
@@ -1493,10 +1336,6 @@ func TestStackIdleVerbindingGeeftBuffersTerug(t *testing.T) {
 		t.Fatal("data kwam beschadigd aan")
 	}
 
-	// Beide kanten zijn nu bij: de zender heeft alles bevestigd gekregen, de
-	// ontvanger heeft alles opgehaald. Wat er nog vast staat, staat vast voor
-	// niets. De marge is één floor-verbinding: de ringen mogen op hun vloer
-	// staan, niet op hun piek.
 	const slack = tcpFloorRing
 	deadline := time.Now().Add(5 * time.Second)
 	for {
@@ -1512,7 +1351,6 @@ func TestStackIdleVerbindingGeeftBuffersTerug(t *testing.T) {
 		time.Sleep(20 * time.Millisecond)
 	}
 
-	// En hij moet daarna nog gewoon werken: krimpen mag geen verbinding slopen.
 	if _, err := srv.Write([]byte("terug")); err != nil {
 		t.Fatalf("schrijven na krimp: %v", err)
 	}
@@ -1526,11 +1364,6 @@ func TestStackIdleVerbindingGeeftBuffersTerug(t *testing.T) {
 	}
 }
 
-// TestStackRSTOpLosseAckIsKaal — een ACK-segment voor een verbinding die niet
-// bestaat krijgt <SEQ=SEG.ACK><CTL=RST>, zónder ACK-vlag (RFC 9293 §3.10.7.1):
-// er is geen sequence-ruimte van de peer om te bevestigen, en een RST|ACK met
-// ack=0 wordt door een strikte SYN-SENT-peer juist wéggegooid — die eist
-// ack == iss+1 (review 13-08).
 func TestStackRSTOpLosseAckIsKaal(t *testing.T) {
 	dev, capture := &memDevice{}, &memDevice{}
 	dev.peer, capture.peer = capture, dev
@@ -1539,15 +1372,13 @@ func TestStackRSTOpLosseAckIsKaal(t *testing.T) {
 		Budget: 1 << 20,
 	}, 1)
 	defer s.Close()
-	// De afzender als statische buur, zodat de RST direct te routeren is.
+
 	if err := s.SeedNeighbor([4]byte{10, 0, 0, 1}, [6]byte{2, 0, 0, 0, 0, 1}); err != nil {
 		t.Fatal(err)
 	}
 
-	// Frame van 10.0.0.1:5555 → 10.0.0.2:7 (geen listener, geen verbinding),
-	// ACK gezet met ack=777.
 	frame := make([]byte, 256)
-	copy(frame[0:6], []byte{2, 0, 0, 0, 0, 2}) // dst = de stack
+	copy(frame[0:6], []byte{2, 0, 0, 0, 0, 2})
 	copy(frame[6:12], []byte{2, 0, 0, 0, 0, 1})
 	frame[12], frame[13] = 0x08, 0x00
 	src, dst := [4]byte{10, 0, 0, 1}, [4]byte{10, 0, 0, 2}
@@ -1562,7 +1393,6 @@ func TestStackRSTOpLosseAckIsKaal(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// De pomp verstuurt de RST; vang hem op de draad.
 	buf := make([]byte, 256)
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
@@ -1573,7 +1403,7 @@ func TestStackRSTOpLosseAckIsKaal(t *testing.T) {
 		}
 		eth, err := ParseEth(buf[:n])
 		if err != nil || eth.EtherType() != EtherTypeIPv4 {
-			continue // ARP of rommel: overslaan
+			continue
 		}
 		ip, err := ParseIPv4(eth.Payload())
 		if err != nil || ip.Proto() != ProtoTCP {
@@ -1597,17 +1427,12 @@ func TestStackRSTOpLosseAckIsKaal(t *testing.T) {
 	t.Fatal("geen RST gezien op de draad")
 }
 
-// TestStackZonderGatewayFaaltMeteen — een bestemming buiten het subnet zonder
-// gateway (statisch noch geconfigureerd) is een antwoord, geen wachttijd:
-// routeLocked start dan nooit een ARP-query, dus arp.noAnswer zou nooit waar
-// worden en een dial zat zijn volle deadline uit op een fout die bij de eerste
-// blik vaststond (review 13-08). Zelfde regel voor UDP.
 func TestStackZonderGatewayFaaltMeteen(t *testing.T) {
 	dev, capture := &memDevice{}, &memDevice{}
 	dev.peer, capture.peer = capture, dev
 	s := NewStack(dev, Config{
 		IP: [4]byte{10, 0, 0, 1}, Prefix: 24, MAC: [6]byte{2, 0, 0, 0, 0, 1},
-		Budget: 1 << 20, // GW bewust leeg
+		Budget: 1 << 20,
 	}, 1)
 	defer s.Close()
 
@@ -1640,10 +1465,6 @@ func TestStackZonderGatewayFaaltMeteen(t *testing.T) {
 	}
 }
 
-// TestSockCloseDeblokkeerRead — het net.Conn-contract: Close moet een
-// geblokkeerde Read wakker maken én laten falen. Vóór deze fix werd de Read wel
-// gewekt (notify) maar ging hij opnieuw wachten zolang de peer geen FIN stuurde
-// (review 13-08).
 func TestSockCloseDeblokkeerRead(t *testing.T) {
 	a, b := newStackPair(t, 1<<20, 1<<20)
 	l, err := b.Listen(90)
@@ -1655,7 +1476,7 @@ func TestSockCloseDeblokkeerRead(t *testing.T) {
 		c, err := l.Accept()
 		if err == nil {
 			defer c.Close()
-			time.Sleep(5 * time.Second) // stuurt nooit iets, sluit niet
+			time.Sleep(5 * time.Second)
 		}
 	}()
 	conn, err := a.DialTCP([4]byte{10, 0, 0, 2}, 90, time.Now().Add(5*time.Second))
@@ -1666,10 +1487,10 @@ func TestSockCloseDeblokkeerRead(t *testing.T) {
 	got := make(chan error, 1)
 	go func() {
 		buf := make([]byte, 16)
-		_, err := conn.Read(buf) // blokkeert: er komt nooit data
+		_, err := conn.Read(buf)
 		got <- err
 	}()
-	time.Sleep(50 * time.Millisecond) // de Read staat nu echt te wachten
+	time.Sleep(50 * time.Millisecond)
 	conn.Close()
 	select {
 	case err := <-got:
@@ -1681,9 +1502,6 @@ func TestSockCloseDeblokkeerRead(t *testing.T) {
 	}
 }
 
-// TestSockDeadlineRaaktLopendeRead — een deadline die ná de Read gezet wordt
-// moet die Read alsnog afbreken; vóór de fix pakte alleen een vólgende call de
-// nieuwe deadline (review 13-08).
 func TestSockDeadlineRaaktLopendeRead(t *testing.T) {
 	a, b := newStackPair(t, 1<<20, 1<<20)
 	l, err := b.Listen(91)
@@ -1707,7 +1525,7 @@ func TestSockDeadlineRaaktLopendeRead(t *testing.T) {
 	got := make(chan error, 1)
 	go func() {
 		buf := make([]byte, 16)
-		_, err := conn.Read(buf) // blokkeert zonder deadline
+		_, err := conn.Read(buf)
 		got <- err
 	}()
 	time.Sleep(50 * time.Millisecond)
@@ -1723,10 +1541,6 @@ func TestSockDeadlineRaaktLopendeRead(t *testing.T) {
 	}
 }
 
-// TestStackCloseSluitAlles — Stack.Close is de hele publieke stack: een
-// geblokkeerde Accept en ReadFrom keren terug, verbindingen worden gereapt en
-// het budget komt integraal terug. Vóór de fix bleef Accept eeuwig hangen en
-// hielden conns en UDP-wachtrijen hun budget vast (review 13-08).
 func TestStackCloseSluitAlles(t *testing.T) {
 	const budget = 1 << 20
 	a, b := newStackPair(t, budget, budget)
@@ -1755,13 +1569,13 @@ func TestStackCloseSluitAlles(t *testing.T) {
 		_, _, err := u.ReadFrom(buf)
 		readErr <- err
 	}()
-	// Eén levende verbinding, zodat er echt iets te reapen valt.
+
 	conn, err := a.DialTCP([4]byte{10, 0, 0, 2}, 90, time.Now().Add(5*time.Second))
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer conn.Close()
-	time.Sleep(50 * time.Millisecond) // Accept- en ReadFrom-goroutines staan nu te wachten
+	time.Sleep(50 * time.Millisecond)
 
 	b.Close()
 
@@ -1783,10 +1597,6 @@ func TestStackCloseSluitAlles(t *testing.T) {
 	}
 }
 
-// TestStackListenerCloseRuimtEmbryosOp — een listener die dichtgaat laat geen
-// halve handshakes achter: het embryo (SYN binnen, SYN|ACK uit, geen slot-ACK)
-// wijst naar een deur die niet meer bestaat en zat vóór de fix zijn hele
-// backoff uit mét floor-budget (review 13-08).
 func TestStackListenerCloseRuimtEmbryosOp(t *testing.T) {
 	dev, capture := &memDevice{}, &memDevice{}
 	dev.peer, capture.peer = capture, dev
@@ -1800,7 +1610,6 @@ func TestStackListenerCloseRuimtEmbryosOp(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Een kale SYN, met de hand: er komt nooit een voltooiende ACK.
 	frame := make([]byte, 256)
 	copy(frame[0:6], []byte{2, 0, 0, 0, 0, 2})
 	copy(frame[6:12], []byte{2, 0, 0, 0, 0, 1})
@@ -1832,9 +1641,6 @@ func TestStackListenerCloseRuimtEmbryosOp(t *testing.T) {
 	}
 }
 
-// TestTCPFinWait2Timeout — een peer die onze FIN bevestigt maar zelf nooit
-// sluit, hield de verbinding (en haar floor-budget) vóór de fix onbeperkt vast:
-// FIN-WAIT-2 had geen deadline (review 13-08).
 func TestTCPFinWait2Timeout(t *testing.T) {
 	w := newTCPPair(t, 8<<10, 8<<10)
 	w.connect()
@@ -1842,7 +1648,7 @@ func TestTCPFinWait2Timeout(t *testing.T) {
 	if err := w.a.close(); err != nil {
 		t.Fatal(err)
 	}
-	w.pump() // FIN eruit, ACK terug — b sluit bewust niet
+	w.pump()
 	if w.a.state != tcpFinWait2 {
 		t.Fatalf("a is %s, wil FIN-WAIT-2", w.a.state)
 	}
@@ -1863,9 +1669,6 @@ func TestTCPFinWait2Timeout(t *testing.T) {
 	}
 }
 
-// TestStackDialAnnuleerbaar — een dial via net.DialContext hoort op de
-// cancel terug te keren, niet pas op zijn deadline. Vóór de fix keek de
-// wachtlus alleen naar de deadline (review 13-08).
 func TestStackDialAnnuleerbaar(t *testing.T) {
 	dev, capture := &memDevice{}, &memDevice{}
 	dev.peer, capture.peer = capture, dev
@@ -1878,7 +1681,7 @@ func TestStackDialAnnuleerbaar(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	got := make(chan error, 1)
 	go func() {
-		// Een buur die nooit antwoordt: de ARP-machine gaat er ~5s over doen.
+
 		_, err := s.Socket(ctx, "tcp", afINET, sockSTREAM, nil,
 			&net.TCPAddr{IP: net.IP{10, 0, 0, 99}, Port: 80})
 		got <- err
@@ -1897,7 +1700,7 @@ func TestStackDialAnnuleerbaar(t *testing.T) {
 	case <-time.After(3 * time.Second):
 		t.Fatal("dial negeerde de cancel volledig")
 	}
-	// De halve verbinding is opgeruimd, budget terug.
+
 	s.mu.Lock()
 	used, conns := s.pot.used, len(s.conns)
 	s.mu.Unlock()
@@ -1906,10 +1709,6 @@ func TestStackDialAnnuleerbaar(t *testing.T) {
 	}
 }
 
-// TestSockStaartLezenDanSluiten — de leesbare staart van een half-gesloten
-// peer leeft in CLOSE-WAIT (vóór reap) en blijft leesbaar; ná de eigen Close
-// wordt de verbinding gereapt en is het budget én de echte buffer weg, ook al
-// houdt de aanroeper de socket nog vast (review 13-08, L9).
 func TestSockStaartLezenDanSluiten(t *testing.T) {
 	a, b := newStackPair(t, 1<<20, 1<<20)
 	l, err := b.Listen(90)
@@ -1933,7 +1732,7 @@ func TestSockStaartLezenDanSluiten(t *testing.T) {
 	if _, err := srv.Write([]byte("staart")); err != nil {
 		t.Fatal(err)
 	}
-	srv.Close() // FIN; a leest pas hierna — CLOSE-WAIT bewaart de staart
+	srv.Close()
 
 	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
 	buf := make([]byte, 64)
@@ -1945,7 +1744,7 @@ func TestSockStaartLezenDanSluiten(t *testing.T) {
 		t.Fatalf("read na de staart gaf %v, wil io.EOF", err)
 	}
 
-	conn.Close() // volle sluiting: LAST-ACK → closed → reap
+	conn.Close()
 	deadline := time.Now().Add(5 * time.Second)
 	for {
 		a.mu.Lock()
@@ -1959,8 +1758,7 @@ func TestSockStaartLezenDanSluiten(t *testing.T) {
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	// De aanroeper houdt de socket nog vast, maar de échte bytes zijn los:
-	// géén tweede budget aan dood geheugen.
+
 	sock := conn.(*tcpSock)
 	if sock.c.tcp.rx.size() != 0 || sock.c.tcp.tx.size() != 0 {
 		t.Fatalf("gereapte verbinding draagt nog buffers (rx %d, tx %d)",
@@ -1968,11 +1766,6 @@ func TestSockStaartLezenDanSluiten(t *testing.T) {
 	}
 }
 
-// TestStackReapWektGeblokkeerdeRead — een verbinding die via een TIMER sterft
-// (opgave, FIN-WAIT-2-verval) wordt door de pomp gereapt; zonder notify in
-// reap bleef een Read zonder deadline wachten tot toevallig ander verkeer
-// langskwam (review 13-08, tweede ronde). De abort+reap hieronder is exact wat
-// het timer-pad doet.
 func TestStackReapWektGeblokkeerdeRead(t *testing.T) {
 	a, b := newStackPair(t, 1<<20, 1<<20)
 	l, err := b.Listen(90)
@@ -2017,10 +1810,6 @@ func TestStackReapWektGeblokkeerdeRead(t *testing.T) {
 	}
 }
 
-// TestStackRouteDoodBreektDeVerbinding — als ARP mid-verbinding luid opgeeft,
-// bevroor de verbinding vóór de fix voorgoed: emitWire werd overgeslagen, dus
-// de retransmissietimer telde nooit door (review 13-08, tweede ronde). Duur:
-// ~5s (de vijf ARP-pogingen).
 func TestStackRouteDoodBreektDeVerbinding(t *testing.T) {
 	a, b := newStackPair(t, 1<<20, 1<<20)
 	l, err := b.Listen(90)
@@ -2041,12 +1830,8 @@ func TestStackRouteDoodBreektDeVerbinding(t *testing.T) {
 	}
 	defer conn.Close()
 
-	// Eerst de handshake volledig laten settelen: blijft a's laatste ACK in
-	// de blackhole hangen, dan hertransmit b zijn SYN|ACK en LEERT a's
-	// ARP-tabel het adres passief opnieuw (b→a-verkeer) — dan test dit de
-	// TCP-opgave-ladder i.p.v. de route-dood.
 	time.Sleep(100 * time.Millisecond)
-	// De peer verdwijnt van het net: ARP-entry weg en béide richtingen dood.
+
 	a.mu.Lock()
 	a.dev.(*memDevice).peer = &memDevice{}
 	delete(a.arp.entries, [4]byte{10, 0, 0, 2})
@@ -2056,7 +1841,7 @@ func TestStackRouteDoodBreektDeVerbinding(t *testing.T) {
 	b.mu.Unlock()
 
 	if _, err := conn.Write([]byte("de leegte in")); err != nil {
-		t.Fatal(err) // de write zelf slaagt: hij vult de ring
+		t.Fatal(err)
 	}
 	conn.SetReadDeadline(time.Now().Add(15 * time.Second))
 	buf := make([]byte, 16)
@@ -2070,22 +1855,18 @@ func TestStackRouteDoodBreektDeVerbinding(t *testing.T) {
 	}
 }
 
-// TestStackAcceptNaCloseGeeftNooitEenVerbinding — de backlog-referenties
-// bleven bij Stack.Close in het kanaal staan, en Accept select't over backlog
-// én done: een Accept ná Close kon dus willekeurig een al gereapte (dode)
-// verbinding teruggeven (review 13-08, tweede ronde).
 func TestStackAcceptNaCloseGeeftNooitEenVerbinding(t *testing.T) {
 	a, b := newStackPair(t, 1<<20, 1<<20)
 	l, err := b.Listen(90)
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Eén voltooide handshake die niemand accepteert: die staat in de backlog.
+
 	if _, err := a.DialTCP([4]byte{10, 0, 0, 2}, 90, time.Now().Add(5*time.Second)); err != nil {
 		t.Fatal(err)
 	}
 	b.Close()
-	for i := 0; i < 32; i++ { // het select-muntje mag nooit verkeerd vallen
+	for i := 0; i < 32; i++ {
 		c, err := l.Accept()
 		if err == nil {
 			t.Fatalf("Accept #%d gaf een verbinding ná Stack.Close (%v)", i, c.RemoteAddr())
@@ -2096,9 +1877,6 @@ func TestStackAcceptNaCloseGeeftNooitEenVerbinding(t *testing.T) {
 	}
 }
 
-// TestStackSynRstMaaktGeenVerbinding — de stack-poort op het SYN-pad kende
-// geen RST-toets; samen met de machine-guard (Has-maskerfout) maakte een
-// SYN|RST zo een embryo mét floor-budget (review 13-08, vijfde ronde).
 func TestStackSynRstMaaktGeenVerbinding(t *testing.T) {
 	dev, capture := &memDevice{}, &memDevice{}
 	dev.peer, capture.peer = capture, dev
@@ -2137,17 +1915,12 @@ func TestStackSynRstMaaktGeenVerbinding(t *testing.T) {
 	}
 }
 
-// TestStackOffSubnetEmbryoSterft — een inbound SYN van een peer buiten het
-// subnet zónder gateway maakte een embryo waarvan de timer nooit gewapend werd
-// (emit draait niet zonder route): een 20KiB-zombie per SYN, tot de pot leeg
-// was. Het route-dood-vangnet dekt nu ook hop == 0.0.0.0 (review 13-08,
-// vijfde ronde).
 func TestStackOffSubnetEmbryoSterft(t *testing.T) {
 	dev, capture := &memDevice{}, &memDevice{}
 	dev.peer, capture.peer = capture, dev
 	s := NewStack(dev, Config{
 		IP: [4]byte{10, 0, 0, 2}, Prefix: 24, MAC: [6]byte{2, 0, 0, 0, 0, 2},
-		Budget: 1 << 20, // GW bewust leeg
+		Budget: 1 << 20,
 	}, 1)
 	defer s.Close()
 	l, err := s.Listen(90)
@@ -2160,7 +1933,7 @@ func TestStackOffSubnetEmbryoSterft(t *testing.T) {
 	copy(frame[0:6], []byte{2, 0, 0, 0, 0, 2})
 	copy(frame[6:12], []byte{2, 0, 0, 0, 0, 9})
 	frame[12], frame[13] = 0x08, 0x00
-	src, dst := [4]byte{192, 168, 1, 9}, [4]byte{10, 0, 0, 2} // buiten het subnet
+	src, dst := [4]byte{192, 168, 1, 9}, [4]byte{10, 0, 0, 2}
 	n, err := PutTCP(frame[EthernetHeaderSize+sizeIPv4:], 49152, 90, 7000, 0,
 		FlagSYN, 1024, nil, src, dst, 0)
 	if err != nil {
@@ -2187,10 +1960,6 @@ func TestStackOffSubnetEmbryoSterft(t *testing.T) {
 	}
 }
 
-// TestStackDialZegtNoRouteNietTimeout — de pomp kan de ARP-opgave als eerste
-// zien en de verbinding aborten; de dial-waiter las dan "connect timed out"
-// waar "no route to host" hoort — het soort verkeerd-wijzende fout dat op
-// 12-08 vijf lagen zoeken kostte (review 13-08, vijfde ronde).
 func TestStackDialZegtNoRouteNietTimeout(t *testing.T) {
 	dev, capture := &memDevice{}, &memDevice{}
 	dev.peer, capture.peer = capture, dev
@@ -2200,8 +1969,6 @@ func TestStackDialZegtNoRouteNietTimeout(t *testing.T) {
 	}, 1)
 	defer s.Close()
 
-	// In-subnet buur die nooit op ARP antwoordt; ruime deadline zodat de
-	// ARP-opgave (±5s) ruim vóór de deadline valt.
 	_, err := s.DialTCP([4]byte{10, 0, 0, 99}, 80, time.Now().Add(20*time.Second))
 	if err == nil {
 		t.Fatal("dial naar een dode buur slaagde")
@@ -2211,12 +1978,6 @@ func TestStackDialZegtNoRouteNietTimeout(t *testing.T) {
 	}
 }
 
-// TestStackVolleLoopbackIsGeenSucces — een schrijver naar het eigen adres op
-// een volle loopback-wachtrij meldde stil succes, en UDP heeft geen
-// retransmissie die dat later goedmaakt (review 13-08, vijfde ronde).
-// Rechtstreeks op sendEthLocked, onder het slot: de pomp draint de wachtrij
-// zodra hij mag, dus een socket-level-vorm racet met zijn eigen opstelling
-// (gemeten als flake onder -race).
 func TestStackVolleLoopbackIsGeenSucces(t *testing.T) {
 	dev, capture := &memDevice{}, &memDevice{}
 	dev.peer, capture.peer = capture, dev
@@ -2231,7 +1992,7 @@ func TestStackVolleLoopbackIsGeenSucces(t *testing.T) {
 		s.loopback = append(s.loopback, []byte{0})
 	}
 	drops := s.stats.DropReplyFull
-	err := s.sendEthLocked(s.cfg.MAC, EtherTypeIPv4, 32) // naar onszelf: loopback
+	err := s.sendEthLocked(s.cfg.MAC, EtherTypeIPv4, 32)
 	gotDrops := s.stats.DropReplyFull
 	s.mu.Unlock()
 
@@ -2243,12 +2004,6 @@ func TestStackVolleLoopbackIsGeenSucces(t *testing.T) {
 	}
 }
 
-// TestSockDeadlineVerlengenEnWissen — het net.Conn-contract in de andere
-// richting: een verlengde of gewiste deadline moet lopende I/O óók bereiken.
-// Set*Deadline wekt bewust niet bij verruimen (de notify-storm), dus await
-// herkeurt de actuele deadline op het moment dat de oude timer afloopt — vóór
-// die herkeuring liep een Read af op een deadline die allang gewist was
-// (review 13-08, zevende ronde).
 func TestSockDeadlineVerlengenEnWissen(t *testing.T) {
 	a, b := newStackPair(t, 1<<20, 1<<20)
 	l, err := b.Listen(90)
@@ -2277,15 +2032,15 @@ func TestSockDeadlineVerlengenEnWissen(t *testing.T) {
 		got <- err
 	}()
 	time.Sleep(50 * time.Millisecond)
-	conn.SetReadDeadline(time.Time{}) // gewist: de Read hoort dóór te wachten
+	conn.SetReadDeadline(time.Time{})
 
 	select {
 	case err := <-got:
 		t.Fatalf("Read keerde terug (%v) op een deadline die gewist was", err)
-	case <-time.After(400 * time.Millisecond): // ruim voorbij de oude 150ms
+	case <-time.After(400 * time.Millisecond):
 	}
 
-	conn.SetReadDeadline(time.Now().Add(50 * time.Millisecond)) // vervroegd: wekt wél
+	conn.SetReadDeadline(time.Now().Add(50 * time.Millisecond))
 	select {
 	case err := <-got:
 		var ne net.Error
@@ -2297,10 +2052,6 @@ func TestSockDeadlineVerlengenEnWissen(t *testing.T) {
 	}
 }
 
-// TestStackCtxDeadlineGeeftContextfout — rond een context-deadline raceten de
-// eigen timer en ctx.Done(), en wie won bepaalde of de aanroeper
-// os.ErrDeadlineExceeded of context.Canceled zag; context.DeadlineExceeded is
-// het verwachte, stabiele antwoord (review 13-08, negende ronde).
 func TestStackCtxDeadlineGeeftContextfout(t *testing.T) {
 	dev, capture := &memDevice{}, &memDevice{}
 	dev.peer, capture.peer = capture, dev
@@ -2310,7 +2061,7 @@ func TestStackCtxDeadlineGeeftContextfout(t *testing.T) {
 	}, 1)
 	defer s.Close()
 
-	for i := 0; i < 8; i++ { // de race is per definitie een muntworp: vaak gooien
+	for i := 0; i < 8; i++ {
 		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Millisecond)
 		_, err := s.Socket(ctx, "tcp", afINET, sockSTREAM, nil,
 			&net.TCPAddr{IP: net.IP{10, 0, 0, 99}, Port: 80})
@@ -2324,10 +2075,6 @@ func TestStackCtxDeadlineGeeftContextfout(t *testing.T) {
 	}
 }
 
-// TestStackRSTAckTeltSegLen — de ACK op een geweigerd niet-ACK-segment is
-// SEG.SEQ + SEG.LEN, en SEG.LEN telt alleen SYN/FIN als extra plek: de vaste
-// +1 was bij kale data één te hoog en bij SYN|FIN één te laag (review 13-08,
-// negende ronde).
 func TestStackRSTAckTeltSegLen(t *testing.T) {
 	dev, capture := &memDevice{}, &memDevice{}
 	dev.peer, capture.peer = capture, dev
@@ -2389,16 +2136,12 @@ func TestStackRSTAckTeltSegLen(t *testing.T) {
 		t.Fatal("geen RST gezien")
 	}
 
-	send(0, []byte("data"), 100) // kale data, geen vlaggen: SEG.LEN = 4
+	send(0, []byte("data"), 100)
 	expectAck(104)
-	send(FlagSYN|FlagFIN, nil, 200) // SYN|FIN: SEG.LEN = 2
+	send(FlagSYN|FlagFIN, nil, 200)
 	expectAck(202)
 }
 
-// TestARPLeerplafond — passief leren is gratis voor de afzender: zonder cap
-// vulde een stroom frames met gespoofde bron-IP's de tabel onbegrensd, en op
-// een node van 64MB is een onbegrensde map een DoS (review 13-08, dertiende
-// ronde).
 func TestARPLeerplafond(t *testing.T) {
 	tab := newARPTable([4]byte{10, 0, 0, 1}, [6]byte{2, 0, 0, 0, 0, 1})
 	for i := 0; i < 2*arpCacheCap; i++ {
@@ -2412,9 +2155,6 @@ func TestARPLeerplafond(t *testing.T) {
 	}
 }
 
-// TestARPResolveVerdringtGeleerd — een actieve resolve (iemand wíl dit adres)
-// gaat vóór een passief bewaard antwoord: vol=vol geldt voor leren, niet voor
-// wie het adres echt nodig heeft (review 13-08, dertiende ronde).
 func TestARPResolveVerdringtGeleerd(t *testing.T) {
 	tab := newARPTable([4]byte{10, 0, 0, 1}, [6]byte{2, 0, 0, 0, 0, 1})
 	for i := 0; len(tab.entries) < arpCacheCap && i < 4*arpCacheCap; i++ {
@@ -2432,10 +2172,6 @@ func TestARPResolveVerdringtGeleerd(t *testing.T) {
 	}
 }
 
-// TestARPKapotteChecksumLeertNiet — het passieve leren zit ná de
-// transportvalidatie: een geldige IP-header met een kapotte TCP-checksum is
-// met één gok te vervalsen en verdient geen cache-plek (review 13-08,
-// dertiende ronde).
 func TestARPKapotteChecksumLeertNiet(t *testing.T) {
 	da, db := &memDevice{}, &memDevice{}
 	da.peer, db.peer = db, da
@@ -2456,7 +2192,7 @@ func TestARPKapotteChecksumLeertNiet(t *testing.T) {
 	f.SetEtherType(EtherTypeIPv4)
 	PutTCP(frame[EthernetHeaderSize+sizeIPv4:], 999, 80, 1, 0, FlagSYN, 100, nil,
 		src, [4]byte{10, 0, 0, 1}, 0)
-	frame[EthernetHeaderSize+sizeIPv4+16] ^= 0xff // TCP-checksum kapot
+	frame[EthernetHeaderSize+sizeIPv4+16] ^= 0xff
 	PutIPv4(frame[EthernetHeaderSize:], ProtoTCP, src, [4]byte{10, 0, 0, 1}, sizeTCP)
 	s.RecvInboundPacket(frame)
 
@@ -2467,7 +2203,6 @@ func TestARPKapotteChecksumLeertNiet(t *testing.T) {
 		t.Fatal("een frame met kapotte TCP-checksum veroverde een ARP-cache-plek")
 	}
 
-	// En exact dezelfde SYN mét kloppende checksum leert wél.
 	PutTCP(frame[EthernetHeaderSize+sizeIPv4:], 999, 80, 1, 0, FlagSYN, 100, nil,
 		src, [4]byte{10, 0, 0, 1}, 0)
 	PutIPv4(frame[EthernetHeaderSize:], ProtoTCP, src, [4]byte{10, 0, 0, 1}, sizeTCP)
@@ -2480,10 +2215,6 @@ func TestARPKapotteChecksumLeertNiet(t *testing.T) {
 	}
 }
 
-// TestReadMetLegeBufferKeertMeteenTerug — net.Conn-contract: een lege read is
-// meteen klaar. Hij kwam in await terecht (tcp.read geeft (0, nil)) en
-// wachtte op verkeer dat er nooit hoeft te komen (review 13-08, dertiende
-// ronde).
 func TestReadMetLegeBufferKeertMeteenTerug(t *testing.T) {
 	a, b := newStackPair(t, 1<<20, 1<<20)
 	l, err := b.Listen(91)
@@ -2494,7 +2225,7 @@ func TestReadMetLegeBufferKeertMeteenTerug(t *testing.T) {
 	go func() {
 		if c, err := l.Accept(); err == nil {
 			defer c.Close()
-			time.Sleep(2 * time.Second) // stuurt niets
+			time.Sleep(2 * time.Second)
 		}
 	}()
 	conn, err := a.DialTCP([4]byte{10, 0, 0, 2}, 91, time.Now().Add(5*time.Second))
@@ -2521,12 +2252,6 @@ func TestReadMetLegeBufferKeertMeteenTerug(t *testing.T) {
 	}
 }
 
-// TestRefuseRSTStartGeenARPQuery — het best-effort-uitvoerpad (RST op een
-// gesloten poort, echo-reply) raadpleegt de ARP-cache alleen nog (peek): een
-// actieve query starten liet élke gespoofde SYN een echte cache-plek
-// verdringen, tot de hele tabel uit pending spoof-queries bestond en een
-// legitieme resolve moest wachten op retries/verval (review 13-08, vijftiende
-// ronde).
 func TestRefuseRSTStartGeenARPQuery(t *testing.T) {
 	da, db := &memDevice{}, &memDevice{}
 	da.peer, db.peer = db, da
@@ -2536,9 +2261,6 @@ func TestRefuseRSTStartGeenARPQuery(t *testing.T) {
 	}, 7)
 	t.Cleanup(s.Close)
 
-	// De tabel vol met passief geleerde buren (allemaal vers, niets verlopen).
-	// Alles BINNEN het /24: buiten het subnet beslist de gateway-route al en
-	// komt er nooit een resolve (dat maskeerde de eerste versie van deze test).
 	s.mu.Lock()
 	now := s.now()
 	for i := 2; len(s.arp.entries) < arpCacheCap; i++ {
@@ -2546,7 +2268,6 @@ func TestRefuseRSTStartGeenARPQuery(t *testing.T) {
 	}
 	s.mu.Unlock()
 
-	// Een geldige SYN naar een gesloten poort, van een verse (gespoofde) bron.
 	src := [4]byte{10, 0, 0, 200}
 	frame := make([]byte, EthernetHeaderSize+sizeIPv4+sizeTCP)
 	f, _ := ParseEth(frame)
@@ -2557,7 +2278,7 @@ func TestRefuseRSTStartGeenARPQuery(t *testing.T) {
 		src, [4]byte{10, 0, 0, 1}, 0)
 	PutIPv4(frame[EthernetHeaderSize:], ProtoTCP, src, [4]byte{10, 0, 0, 1}, sizeTCP)
 	s.RecvInboundPacket(frame)
-	time.Sleep(50 * time.Millisecond) // de pomp bezorgt de RST best-effort
+	time.Sleep(50 * time.Millisecond)
 
 	s.mu.Lock()
 	_, exists := s.arp.entries[src]
@@ -2573,11 +2294,6 @@ func TestRefuseRSTStartGeenARPQuery(t *testing.T) {
 	}
 }
 
-// TestRefuseRSTNaarGatewayStartWelEenQuery — de peek-regel geldt niet voor de
-// gateway: dat IP komt uit de config, niet uit het pakket, dus een spoofer
-// kan er nooit méér dan die ene entry mee laten bestaan — en zonder query
-// verdampte een refuse-RST naar een off-subnet peer stil op een verse node
-// die nog nooit uitbelde (review 13-08, zestiende ronde).
 func TestRefuseRSTNaarGatewayStartWelEenQuery(t *testing.T) {
 	da, db := &memDevice{}, &memDevice{}
 	da.peer, db.peer = db, da
@@ -2588,8 +2304,6 @@ func TestRefuseRSTNaarGatewayStartWelEenQuery(t *testing.T) {
 	}, 7)
 	t.Cleanup(s.Close)
 
-	// Een geldige SYN van een off-subnet bron (via de router binnengekomen)
-	// naar een gesloten poort: de RST terug moet via de gateway.
 	src := [4]byte{192, 168, 1, 5}
 	frame := make([]byte, EthernetHeaderSize+sizeIPv4+sizeTCP)
 	f, _ := ParseEth(frame)
@@ -2610,9 +2324,6 @@ func TestRefuseRSTNaarGatewayStartWelEenQuery(t *testing.T) {
 	}
 }
 
-// TestSocketWeigertOngeldigRemoteAdres — een niet-nil maar onbruikbaar
-// remote-adres (IPv6 op een v4-stack) werd stil een LISTENER; een dial die
-// faalt hoort (nil, err) te geven (review 13-08, vijfentwintigste ronde).
 func TestSocketWeigertOngeldigRemoteAdres(t *testing.T) {
 	da, db := &memDevice{}, &memDevice{}
 	da.peer, db.peer = db, da
@@ -2628,9 +2339,6 @@ func TestSocketWeigertOngeldigRemoteAdres(t *testing.T) {
 	}
 }
 
-// TestConnectedUDPFiltertBijDeliver — vreemde afzenders vielen pas in
-// ReadFrom af en konden intussen de hele wachtrij vullen, de echte peer
-// verdringend (review 13-08, vijfentwintigste ronde).
 func TestConnectedUDPFiltertBijDeliver(t *testing.T) {
 	da, db := &memDevice{}, &memDevice{}
 	da.peer, db.peer = db, da
@@ -2645,7 +2353,6 @@ func TestConnectedUDPFiltertBijDeliver(t *testing.T) {
 	}
 	defer u.Close()
 
-	// Een spoofer probeert de wachtrij te vullen; daarna komt de echte peer.
 	s.mu.Lock()
 	spoofed := 0
 	for i := 0; i < 1000; i++ {
@@ -2663,10 +2370,6 @@ func TestConnectedUDPFiltertBijDeliver(t *testing.T) {
 	}
 }
 
-// TestAcceptZietSnelleSluiter — de derde handshake-ACK kan data én FIN
-// dragen: de verbinding schiet dan in één recv door ESTABLISHED naar
-// CLOSE-WAIT, en de handoff op exact ESTABLISHED liet Accept eeuwig wachten
-// mét hangend floorbudget (review 13-08, zevenentwintigste ronde).
 func TestAcceptZietSnelleSluiter(t *testing.T) {
 	da, db := &memDevice{}, &memDevice{}
 	da.peer, db.peer = db, da
@@ -2681,7 +2384,6 @@ func TestAcceptZietSnelleSluiter(t *testing.T) {
 	}
 	defer l.Close()
 
-	// Een embryo dat al voorbij ESTABLISHED is als de handoff hem ziet.
 	c := &sconn{listener: l.(*tcpListener)}
 	c.tcp.state = tcpCloseWait
 	s.mu.Lock()
@@ -2703,9 +2405,6 @@ func TestAcceptZietSnelleSluiter(t *testing.T) {
 	}
 }
 
-// TestJumboFrameWordtGeweigerd — een frame boven MTU+ethernet kan verderop
-// een reply bouwen die groter is dan txBuf en de pomp laten panicken; de
-// maatwacht zit aan de deur (review 13-08, zevenentwintigste ronde).
 func TestJumboFrameWordtGeweigerd(t *testing.T) {
 	da, db := &memDevice{}, &memDevice{}
 	da.peer, db.peer = db, da
@@ -2721,10 +2420,6 @@ func TestJumboFrameWordtGeweigerd(t *testing.T) {
 	}
 }
 
-// TestReadWeigertNaVerstrekenDeadline — een verstreken deadline hoort ÉLKE
-// operatie meteen te weigeren, ook met data in de wachtrij: de toets zat ná
-// het gereed-I/O-pad, dus gequeue'de data werd na de deadline nog geleverd
-// (review 13-08, achtentwintigste ronde).
 func TestReadWeigertNaVerstrekenDeadline(t *testing.T) {
 	a, b := newStackPair(t, 1<<20, 1<<20)
 	l, err := b.Listen(92)
@@ -2734,7 +2429,7 @@ func TestReadWeigertNaVerstrekenDeadline(t *testing.T) {
 	defer l.Close()
 	go func() {
 		if c, err := l.Accept(); err == nil {
-			c.Write([]byte("wachtend")) // data staat klaar in a's ring
+			c.Write([]byte("wachtend"))
 			time.Sleep(2 * time.Second)
 			c.Close()
 		}
@@ -2744,7 +2439,7 @@ func TestReadWeigertNaVerstrekenDeadline(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer conn.Close()
-	time.Sleep(200 * time.Millisecond) // de data is bezorgd
+	time.Sleep(200 * time.Millisecond)
 	conn.SetReadDeadline(time.Now().Add(-time.Second))
 	buf := make([]byte, 16)
 	if n, err := conn.Read(buf); err == nil {
@@ -2752,18 +2447,14 @@ func TestReadWeigertNaVerstrekenDeadline(t *testing.T) {
 	}
 }
 
-// TestUDPSchrijverWordtGewektBijARPOpgave — de pending→failed-overgang
-// gebeurde in de drain zonder notify: een UDP-writer die op noAnswer pollt
-// hoorde pas bij zijn eigen deadline dat de route dood was (review 13-08,
-// achtentwintigste ronde).
 func TestUDPSchrijverWordtGewektBijARPOpgave(t *testing.T) {
 	a, _ := newStackPair(t, 1<<20, 1<<20)
-	u, err := a.DialUDP([4]byte{10, 0, 0, 99}, 53) // niemand thuis: ARP geeft na ~5s op
+	u, err := a.DialUDP([4]byte{10, 0, 0, 99}, 53)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer u.Close()
-	u.SetWriteDeadline(time.Now().Add(30 * time.Second)) // ruim: de wek moet éérder komen
+	u.SetWriteDeadline(time.Now().Add(30 * time.Second))
 	start := time.Now()
 	_, err = u.Write([]byte("hallo"))
 	if err == nil || !errors.Is(err, errUnreachable) {
@@ -2774,9 +2465,6 @@ func TestUDPSchrijverWordtGewektBijARPOpgave(t *testing.T) {
 	}
 }
 
-// TestSocketWeigertOnzinnigePoort — poort 0, negatief of 65536 op een non-nil
-// remote werd via de uint16-conversie een stille listener (review 13-08,
-// achtentwintigste ronde).
 func TestSocketWeigertOnzinnigePoort(t *testing.T) {
 	da, db := &memDevice{}, &memDevice{}
 	da.peer, db.peer = db, da
@@ -2794,11 +2482,6 @@ func TestSocketWeigertOnzinnigePoort(t *testing.T) {
 	}
 }
 
-// TestSocketCloseGeeftRxDirectTerug — de volle close van de socket-laag hoort
-// abandonRead aan te roepen: zonder die bedrading hield een gepoolde/idle-
-// geëvicte verbinding minstens 16KiB RX-budget vast tot de peer sloot of
-// FIN-WAIT-2 na 20s verliep (review 13-08, negenentwintigste ronde — de
-// machinefix bestond, de wiring was in een toggle-herstel gesneuveld).
 func TestSocketCloseGeeftRxDirectTerug(t *testing.T) {
 	a, b := newStackPair(t, 1<<20, 1<<20)
 	l, err := b.Listen(93)
@@ -2809,7 +2492,7 @@ func TestSocketCloseGeeftRxDirectTerug(t *testing.T) {
 	klaar := make(chan struct{})
 	go func() {
 		if c, err := l.Accept(); err == nil {
-			<-klaar // b sluit NIET: a moet zijn budget zelf terugkrijgen
+			<-klaar
 			c.Close()
 		}
 	}()
@@ -2818,7 +2501,7 @@ func TestSocketCloseGeeftRxDirectTerug(t *testing.T) {
 		t.Fatal(err)
 	}
 	conn.Close()
-	time.Sleep(200 * time.Millisecond) // FIN + ACK wisselen; b blijft open
+	time.Sleep(200 * time.Millisecond)
 	a.mu.Lock()
 	used := a.pot.used
 	a.mu.Unlock()
@@ -2828,10 +2511,6 @@ func TestSocketCloseGeeftRxDirectTerug(t *testing.T) {
 	close(klaar)
 }
 
-// TestConnectedUDPWeigertWriteTo — na DialUDP(peerA) is WriteTo naar peerB
-// een zwart gat (replies van B worden bij deliver al weggegooid): het
-// net.UDPConn-contract weigert hem, wij nu ook (review 13-08, dertigste
-// ronde).
 func TestConnectedUDPWeigertWriteTo(t *testing.T) {
 	a, _ := newStackPair(t, 1<<20, 1<<20)
 	u, err := a.DialUDP([4]byte{10, 0, 0, 2}, 53)
@@ -2844,10 +2523,6 @@ func TestConnectedUDPWeigertWriteTo(t *testing.T) {
 	}
 }
 
-// TestSeedNeighborKentEenPlafond — statische seeds omzeilen tick, sweep én
-// verdringing: onbegrensd zaaien kon de tabel vullen waarna resolve geen
-// pending entry meer kwijt kon en een UDP-write zonder deadline permanent
-// sliep (review 13-08, dertigste ronde).
 func TestSeedNeighborKentEenPlafond(t *testing.T) {
 	da, db := &memDevice{}, &memDevice{}
 	da.peer, db.peer = db, da
@@ -2874,9 +2549,6 @@ func TestSeedNeighborKentEenPlafond(t *testing.T) {
 	}
 }
 
-// TestSocketWeigertOngeldigLokaalAdres — een IPv6- of vreemd-type laddr werd
-// stil een wildcard-listener, en een vreemde poort klapte om via uint16
-// (review 13-08, dertigste ronde).
 func TestSocketWeigertOngeldigLokaalAdres(t *testing.T) {
 	da, db := &memDevice{}, &memDevice{}
 	da.peer, db.peer = db, da
@@ -2897,15 +2569,10 @@ func TestSocketWeigertOngeldigLokaalAdres(t *testing.T) {
 	}
 }
 
-// TestARPVolleTabelIsLuid — een resolver wiens query niet eens kán starten
-// (tabel vol met pending/statisch, niets verdringbaars) hoort dat als "geen
-// antwoord" te zien: er komt immers nooit een arpFailed-entry waar noAnswer op
-// zou slaan, dus sliep de wachter tot zijn deadline — of zonder deadline voor
-// altijd (review 13-08, eenendertigste ronde).
 func TestARPVolleTabelIsLuid(t *testing.T) {
 	tbl := newARPTable([4]byte{10, 0, 0, 1}, [6]byte{2, 0, 0, 0, 0, 1})
 	now := int64(time.Hour)
-	// De tabel volpompen met pending queries (allemaal onverdringbaar).
+
 	for i := 0; i < arpCacheCap; i++ {
 		tbl.resolve([4]byte{10, 0, byte(i >> 8), byte(i)}, now)
 	}
@@ -2919,16 +2586,14 @@ func TestARPVolleTabelIsLuid(t *testing.T) {
 	if tbl.cnt.FullDrop == 0 {
 		t.Fatal("de geweigerde resolve is niet geteld (FullDrop)")
 	}
-	// Zodra er iets verdringbaars staat is het geen vol-fout meer: een entry
-	// lost op (wordt verdringbaar) en de nieuwe resolve hoort weer te lopen.
-	tbl.learn([4]byte{10, 0, 0, 2}, [6]byte{2, 0, 0, 0, 0, 2}, now) // ververst niets: vol
+
+	tbl.learn([4]byte{10, 0, 0, 2}, [6]byte{2, 0, 0, 0, 0, 2}, now)
 	tbl.recv(mustARPReply(t, [4]byte{10, 0, 0, 5}, [6]byte{2, 0, 0, 0, 0, 5}, [4]byte{10, 0, 0, 1}), now)
 	if tbl.noAnswer(slachtoffer, now) {
 		t.Fatal("met een verdringbare (opgeloste) entry hoort noAnswer weer false te zijn")
 	}
 }
 
-// mustARPReply bouwt een geldige aan-ons-gerichte reply voor de test hierboven.
 func mustARPReply(t *testing.T, senderIP [4]byte, senderHW [6]byte, target [4]byte) ARPFrame {
 	t.Helper()
 	buf := make([]byte, sizeARP)
@@ -2942,9 +2607,6 @@ func mustARPReply(t *testing.T, senderIP [4]byte, senderHW [6]byte, target [4]by
 	return f
 }
 
-// TestSocketWeigertBronpoortBijDial — een gevraagde bronpoort op een dial werd
-// stil genegeerd (de stack kiest altijd efemeer): dat hoort een luide fout te
-// zijn (review 13-08, eenendertigste ronde).
 func TestSocketWeigertBronpoortBijDial(t *testing.T) {
 	a, _ := newStackPair(t, 0, 0)
 	_, err := a.Socket(context.Background(), "tcp4", afINET, sockSTREAM,
@@ -2955,22 +2617,15 @@ func TestSocketWeigertBronpoortBijDial(t *testing.T) {
 	}
 }
 
-// TestCapaciteitssweepLaatPendingMetRust — pending → failed doet UITSLUITEND
-// de pomp (emit): de capaciteitssweep in resolve (en noAnswer's toets) kon een
-// uitgeputte query buiten de pomp om naar failed tikken, en dan viel de
-// transitie buiten de GaveUp-tellerbaseline van drainLocked — de notify die
-// bestaande wachters moest wekken kwam er nooit (review 13-08,
-// tweeëndertigste ronde).
 func TestCapaciteitssweepLaatPendingMetRust(t *testing.T) {
 	tbl := newARPTable([4]byte{10, 0, 0, 1}, [6]byte{2, 0, 0, 0, 0, 1})
 	now := int64(time.Hour)
-	// Volle tabel met uitgeputte pending queries (laatste tussenpoos voorbij).
+
 	for i := 0; i < arpCacheCap; i++ {
 		ip := [4]byte{10, 0, byte(i >> 8), byte(i)}
 		tbl.entries[ip] = &arpEntry{state: arpPending, tries: arpQueryTries, due: now - 1}
 	}
-	// De capaciteitspaden (resolve op een nieuw IP → sweep, en noAnswer's
-	// vol-toets) mogen die staat niet aanraken.
+
 	tbl.resolve([4]byte{10, 0, 200, 200}, now)
 	tbl.noAnswer([4]byte{10, 0, 200, 201}, now)
 	if tbl.cnt.GaveUp != 0 {
@@ -2981,7 +2636,7 @@ func TestCapaciteitssweepLaatPendingMetRust(t *testing.T) {
 			t.Fatalf("%v is %v geworden buiten de pomp om", ip, e.state)
 		}
 	}
-	// De pomp zelf geeft ze luid op — mét teller, dus mét notify.
+
 	buf := make([]byte, sizeARP)
 	for {
 		if _, ok := tbl.emit(buf, now); !ok {
@@ -2993,10 +2648,6 @@ func TestCapaciteitssweepLaatPendingMetRust(t *testing.T) {
 	}
 }
 
-// ---- vierendertigste ronde ----
-
-// wachtOpPending pollt tot de ARP-entry voor ip pending is — het moment
-// waarop de wachter van de test écht op de query slaapt.
 func wachtOpPending(t *testing.T, s *Stack, ip [4]byte) {
 	t.Helper()
 	for begin := time.Now(); time.Since(begin) < 2*time.Second; {
@@ -3012,10 +2663,6 @@ func wachtOpPending(t *testing.T, s *Stack, ip [4]byte) {
 	t.Fatal("de ARP-query kwam nooit op gang")
 }
 
-// TestSeedWektDeWachter — SeedNeighbor kan een lopende query vervangen door
-// een statische entry; daarmee verdwijnt de query-timer uit nextDeadline, en
-// zonder notify sliep een deadline-loze UDP-writer op die route voorgoed
-// (review 13-08, vierendertigste ronde).
 func TestSeedWektDeWachter(t *testing.T) {
 	a, _ := newStackPair(t, 1<<20, 1<<20)
 	pc, err := a.ListenUDP(9000)
@@ -3023,7 +2670,7 @@ func TestSeedWektDeWachter(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer pc.Close()
-	doel := [4]byte{10, 0, 0, 99} // niemand antwoordt op deze ARP
+	doel := [4]byte{10, 0, 0, 99}
 	klaar := make(chan error, 1)
 	go func() {
 		_, err := pc.WriteTo([]byte("ping"), &net.UDPAddr{IP: net.IP(doel[:]), Port: 7})
@@ -3043,10 +2690,6 @@ func TestSeedWektDeWachter(t *testing.T) {
 	}
 }
 
-// TestPassiefLerenWektDeWachter — passief leren kan een lopende query
-// oplossen terwijl het pakket zelf daarna op een early-return-pad sterft
-// (hier: UDP naar een poort zonder listener). Zonder notify uit het leren
-// zelf wekte niets de wachter meer (review 13-08, vierendertigste ronde).
 func TestPassiefLerenWektDeWachter(t *testing.T) {
 	a, _ := newStackPair(t, 1<<20, 1<<20)
 	pc, err := a.ListenUDP(9001)
@@ -3062,9 +2705,6 @@ func TestPassiefLerenWektDeWachter(t *testing.T) {
 	}()
 	wachtOpPending(t, a, doel)
 
-	// Een geldig UDP-frame VAN het doel, naar een poort zonder listener: het
-	// no-port-pad dropt het (early return) — alleen het passieve leren blijft
-	// over, en dat moet de wachter wekken.
 	frame := make([]byte, EthernetHeaderSize+sizeIPv4+sizeUDP)
 	f, _ := ParseEth(frame)
 	f.SetDst([6]byte{2, 0, 0, 0, 0, 1})
@@ -3089,15 +2729,10 @@ func TestPassiefLerenWektDeWachter(t *testing.T) {
 	}
 }
 
-// TestSeedRespecteertTotaalcap — de statics-cap (arpCacheCap/2) begrensde
-// alleen de seeds zelf: met 65 dynamische entries erbij groeide de tabel naar
-// 129, waarna resolve's ene verdringing nooit onder de cap kwam en fullLocked
-// tóch "niet vol" zei — geen query, geen fout, geen timer (review 13-08,
-// vierendertigste ronde).
 func TestSeedRespecteertTotaalcap(t *testing.T) {
 	a, _ := newStackPair(t, 0, 0)
 	a.mu.Lock()
-	for i := 0; i < 65; i++ { // 65 onverdringbare pending queries
+	for i := 0; i < 65; i++ {
 		a.arp.entries[[4]byte{10, 0, 0, byte(3 + i)}] = &arpEntry{state: arpPending, due: a.now()}
 	}
 	a.mu.Unlock()
@@ -3120,10 +2755,6 @@ func TestSeedRespecteertTotaalcap(t *testing.T) {
 	}
 }
 
-// TestResolveVerdringtTotErRuimteIs — stond de tabel ooit boven de cap, dan
-// moet resolve verdringen TOT er ruimte is (en fullLocked precies dan "vol"
-// zeggen wanneer dat niet kan) — één verdringing liet 129 entries op 128
-// staan: geen query én geen fout (review 13-08, vierendertigste ronde).
 func TestResolveVerdringtTotErRuimteIs(t *testing.T) {
 	now := int64(time.Hour)
 	over := func(evictable int) *arpTable {
@@ -3134,10 +2765,9 @@ func TestResolveVerdringtTotErRuimteIs(t *testing.T) {
 		for i := 0; i < evictable; i++ {
 			tbl.entries[[4]byte{10, 2, 0, byte(i)}] = &arpEntry{state: arpResolved, born: now}
 		}
-		return tbl // len = arpCacheCap+1: de historische boven-cap-toestand
+		return tbl
 	}
 
-	// Twee verdringbare: resolve moet ze BEIDE ruimen en de query starten.
 	tbl := over(2)
 	doel := [4]byte{10, 3, 0, 1}
 	tbl.resolve(doel, now)
@@ -3148,8 +2778,6 @@ func TestResolveVerdringtTotErRuimteIs(t *testing.T) {
 		t.Fatalf("tabel draagt %d entries na resolve, cap is %d", len(tbl.entries), arpCacheCap)
 	}
 
-	// Eén verdringbare op 129: dat is en blijft vol — en fullLocked moet dat
-	// ook ZEGGEN, anders wacht de teleurgestelde resolver eeuwig.
 	tbl = over(1)
 	tbl.resolve(doel, now)
 	if _, ok := tbl.entries[doel]; ok {
@@ -3160,10 +2788,6 @@ func TestResolveVerdringtTotErRuimteIs(t *testing.T) {
 	}
 }
 
-// ---- zesendertigste ronde ----
-
-// arpFrameTeller telt uitgaande ARP-frames — het meetinstrument voor de
-// nul-ARP-belofte van een geseede gateway.
 type arpFrameTeller struct {
 	*memDevice
 	n atomic.Int32
@@ -3176,12 +2800,6 @@ func (d *arpFrameTeller) Transmit(p []byte) error {
 	return d.memDevice.Transmit(p)
 }
 
-// TestGatewaySeedDektOokDeGatewayZelf — de gateway is same-subnet, dus
-// verkeer NAAR hem viel buiten de gwMAC-route en startte alsnog ARP, terwijl
-// appnet.Up belooft dat dials naar de host nul ARP kosten (hopswitch maskeerde
-// dat door de query te beantwoorden). Nu: dst == cfg.GW && hasGwMAC routeert
-// rechtstreeks — TCP én UDP, nul ARP-frames (review 13-08, zesendertigste
-// ronde).
 func TestGatewaySeedDektOokDeGatewayZelf(t *testing.T) {
 	da, db := &memDevice{}, &memDevice{}
 	da.peer, db.peer = db, da
@@ -3218,7 +2836,7 @@ func TestGatewaySeedDektOokDeGatewayZelf(t *testing.T) {
 	if err := a.SeedNeighbor([4]byte{10, 0, 0, 2}, [6]byte{2, 0, 0, 0, 0, 2}); err != nil {
 		t.Fatal(err)
 	}
-	// TCP naar de gateway zelf.
+
 	l, err := b.Listen(80)
 	if err != nil {
 		t.Fatal(err)
@@ -3234,7 +2852,7 @@ func TestGatewaySeedDektOokDeGatewayZelf(t *testing.T) {
 		t.Fatalf("dial naar de geseede gateway: %v", err)
 	}
 	c.Close()
-	// En UDP.
+
 	pc, err := a.ListenUDP(9002)
 	if err != nil {
 		t.Fatal(err)
@@ -3248,26 +2866,16 @@ func TestGatewaySeedDektOokDeGatewayZelf(t *testing.T) {
 	}
 }
 
-// TestStatischeGatewayNegeertVolleTabel — off-subnet verkeer met een geseede
-// gateway-MAC heeft géén ARP-lot, maar nextHopLocked gaf de eindbestemming als
-// vulwaarde terug en de wachter vroeg daar tóch noAnswer op: op een tabel vol
-// onverdringbaar werk werd elke remote bestemming zo meteen "unreachable"
-// terwijl het pakket gewoon via de bekende MAC kan vertrekken (review 13-08,
-// zesendertigste ronde).
 func TestStatischeGatewayNegeertVolleTabel(t *testing.T) {
 	a, _ := newStackPair(t, 1<<20, 1<<20)
 	a.mu.Lock()
 	a.cfg.GW = [4]byte{10, 0, 0, 2}
 	a.gwMAC, a.hasGwMAC = [6]byte{2, 0, 0, 0, 0, 2}, true
-	for i := 0; i < arpCacheCap; i++ { // vol met onverdringbaar werk
+	for i := 0; i < arpCacheCap; i++ {
 		a.arp.entries[[4]byte{10, 0, 1, byte(i)}] = &arpEntry{state: arpPending, due: a.now()}
 	}
 	a.mu.Unlock()
-	// De DIAL-cond is de plek die het gat had: die toetst noAnswer VÓÓR de
-	// uitkomst van de handshake, dus vóór de SYN ook maar vertrokken was.
-	// Niemand antwoordt op 192.168.1.1, dus de dial hoort op zijn DEADLINE te
-	// stranden (de SYN vertrok via de bekende gateway-MAC) — niet op de
-	// onmiddellijke "unreachable" die de volle tabel hem aanpraatte.
+
 	_, err := a.DialTCP([4]byte{192, 168, 1, 1}, 80, time.Now().Add(400*time.Millisecond))
 	if err == nil {
 		t.Fatal("dial slaagde — er is daar helemaal geen server")
@@ -3275,7 +2883,7 @@ func TestStatischeGatewayNegeertVolleTabel(t *testing.T) {
 	if strings.Contains(err.Error(), "no route to host") {
 		t.Fatalf("dial gaf %v: de volle ARP-tabel blokkeerde een route zonder ARP-lot", err)
 	}
-	// En UDP blijft gewoon vertrekken (de route slaagt direct op gwMAC).
+
 	pc, err := a.ListenUDP(9003)
 	if err != nil {
 		t.Fatal(err)
@@ -3286,10 +2894,6 @@ func TestStatischeGatewayNegeertVolleTabel(t *testing.T) {
 	}
 }
 
-// TestReseedVanBestaandeStaticMagAltijd — de static-cap werd getoetst vóór de
-// bestaat-hij-al-vraag: een MAC-update van een bestaande static (nul extra
-// entries) faalde dus zodra de cap vol stond (review 13-08, zesendertigste
-// ronde).
 func TestReseedVanBestaandeStaticMagAltijd(t *testing.T) {
 	a, _ := newStackPair(t, 0, 0)
 	for i := 0; i < arpCacheCap/2; i++ {
@@ -3297,7 +2901,7 @@ func TestReseedVanBestaandeStaticMagAltijd(t *testing.T) {
 			t.Fatalf("seed %d: %v", i, err)
 		}
 	}
-	// De cap staat vol; een verse static moet falen, een UPDATE niet.
+
 	if err := a.SeedNeighbor([4]byte{10, 0, 0, 200}, [6]byte{2, 0, 0, 0, 0, 200}); err == nil {
 		t.Fatal("de 65e statische seed passeerde de cap")
 	}

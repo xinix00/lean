@@ -1,16 +1,14 @@
 package leans3
 
-// AWS Signature Version 4 — de vorm die S3 wil voor een verzoek met een body
-// die je al kent (geen streaming signature).
+// AWS Signature Version 4 for requests with known bodies; streaming signatures
+// are outside scope.
 //
-// Specificatie:
+// Specification:
 // https://docs.aws.amazon.com/IAM/latest/UserGuide/create-signed-request.html
 //
-// Deze code komt uit hoplock/s3 en is daar op echte providers gelopen (AWS,
-// Cloudflare R2, MinIO, Hetzner/Ceph RGW). De canonieke vorm is dus geen
-// interpretatie van de specificatie maar de vorm die werkt; wie hem verandert,
-// verandert élke signatuur en krijgt SignatureDoesNotMatch op álles. Er staan
-// tests op de vorm, niet alleen op het resultaat.
+// This code ran against AWS, Cloudflare R2, MinIO, and Hetzner/Ceph RGW in
+// hoplock/s3. Tests protect the canonical form because changing it invalidates
+// every signature.
 
 import (
 	"crypto/hmac"
@@ -31,7 +29,7 @@ const (
 	sigTerminator = "aws4_request"
 )
 
-// credentials draagt alles wat SigV4 nodig heeft.
+// credentials contains the inputs needed by SigV4.
 type credentials struct {
 	AccessKeyID     string
 	SecretAccessKey string
@@ -39,13 +37,10 @@ type credentials struct {
 	Region          string
 }
 
-// signRequest hangt Authorization, X-Amz-Date en X-Amz-Content-Sha256 aan hdr —
-// de header-map die op de draad gaat. payloadHash is de hex-sha256 van de body
-// of [UnsignedPayload].
-//
-// Het signeert een (methode, URL, headers)-drietal in plaats van een
-// verzoek-object, want leanhttp heeft geen verzoektype: een Call draagt exact
-// deze map, dus wat hier gesigneerd wordt is wat er verstuurd wordt.
+// signRequest adds Authorization, X-Amz-Date, and X-Amz-Content-Sha256 to the
+// header map sent on the wire. payloadHash is hexadecimal SHA-256 or
+// [UnsignedPayload]. Signing method, URL, and headers directly matches the data
+// represented by a leanhttp Call.
 func signRequest(method string, u *url.URL, hdr leanhttp.Header, creds credentials, payloadHash string, now time.Time) {
 	if payloadHash == "" {
 		payloadHash = UnsignedPayload
@@ -78,18 +73,13 @@ func signRequest(method string, u *url.URL, hdr leanhttp.Header, creds credentia
 	hdr.Set("Authorization", auth)
 }
 
-// canonicalRequest bouwt de canonieke verzoekstring en de signed-headers-lijst.
+// canonicalRequest builds the canonical request and signed-header list.
 //
-// Twee dingen aan de gesigneerde header-verzameling lijken vergeten en zijn dat
-// niet — verander één van de twee en S3 wijst élke aanroep af:
+// Two apparent omissions are intentional:
 //
-//   - "host" komt uit u.Host en wordt NOOIT uit hdr gelezen. leanhttp schrijft
-//     de Host-regel zelf, uit diezelfde u.Host, en weigert een aanroeper die de
-//     header zet — dus u.Host signeren is precies de string die de server leest.
-//   - Content-Length staat niet in hdr (leanhttp schrijft hem, uit de
-//     bodylengte) en wordt dus niet gesigneerd. Dat is hoe deze signeerder het
-//     altijd deed: ook net/http hield hem buiten req.Header, dus de signatuur
-//     dekte hem nooit.
+//   - host comes from u.Host because leanhttp owns and writes that field.
+//   - Content-Length remains unsigned because leanhttp derives and writes it
+//     from body length, matching the signer's historical net/http behavior.
 func canonicalRequest(method string, u *url.URL, hdr leanhttp.Header, payloadHash string) (string, string) {
 	type header struct{ name, value string }
 	hdrs := []header{{"host", u.Host}}
@@ -123,8 +113,8 @@ func canonicalRequest(method string, u *url.URL, hdr leanhttp.Header, payloadHas
 	return strings.Join(parts, "\n"), signedHeaders
 }
 
-// canonicalURI escapet elk padsegment volgens de unreserved-verzameling van
-// RFC 3986. Slashes tussen segmenten blijven letterlijk. Een leeg pad wordt "/".
+// canonicalURI escapes each path segment using RFC 3986 unreserved characters,
+// preserving separators. An empty path becomes "/".
 func canonicalURI(p string) string {
 	if p == "" {
 		return "/"
@@ -136,8 +126,8 @@ func canonicalURI(p string) string {
 	return strings.Join(segments, "/")
 }
 
-// canonicalQuery sorteert de query-parameters op key (en op waarde als een key
-// zich herhaalt) en escapet ze opnieuw met de SigV4-regels.
+// canonicalQuery re-escapes parameters using SigV4 rules and sorts by key then
+// value.
 func canonicalQuery(u *url.URL) string {
 	if u.RawQuery == "" {
 		return ""
@@ -169,14 +159,9 @@ func canonicalQuery(u *url.URL) string {
 	return strings.Join(out, "&")
 }
 
-// uriEscape is de SigV4-escaperegel: percent-encode elke byte buiten de
-// unreserved-verzameling (A-Z, a-z, 0-9, '-', '_', '.', '~'). Met encodeSlash
-// false blijft '/' letterlijk — dat is de vorm voor het pad.
-//
-// Dit is het stuk dat de tweede, met de hand geschreven signeerder in hop
-// overslaat: een key met een spatie of een '+' erin signeert dan een andere
-// string dan de server ziet, en de fout die je terugkrijgt zegt "signature
-// mismatch" en niet "je pad is niet geëscaped".
+// uriEscape percent-encodes bytes outside the SigV4 unreserved set. A false
+// encodeSlash preserves path separators. Omitting this step makes keys with
+// spaces or `+` sign a different string from the server's request target.
 func uriEscape(s string, encodeSlash bool) string {
 	const hexUpper = "0123456789ABCDEF"
 	var b strings.Builder
@@ -213,18 +198,12 @@ func hmacSHA256(key, data []byte) []byte {
 	return h.Sum(nil)
 }
 
-// hexSHA256 is de payload-hash-vorm die S3 wil: lowercase hex.
+// hexSHA256 returns S3's lowercase hexadecimal payload-hash form.
 func hexSHA256(data []byte) string {
 	sum := sha256.Sum256(data)
 	return hex.EncodeToString(sum[:])
 }
 
-// emptyPayloadHash is de hash van een body van nul bytes, en dus wat een GET,
-// een DELETE en een listing signeren.
-//
-// Bewust niet [UnsignedPayload] voor die drie: dat mag alleen over https en
-// meerdere providers weigeren het op een write, terwijl de echte hash van een
-// lege body altijd goed is. In hoplock stond dit per operatie verschillend
-// ingesteld — de lease-DELETE signeerde de lege hash, de object-DELETE
-// UNSIGNED-PAYLOAD — en dat verschil was geen keuze maar een slip.
+// emptyPayloadHash signs the zero-byte body used by GET, DELETE, and LIST. It is
+// safer and more widely supported than [UnsignedPayload].
 var emptyPayloadHash = hexSHA256(nil)

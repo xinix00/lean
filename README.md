@@ -47,8 +47,7 @@ three more along with it.
 Lean means reduced scope, not reduced correctness. The frozen contract for
 `leanhttp`, `leanhttps`, `leans3` and `leannet` — what stays, what is narrowed,
 what is deliberately removed, and which release gates protect that boundary —
-is documented in [KAM.md](KAM.md). The document is in Dutch, like the package
-documentation.
+is documented in [KAM.md](KAM.md).
 
 ## The one exception: compositions
 
@@ -136,4 +135,5 @@ an OFFER from a FRITZ!Box through our own PCIe→RP1→GEM chain). Keeping the l
 alive is a second half that runs over the stack instead of the NIC, because
 after bring-up the receive loop has exactly one owner.
 
-The package documentation is in Dutch, as it was written.
+The package documentation records the measurements and constraints behind both
+packages.

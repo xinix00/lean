@@ -8,23 +8,16 @@ import (
 	"io"
 )
 
-// De recordlaag van TLS 1.3 (RFC 8446 §5). Drie dingen die anders zijn dan in
-// 1.2 en die precies daarom hier bij elkaar staan:
+// TLS 1.3 record layer (RFC 8446 §5). Three 1.3-specific rules stay together:
 //
-//   - Er is één ciphertext-vorm. Het echte contenttype zit BINNEN de versleuteling
-//     (TLSInnerPlaintext), en buiten staat altijd application_data(23). Wie het
-//     buitenste type gebruikt om te beslissen wat iets is, leest het verkeerde
-//     veld.
-//   - De nonce komt niet van de draad maar uit het recordnummer (§5.3). Dat
-//     nummer begint bij nul na élke sleutelwissel en wordt nooit verstuurd, dus
-//     zender en ontvanger moeten exact gelijk tellen — één overgeslagen record
-//     en niets ontsleutelt meer.
-//   - De AAD is de vijf headerbytes zoals ze op de draad staan, inclusief de
-//     lengte van de ciphertext. Niet van de plaintext.
+//   - TLSInnerPlaintext carries the real content type inside encryption; the
+//     outer type is always application_data(23).
+//   - The nonce comes from an untransmitted record sequence that resets after
+//     each key update, so both sides must count identically (§5.3).
+//   - AAD is the five wire header bytes, including ciphertext length.
 //
-// change_cipher_spec blijft plaintext, ook ná de sleutelwissel: het is in 1.3
-// een leeg middlebox-compatibiliteitsrecord zonder betekenis. Wij sturen er één
-// en negeren alles wat we ervan terugkrijgen.
+// change_cipher_spec stays plaintext as a semantic-free middlebox compatibility
+// record. This client sends one and ignores received copies.
 
 const (
 	recCCS       = 20
@@ -32,24 +25,22 @@ const (
 	recHandshake = 22
 	recAppData   = 23
 
-	// maxPlain is de grens die de RFC aan een plaintext-fragment stelt (2^14).
+	// maxPlain is the RFC plaintext-fragment limit (2^14).
 	maxPlain = 1 << 14
-	// maxCipher is wat een ciphertext-record hoogstens mag zijn: 2^14 plus het
-	// contenttype, de AEAD-tag en de marge die §5.2 toestaat. Een header die
-	// meer aankondigt weigeren we vóór we ook maar één byte body lezen — dat is
-	// de enige plek waar een tegenpartij ons geheugen zou kunnen laten claimen.
+	// maxCipher includes content type, AEAD tag, and §5.2 allowance. Reject the
+	// advertised length before allocating peer-controlled memory.
 	maxCipher = maxPlain + 256
 
-	// alertCloseNotify is de nette afsluiting (§6.1).
+	// alertCloseNotify is the clean shutdown signal (§6.1).
 	alertCloseNotify = 0
 )
 
-// aeadFor maakt de AES-128-GCM van een richting. Eén suite, dus dit is de enige
-// plek waar een cipher gekozen wordt en er valt niets te negotiëren.
+// aeadFor creates one direction's AES-128-GCM. The single suite needs no
+// negotiation.
 func aeadFor(k trafficKeys) cipher.AEAD {
 	blk, err := aes.NewCipher(k.key)
 	if err != nil {
-		panic("leantls: aes: " + err.Error()) // sleutel komt uit de schedule, altijd 16 bytes
+		panic("leantls: aes: " + err.Error()) // Schedule keys are always 16 bytes.
 	}
 	g, err := cipher.NewGCM(blk)
 	if err != nil {
@@ -58,8 +49,8 @@ func aeadFor(k trafficKeys) cipher.AEAD {
 	return g
 }
 
-// writeRecord schrijft één record. Vóór de sleutelwissel (aead == nil) gaat het
-// plaintext de draad op; daarna versleuteld met het echte type erin verstopt.
+// writeRecord sends plaintext before keys exist and encrypted
+// TLSInnerPlaintext afterward.
 func (c *Conn) writeRecord(typ byte, data []byte) error {
 	if c.wAEAD == nil {
 		hdr := [5]byte{typ, 3, 3, byte(len(data) >> 8), byte(len(data))}
@@ -69,9 +60,8 @@ func (c *Conn) writeRecord(typ byte, data []byte) error {
 		return nil
 	}
 
-	// TLSInnerPlaintext: inhoud, dan het echte type. Geen padding — dat is
-	// toegestaan (§5.4) en wat je ermee koopt (lengtes verhullen) betaal je in
-	// bandbreedte op een node die daar weinig van heeft.
+	// TLSInnerPlaintext is content followed by its type. §5.4 padding is optional
+	// and omitted to avoid bandwidth cost on small nodes.
 	inner := make([]byte, 0, len(data)+1)
 	inner = append(inner, data...)
 	inner = append(inner, typ)
@@ -87,8 +77,8 @@ func (c *Conn) writeRecord(typ byte, data []byte) error {
 	return err
 }
 
-// readRecord leest één record en geeft het CONTENTTYPE en de payload. Bij een
-// versleuteld record is dat het type van binnen, niet dat van de header.
+// readRecord returns one record's actual content type and payload. For encrypted
+// records, the type comes from TLSInnerPlaintext rather than the outer header.
 func (c *Conn) readRecord() (byte, []byte, error) {
 	var hdr [5]byte
 	if _, err := io.ReadFull(c.conn, hdr[:]); err != nil {
@@ -103,23 +93,20 @@ func (c *Conn) readRecord() (byte, []byte, error) {
 		return 0, nil, err
 	}
 
-	// change_cipher_spec blijft altijd plaintext, ook als de sleutels al staan.
+	// change_cipher_spec remains plaintext after keys are installed.
 	if c.rAEAD == nil || hdr[0] == recCCS {
 		return hdr[0], body, nil
 	}
 
 	plain, err := c.rAEAD.Open(body[:0], nonce(c.rKeys.iv, c.rSeq), body, hdr[:])
 	if err != nil {
-		// Geen detail naar buiten: welk record faalde is voor een aanvaller
-		// informatie en voor ons niets. Dat dit een harde fout is en geen
-		// overgeslagen record is opzet — een gat in de recordnummering maakt
-		// alles erna onleesbaar, dus doorgaan heeft geen betekenis.
+		// Decryption failure is fatal: skipping would desynchronize sequence
+		// numbers and make every later record unreadable.
 		return 0, nil, fmt.Errorf("leantls: record %d failed to decrypt", c.rSeq)
 	}
 	c.rSeq++
 
-	// Het echte type is de laatste byte die niet nul is; alles erachter is
-	// padding (§5.4).
+	// The final non-zero byte is content type; later zeros are §5.4 padding.
 	i := len(plain) - 1
 	for i >= 0 && plain[i] == 0 {
 		i--
@@ -130,9 +117,8 @@ func (c *Conn) readRecord() (byte, []byte, error) {
 	return plain[i], plain[:i], nil
 }
 
-// alertError maakt van een alert-record een leesbare fout. close_notify is geen
-// fout maar het einde: die geeft io.EOF, zodat een aanroeper hem als een gewoon
-// streameinde behandelt.
+// alertError maps alerts to readable errors. close_notify becomes io.EOF so
+// callers observe an ordinary clean stream end.
 func alertError(payload []byte) error {
 	if len(payload) == 2 && payload[1] == alertCloseNotify {
 		return io.EOF
@@ -144,9 +130,8 @@ func alertError(payload []byte) error {
 		payload[0], payload[1], alertName(payload[1]))
 }
 
-// alertName geeft de codes die je in de praktijk tegenkomt een naam. Niet de
-// hele tabel uit §6: wat hier staat is wat een operator moet kunnen lezen
-// zonder de RFC ernaast, de rest is een nummer en dat is genoeg.
+// alertName names common operational alerts; uncommon §6 codes remain readable
+// as numbers.
 func alertName(code byte) string {
 	switch code {
 	case 40:

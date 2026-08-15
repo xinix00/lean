@@ -1,20 +1,15 @@
 package leannet
 
-// stack.go — de laag die de pure machines (tcp.go, arp.go, udp.go, icmp.go)
-// aan een echt device knoopt: ingress-demux, de TX-pomp, routing via ARP en
-// de poorttabellen. Dit is de enige laag met goroutine- en lock-kennis; alle
-// machines eronder blijven puur.
+// stack.go connects the pure protocol machines to a device: ingress
+// demultiplexing, transmit pumping, ARP routing, and port tables. Only this
+// layer knows about goroutines and locks.
 //
-// Threading-model: één stack-mutex over alle machine-staat, één pomp-goroutine
-// die uitgaande frames schrijft en timers bewaakt (RTO's, ARP-retries,
-// TIME-WAIT). De pomp slaapt exact tot de vroegste deadline of tot een notify;
-// er is geen vaste tick, dus een idle stack kost geen CPU — de les van HOP's
-// poll-tijd-jacht. Blokkerende socket-calls (socket.go) wachten op dezelfde
-// notify met hun eigen deadline: deadline-gedreven, nooit iteration-capped.
+// One mutex protects all machine state. One pump goroutine transmits frames and
+// observes RTO, ARP, and TIME-WAIT timers. It sleeps until the earliest deadline
+// or a notification, so an idle stack consumes no CPU. Blocking socket calls
+// wait on the same notifications with their own deadlines.
 //
-// De TX-pomp is een stack-plicht: hop-os heeft geen eigen TX-lus (go-net's
-// lifetimeGoroutine deed dit stilletjes; zie het naad-rapport in het
-// ontwerpdossier).
+// The transmit pump belongs here because HopOS has no separate transmit loop.
 
 import (
 	"errors"
@@ -22,62 +17,45 @@ import (
 	"time"
 )
 
-// Device is het NIC-contract: exact de twee methodes die élke HopOS-driver al
-// spreekt (dwmac, gem, genet, igb, virtionet, locdev, hopswitch.Uplink — en
-// leandhcp.NIC heeft dezelfde vorm). Receive geeft (0, nil) als er niets is;
-// de stack pollt niet zelf — de eigenaar van de RX-lus (hopnet) voert frames
-// via Stack.RecvInboundPacket.
+// Device is the NIC contract shared by HopOS drivers. Receive returns (0, nil)
+// when empty; the owner of the receive loop passes frames to RecvInboundPacket.
 type Device interface {
 	Receive(buf []byte) (int, error)
 	Transmit(buf []byte) error
 }
 
-// Draadconstanten die de buitenwereld nodig heeft voor buffermaten.
+// Wire constants exposed for buffer sizing.
 const (
 	MTU                 = 1500
 	EthernetHeaderSize  = 14
-	EthernetMaximumSize = 18 // header + FCS-marge; zelfde waarde als go-net
+	EthernetMaximumSize = 18 // header plus FCS margin
 )
 
-// Efemere poorten: sequentieel vanaf 49152 (RFC 6335 dynamic range). Dit
-// bereik is per constructie disjunct van hopswitch.MasqEnd — verplaats het
-// niet zonder die invariant mee te nemen.
+// Ephemeral ports are sequential within RFC 6335's dynamic range. Keep this
+// range disjoint from hopswitch.MasqEnd.
 const (
 	ephemeralBase = 49152
 	ephemeralEnd  = 65535
 )
 
-// loopbackMax begrenst de zelf-verkeer-wachtrij. Ruim voor een handshake plus
-// een venster aan segmenten; vol = droppen zoals elke ring dropt.
+// loopbackMax covers a handshake plus a window of segments; overflow drops.
 const loopbackMax = 64
 
-// De verbindingsloze reply-wachtrijen zijn begrensd, net als arp's
-// reply-queue en om dezelfde reden: een flood van SYNs naar dichte poorten of
-// echo-requests mag hier geen geheugen laten groeien. Vol = droppen mét
-// teller; de peer merkt het aan zijn timeout en herhaalt (review 13-08).
+// Bound connectionless replies so closed-port SYNs or echo floods cannot grow memory.
 const outQueueCap = 32
 
-// Buffer-floors per TCP-verbinding: waar de ringen beginnen vóór budgetgroei.
-// Ze zijn asymmetrisch, en dat is het enige getal in leannet dat niet uit
-// "groeien op druk" volgt maar uit hoe de tegenpartij begint.
+// Initial TCP ring sizes are asymmetric because peers and applications create
+// different pressure.
 //
-// ONTVANGEN (16KiB): een zender start met een initial congestion window van 10
-// segmenten (RFC 6928) en stuurt die als burst. Adverteren wij minder, dan kan
-// hij niet aan die burst beginnen: één segment, wachten op onze ACK, weer één —
-// stop-and-wait, waarbij ÓNS venster de rem is in plaats van de link. Dat is
-// geen opwarmen dat een verdubbeling later goedmaakt: bij een snelle lezer
-// loopt de ring nooit vol, dus komt die verdubbeling er nooit. 10 × 1460 × 2
-// afgerond op 16KiB is dus de laagste maat waarop de ontvangkant eerlijk is.
-// (Dit is hetzelfde getal dat gVisor als receive-vloer neemt, om dezelfde
-// reden — de RTT-schatter erboven hebben we niet nodig, deze vloer wel.)
+// Receive starts at 16 KiB so a peer can send RFC 6928's ten-segment initial
+// congestion window without our advertised window forcing stop-and-wait. A
+// fast reader might otherwise prevent growth from ever triggering.
 //
-// ZENDEN (4KiB): hier bepaalt de applicatie het tempo, en de ring groeit op de
-// druk die zij zelf zet (een Write die niet past terwijl de peer méér venster
-// biedt). Klein beginnen kost daar dus niets.
+// Transmit starts at 4 KiB and grows when application writes create pressure.
 const (
 	tcpFloorRx   = 16 << 10
 	tcpFloorTx   = 4 << 10
-	tcpFloorRing = tcpFloorRx + tcpFloorTx // wat één verbinding minimaal claimt
+	tcpFloorRing = tcpFloorRx + tcpFloorTx // minimum reservation per connection
 )
 
 var (
@@ -89,23 +67,19 @@ var (
 	errLoopbackFull = errors.New("leannet: loopback queue full")
 )
 
-// Config is de stack-configuratie. Budget is dé knop (doc.go): alle
-// verbindingsbuffers samen blijven eronder. De rest is identiteit.
+// Config defines stack identity and its total connection-buffer budget.
 type Config struct {
 	IP     [4]byte
-	Prefix int // subnet-prefixlengte, voor de routebeslissing en seed-checks
+	Prefix int // subnet prefix length used for routing and seed validation
 	MAC    [6]byte
-	GW     [4]byte // gateway; nul = geen route buiten het subnet
+	GW     [4]byte // zero means no route outside the subnet
 
-	Budget int // bytes voor álle verbindingsbuffers samen
+	Budget int // bytes for all connection buffers combined
 
-	// MaxBufPerConn klemt de groei van één verbinding. 0 = Budget/4
-	// (ontwerpdossier: één download mag hard, maar niet alles).
+	// MaxBufPerConn caps one connection's growth; 0 means Budget/4.
 	MaxBufPerConn int
 
-	// AdvWS is de window-scale-shift die we aanbieden. 0 is een geldige
-	// aanbieding (RFC 7323); de shift begrenst het maximale venster dat
-	// MaxBufPerConn ooit kan adverteren.
+	// AdvWS is the advertised window-scale shift. Zero is valid (RFC 7323).
 	AdvWS uint8
 }
 
@@ -115,7 +89,7 @@ type connKey struct {
 	rport uint16
 }
 
-// Stack knoopt alles aan elkaar. Eén mutex over alle staat (zie boven).
+// Stack connects the protocol machines under one mutex.
 type Stack struct {
 	mu  sync.Mutex
 	cfg Config
@@ -127,62 +101,54 @@ type Stack struct {
 	listeners map[uint16]*tcpListener
 	udp       *udpTable
 
-	// Verbindingsloze uitgaande pakketten (RST's, echo-replies), al tot bytes
-	// gebouwd op het queue-moment; de pomp bezorgt ze route-best-effort. Eén
-	// wachtrij, één cap, één drop-teller — het waren er twee met dezelfde
-	// levensloop (review 13-08, zesde ronde).
+	// Connectionless replies are serialized when queued and routed best-effort.
 	out []outPkt
 
-	// Loopback: frames aan ons eigen MAC (zie sendEthLocked). lbFree recyclet
-	// de buffers.
+	// Loopback frames target our own MAC; lbFree recycles their buffers.
 	loopback [][]byte
 	lbFree   [][]byte
 
-	gwMAC    [6]byte // statisch geplande gateway (SeedNeighbor-equivalent)
+	gwMAC    [6]byte // statically planned gateway
 	hasGwMAC bool
 
-	// wake is het broadcast-kanaal: dicht = er is iets veranderd. Waiters
-	// pakken hem onder de lock en selecten erop naast hun eigen deadline.
+	// Closing wake broadcasts a state change. Waiters capture it under the lock.
 	wake   chan struct{}
 	closed bool
 
-	t0 time.Time // basis van de monotone klok (nooit de wandklok — BEVINDINGEN #9)
+	t0 time.Time // monotonic clock origin
 
 	nextEph uint16
 	issSeed uint32
 
 	txBuf []byte
 
-	// Tellers, onder s.mu; de buitenwereld leest ze via Stats() — publieke
-	// velden die intern onder een privé-mutex muteren waren een datarace voor
-	// élke live-lezer (review 13-08, vierde ronde).
+	// Counters are protected by s.mu and exposed through snapshotting Stats().
 	stats Stats
 }
 
-// Stats is een momentopname van de stack-tellers: de stack logt niet zelf,
-// hopnet hangt hier logregels/telemetrie aan.
+// Stats is a snapshot for external logging and telemetry.
 type Stats struct {
-	RefusedNoBudget int // verbindingen geweigerd omdat de pot leeg was
+	RefusedNoBudget int // connections refused because the budget was exhausted
 	DropShortFrame  int
 	DropNoPort      int
 	DropBadFrame    int
-	DropReplyFull   int // verbindingsloze replies (RST/echo) én loopback-frames gedropt op een volle wachtrij
+	DropReplyFull   int // connectionless replies or loopback frames dropped on overflow
 
-	// ARP zijn de tellers van de ARP-machine, als heel blok gekopieerd.
+	// ARP contains a complete copy of the ARP machine counters.
 	ARP ARPStats
 }
 
-// ARPStats — de tellers van de ARP-machine.
+// ARPStats contains ARP machine counters.
 type ARPStats struct {
-	GaveUp     int // queries die na arpQueryTries pogingen opgaven
-	Ignored    int // replies die niet aan ons gericht en niet gratuitous waren
-	MACChanged int // refresh die een ánder MAC op een bestaande entry zette
-	ReplyDrop  int // reply-antwoorden gedropt omdat de wachtrij vol was
-	LearnDrop  int // passieve leerpogingen geweigerd op een volle tabel (arpCacheCap)
-	FullDrop   int // resolves die geen query konden starten: tabel vol met pending/statisch
+	GaveUp     int // queries abandoned after arpQueryTries attempts
+	Ignored    int // replies neither addressed to us nor gratuitous
+	MACChanged int // refreshes that changed an existing entry's MAC
+	ReplyDrop  int // replies dropped because their queue was full
+	LearnDrop  int // passive learns rejected at arpCacheCap
+	FullDrop   int // resolves blocked by pending/static entries filling the table
 }
 
-// Stats geeft de tellers als kopie, onder het stack-slot: race-vrij te lezen.
+// Stats returns a race-free copy of all counters.
 func (s *Stack) Stats() Stats {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -191,16 +157,11 @@ func (s *Stack) Stats() Stats {
 	return st
 }
 
-// NewStack bouwt de stack en start de pomp. issSeed hoort uit een echte
-// entropiebron te komen (de aanroeper heeft die; wij eisen hem in plaats van
-// stiekem een zwakke te kiezen).
+// NewStack creates a stack and starts its pump. issSeed should come from a real
+// entropy source supplied by the caller.
 func NewStack(dev Device, cfg Config, issSeed uint32) *Stack {
-	// Config-hygiëne, luid waar het een bug is en stil waar de RFC een klem
-	// voorschrijft (review 13-08, vierde ronde). Een Prefix buiten 0..32 maakt
-	// élke subnet-beslissing onzin — dat is een programmeerfout, geen input.
-	// Een AdvWS boven 14 zou ná de handshake elk eigen venster naar nul
-	// schuiven (advertisedWnd >>= shift): de peer-kant klemde al, de eigen
-	// config nog niet.
+	// Invalid prefixes are programmer errors. RFC 7323 caps window scaling at 14;
+	// larger values could shift every advertised window to zero.
 	if cfg.Prefix < 0 || cfg.Prefix > 32 {
 		panic("leannet: Config.Prefix must be in 0..32")
 	}
@@ -231,22 +192,17 @@ func NewStack(dev Device, cfg Config, issSeed uint32) *Stack {
 	return s
 }
 
-// now is de monotone klok van de hele stack: time.Since overleeft elke
-// NTP-stap, in tegenstelling tot UnixNano (BEVINDINGEN #9/#10).
+// now is the stack's monotonic clock and is unaffected by wall-clock changes.
 func (s *Stack) now() int64 { return int64(time.Since(s.t0)) }
 
-// notify maakt alle waiters (pomp én sockets) wakker. Aanroepen onder s.mu.
+// notify wakes the pump and all socket waiters. s.mu must be held.
 func (s *Stack) notify() {
 	close(s.wake)
 	s.wake = make(chan struct{})
 }
 
-// Close sluit de héle publieke stack: de pomp stopt, elke verbinding wordt
-// afgekapt en gereapt (budget terug), elke listener gaat dicht (een
-// geblokkeerde Accept keert terug met net.ErrClosed) en elke UDP-poort wordt
-// vrijgegeven (een geblokkeerde ReadFrom idem). Vóór deze vorm bleef een
-// wachtende Accept eeuwig hangen en hielden conns en UDP-wachtrijen hun
-// budget vast (review 13-08).
+// Close stops the pump, aborts and reaps connections, closes listeners, and
+// releases UDP ports. Blocked operations return net.ErrClosed.
 func (s *Stack) Close() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -258,37 +214,27 @@ func (s *Stack) Close() {
 		c.tcp.abort()
 		s.reap(key, c)
 	}
-	// Dezelfde teardown als tcpListener.Close (één definitie): de sconns zijn
-	// hierboven al afgekapt en gereapt, dus de abort/reap-helft ervan is hier
-	// een no-op — wat telt is done sluiten en de backlog-referenties legen,
-	// anders kon een Accept ná Close willekeurig een gereapte (dode)
-	// verbinding teruggeven (review 13-08).
+	// Use listener teardown to close done and clear backlog references; otherwise
+	// Accept after Close could return an already-reaped connection.
 	for _, l := range s.listeners {
 		l.closeLocked()
 	}
 	for _, u := range s.udp.ports {
-		// close verwijdert de poort uit de tabel en stort de wachtrij terug;
-		// verzamelen hoeft niet — delete-tijdens-range is in Go gedefinieerd
-		// en close is idempotent.
+		// Deletion during map iteration is defined and close is idempotent.
 		u.close()
 	}
 	s.notify()
 }
 
-// SeedNeighbor plant een statische buur: het deterministische gateway-plan
-// van appnet (layout.SlotMAC, nul ARP). Buiten het subnet is een seed
-// zinloos — de routelaag stuurt zulk verkeer naar de gateway en raadpleegt
-// de tabel nooit — dus weigeren we hem luid (BEVINDINGEN #21).
+// SeedNeighbor installs a static neighbor. Non-gateway seeds outside the local
+// subnet are rejected because routing would never consult them.
 func (s *Stack) SeedNeighbor(ip [4]byte, mac [6]byte) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if ip == s.cfg.GW {
 		s.gwMAC, s.hasGwMAC = mac, true
-		// Een al lopende query voor de gateway is nu zinloos (routeLocked
-		// raadpleegt de tabel voor hem nooit meer) én zijn wachters moeten
-		// wakker: de route is er — zonder notify sliep een deadline-loze
-		// writer voorgoed op een query wiens timer zojuist betekenisloos werd
-		// (review 13-08, vierendertigste ronde).
+		// A static gateway makes any pending query obsolete; wake its waiters
+		// because that query's timer no longer exists.
 		delete(s.arp.entries, ip)
 		s.notify()
 		return nil
@@ -296,14 +242,8 @@ func (s *Stack) SeedNeighbor(ip [4]byte, mac [6]byte) error {
 	if !sameSubnet(ip, s.cfg.IP, s.cfg.Prefix) {
 		return errors.New("leannet: seed outside subnet would never be consulted")
 	}
-	// Statische entries omzeilen tick/sweep/verdringing: onbegrensd zaaien
-	// kon de tabel volledig vullen, waarna resolve geen pending entry of
-	// negatieve status meer kwijt kon en een UDP-write zonder deadline
-	// permanent sliep (review 13-08, dertigste ronde). De helft van de cap is
-	// ruim voor élke config; meer is een bedradingsfout en faalt luid. De cap
-	// telt alleen voor een seed die het aantal statics laat GROEIEN: een
-	// MAC-update van een bestaande static gebruikt geen extra plek en faalde
-	// eerst tóch zodra de cap vol stond (review 13-08, zesendertigste ronde).
+	// Static entries bypass expiry and eviction, so cap them at half the table.
+	// Updating an existing static entry does not consume another slot.
 	e, exists := s.arp.entries[ip]
 	if !exists || !e.static {
 		statics := 0
@@ -316,18 +256,12 @@ func (s *Stack) SeedNeighbor(ip [4]byte, mac [6]byte) error {
 			return errors.New("leannet: too many static neighbor seeds (cap is arpCacheCap/2)")
 		}
 	}
-	// En de TOTALE cap geldt ook voor seeds: 65 dynamische + 64 statische gaf
-	// een tabel van 129, waarna resolve's ene verdringing nooit meer onder de
-	// cap kwam en fullLocked tóch "niet vol" zei — geen query, geen fout,
-	// geen timer (review 13-08, vierendertigste ronde). Een seed op een
-	// bestáánd IP groeit niet en mag altijd.
+	// Seeds also obey the total cap; an existing IP does not grow the table.
 	if !exists && !s.arp.makeRoom(s.now()) {
 		return errors.New("leannet: neighbor table is full of pending queries; cannot seed")
 	}
 	if s.arp.seed(ip, mac) {
-		// De seed verving een lopende query: de wachters daarop zien de route
-		// nu bij hun volgende blik — als iemand ze wekt. De query-timer die
-		// dat via de pomp deed bestaat niet meer, dus dat doen wij.
+		// Wake waiters when the seed replaced their query and its timer.
 		s.notify()
 	}
 	return nil
@@ -340,9 +274,8 @@ func sameSubnet(a, b [4]byte, prefix int) bool {
 	return au&mask == bu&mask
 }
 
-// isBroadcastIP rapporteert of dst een broadcast-adres is: 255.255.255.255
-// (limited) of het adres met alle hostbits aan in ons eigen subnet (directed).
-// Bij /31 en /32 bestaat er geen broadcastadres (RFC 3021).
+// isBroadcastIP recognizes limited and local directed broadcasts. RFC 3021
+// defines no broadcast address for /31 and /32.
 func isBroadcastIP(dst, ip [4]byte, prefix int) bool {
 	if dst == bcastIP {
 		return true
@@ -358,10 +291,8 @@ func isBroadcastIP(dst, ip [4]byte, prefix int) bool {
 
 // ---- ingress ----
 
-// RecvInboundPacket verwerkt één rauw ethernet-frame. Veilig voor rommel: te
-// kort, verkeerd geadresseerd of corrupt wordt geteld en gedropt, nooit
-// gepanict — dit is de onvertrouwde rand (hopnet draait hem onder recover,
-// maar daar hoort niets aan te komen).
+// RecvInboundPacket processes one untrusted Ethernet frame. It counts and drops
+// short, misaddressed, or corrupt input without panicking.
 func (s *Stack) RecvInboundPacket(frame []byte) error {
 	eth, err := ParseEth(frame)
 	if err != nil {
@@ -371,10 +302,7 @@ func (s *Stack) RecvInboundPacket(frame []byte) error {
 		return nil
 	}
 	if len(frame) > MTU+EthernetMaximumSize {
-		// Een jumbo frame (driver zonder maatwacht, of een test) kan verderop
-		// een reply bouwen die groter is dan txBuf — en dan panickt de pomp
-		// op zijn eigen slice (review 13-08, zevenentwintigste ronde). Aan de
-		// deur meten, één keer.
+		// Reject jumbo frames before a generated reply can overflow txBuf.
 		s.mu.Lock()
 		s.stats.DropBadFrame++
 		s.mu.Unlock()
@@ -389,8 +317,7 @@ func (s *Stack) RecvInboundPacket(frame []byte) error {
 	return nil
 }
 
-// ingressLocked is de demux zelf, los van het slot zodat de pomp
-// loopback-frames langs hetzelfde pad kan voeren (zie sendEthLocked).
+// ingressLocked is separated so the pump can feed loopback through the same demux.
 func (s *Stack) ingressLocked(eth EthFrame, now int64) {
 	toUs := [6]byte(eth.Dst()) == s.cfg.MAC
 	switch eth.EtherType() {
@@ -401,39 +328,31 @@ func (s *Stack) ingressLocked(eth EthFrame, now int64) {
 			return
 		}
 		s.arp.recv(f, now)
-		s.notify() // een resolve kan nu klaar zijn; ook de pomp wil kijken (reply)
+		s.notify() // resolution or a reply may now be ready
 	case EtherTypeIPv4:
 		if !toUs {
-			return // niet voor ons (broadcast-IP doen we niet aan)
+			return // not addressed to us; broadcast IP ingress is unsupported
 		}
 		ip, err := ParseIPv4(eth.Payload())
 		if err != nil || !ip.ChecksumOK() || ip.Dst() != s.cfg.IP {
 			s.stats.DropBadFrame++
 			return
 		}
-		// Het passieve buurleren zit in recvIPv4, ná de transport-checksum:
-		// een IP-header alleen is met één gok te vervalsen, en vóór deze
-		// verhuizing maakte élk frame met een gespoofd bron-IP een verse
-		// cache-entry aan (review 13-08, dertiende ronde).
+		// Passive learning happens after transport checksum validation so a
+		// forged IP header alone cannot claim a cache entry.
 		s.recvIPv4(ip, [6]byte(eth.Src()), now)
 	}
 }
 
 func (s *Stack) recvIPv4(ip IPv4Frame, srcMAC [6]byte, now int64) {
 	src := ip.Src()
-	// Passief buurleren, alleen van unicast aan óns én pas nadat de
-	// transport-checksum klopte (zie ingressLocked): wie leert vóór de
-	// validatie geeft elke spoofer een gratis cache-plek. De checksum is geen
-	// authenticatie — de échte grens is de cap in arp.learn — maar hij haalt
-	// de triviaalste vervalsing eruit.
+	// Learn only from unicast addressed to us after transport checksum
+	// validation. The checksum is not authentication; arp.learn's cap remains
+	// the security boundary.
 	learn := func() {
 		if sameSubnet(src, s.cfg.IP, s.cfg.Prefix) && s.arp.learn(src, srcMAC, now) {
-			// Het passieve leren loste een lopende query op: de wachter op
-			// die route (dial, UDP-write) moet dat NU horen. Het pakket zelf
-			// kan hierna nog op een early-return-pad sterven (UDP zonder
-			// poort bijvoorbeeld) en dan notify't niets anders meer — de
-			// query-timer is met de pending-status mee verdwenen
-			// (review 13-08, vierendertigste ronde).
+			// Wake route waiters now because later packet processing may return
+			// early and resolving the query removed its timer.
 			s.notify()
 		}
 	}
@@ -453,31 +372,28 @@ func (s *Stack) recvIPv4(ip IPv4Frame, srcMAC [6]byte, now int64) {
 			return
 		}
 		learn()
-		// Connected UDP deelt gewoon de poorttabel; het filteren op afzender
-		// doet de socket-laag (de efemere poort is per dial uniek, dus vreemd
-		// verkeer erheen is uitzondering, geen pad).
+		// Connected UDP shares the port table; deliver applies its peer filter.
 		if !s.udp.deliver(f.DstPort(), src, f.SrcPort(), f.Payload()) {
 			s.stats.DropNoPort++
 			return
 		}
 		s.notify()
 	case ProtoICMP:
-		// Echo-reply bouwen en klaarleggen; de pomp verstuurt hem.
+		// Build an echo reply for the pump to transmit.
 		if len(s.out) >= outQueueCap {
 			s.stats.DropReplyFull++
 			return
 		}
 		reply := make([]byte, len(ip.Payload()))
 		if n, ok := icmpEcho(ip.Payload(), reply); ok {
-			learn() // icmpEcho heeft de ICMP-checksum dan gevalideerd
+			learn() // icmpEcho validated the ICMP checksum
 			s.queueOutLocked(src, ProtoICMP, reply[:n])
 			s.notify()
 		}
 	}
 }
 
-// outPkt is één verbindingsloos uitgaand pakket: de payload boven IPv4, al
-// gebouwd, plus waar hij heen moet.
+// outPkt is a serialized connectionless payload and destination.
 type outPkt struct {
 	dst   [4]byte
 	proto byte
@@ -498,39 +414,21 @@ func (s *Stack) recvTCP(f TCPFrame, src [4]byte, now int64) {
 		s.notify()
 		return
 	}
-	// Geen verbinding: een SYN voor een listener opent een embryo. Al het
-	// andere krijgt een RST (RFC 9293 §3.10.7.1) — behalve een RST zelf, want
-	// daarop antwoorden is een storm.
-	//
-	// Dat "behalve" was er eerst niet en daarmee ontbrak élke weigering: een
-	// dial naar een dichte poort wachtte zijn volle deadline uit in plaats van
-	// meteen "connection refused" te krijgen. Voor een health-check of een
-	// origin die net verhuisd is, is het verschil tussen 3 seconden stilte en
-	// een onmiddellijk antwoord het verschil tussen zoeken en weten (12-08:
-	// een verkeerd origin-adres leek een netwerkprobleem).
+	// Without a connection, a SYN to a listener opens an embryo. Everything but
+	// RST receives an RFC 9293 §3.10.7.1 reset so closed-port dials fail promptly.
 	l, listening := s.listeners[f.DstPort()]
-	// De RST-toets hoort hier óók (RFC 9293 §3.10.7.2): een SYN|RST valt zo in
-	// het refuse-pad, en dat dropt RST-dragende segmenten al stil — zelfde
-	// regel als de machine-guard. Zonder deze poort maakte newConnLocked
-	// hieronder een embryo dat de machine daarna weigerde: 20KiB in s.conns
-	// zonder timer en zonder reaper (review 13-08, vijfde ronde).
+	// Reject SYN|RST before allocating an embryo that the machine would ignore,
+	// leaving a 20 KiB connection without a timer or reaper.
 	if !listening || !seg.flags.Has(FlagSYN) || seg.flags.Has(FlagACK) ||
 		seg.flags.Has(FlagRST) {
 		if !seg.flags.Has(FlagRST) {
-			// SEQ/ACK per RFC: een segment mét ACK spiegelt dat nummer als
-			// SEQ, anders is SEQ 0 en bevestigen we de sequence-ruimte die de
-			// peer beweert te hebben gebruikt.
+			// RFC reset sequence rules depend on whether the segment carried ACK.
 			if seg.flags.Has(FlagACK) {
-				// <SEQ=SEG.ACK><CTL=RST>, zónder ACK-vlag (RFC 9293 §3.10.7.1):
-				// er is geen sequence-ruimte van de peer om te bevestigen, en
-				// een RST|ACK met ack=0 wordt door een strikte SYN-SENT-peer
-				// juist wéggegooid (die eist ack == iss+1) — review 13-08.
+				// <SEQ=SEG.ACK><CTL=RST> has no ACK flag; strict SYN-SENT peers
+				// discard RST|ACK with ack=0.
 				s.queueRSTLocked(src, f.DstPort(), f.SrcPort(), seg.ack, 0, false)
 			} else {
-				// ACK = SEG.SEQ + SEG.LEN, en SEG.LEN telt SYN en FIN als één
-				// sequence-plek — de vaste +1 die hier stond klopte alleen
-				// voor een kale SYN: bij data-zonder-vlaggen was de ACK één te
-				// hoog, bij SYN|FIN één te laag (review 13-08, negende ronde).
+				// ACK covers SEG.LEN; SYN and FIN each consume one sequence number.
 				segLen := uint32(len(seg.data))
 				if seg.flags.Has(FlagSYN) {
 					segLen++
@@ -546,8 +444,7 @@ func (s *Stack) recvTCP(f TCPFrame, src [4]byte, now int64) {
 	}
 	c, err := s.newConnLocked(key)
 	if err != nil {
-		// De pot is leeg: luid weigeren met een RST in plaats van stil
-		// verhongeren (lean-regel 2). De peer krijgt meteen "nee".
+		// Refuse immediately with RST when the buffer budget is exhausted.
 		s.stats.RefusedNoBudget++
 		s.queueRSTLocked(src, f.DstPort(), f.SrcPort(), 0, seg.seq+1, true)
 		s.notify()
@@ -555,25 +452,16 @@ func (s *Stack) recvTCP(f TCPFrame, src [4]byte, now int64) {
 	}
 	c.tcp.openPassive(s.nextISS(), uint16(MTU-40), s.cfg.AdvWS)
 	c.tcp.recv(seg, now)
-	// De reset op een onacceptabele ACK (tcpConn.rst) hoeft hier — en op
-	// het pad hierboven — niet geleegd te worden: emit stuurt hem zelf als
-	// eerstvolgende segment, en reap vangt de verbinding die eerder sterft.
-	// De vlag-en-leegprotocol tussen de lagen (dat élke recv-aanroeper moest
-	// kennen) is daarmee weg (review 13-08, vijfde ronde).
+	// emit sends any pending reset first; reap preserves it if the connection dies.
 	c.listener = l
 	s.notify()
 }
 
-// maybeAccept geeft een embryo dat zojuist Established werd aan zijn
-// listener. Hier en niet in het emit-pad: de handshake voltooit op een RECV
-// (de ACK van de peer), en daar hoeft geen enkel uitgaand segment op te
-// volgen.
+// maybeAccept offers a newly established embryo to its listener. The handshake
+// completes on receive and need not produce an outgoing segment.
 func (s *Stack) maybeAccept(c *sconn) {
-	// Ook CLOSE-WAIT: de derde handshake-ACK kan data én FIN dragen, en dan
-	// is de verbinding in één recv door ESTABLISHED heen geschoten. Alleen op
-	// exact ESTABLISHED toetsen liet Accept dan eeuwig wachten en het
-	// floor-budget hangen (review 13-08, zevenentwintigste ronde). De data en
-	// de EOF staan gewoon klaar voor de lezer.
+	// Include CLOSE-WAIT because the final handshake ACK may also carry data and
+	// FIN, passing through ESTABLISHED within one receive.
 	if c.listener != nil && !c.accepted &&
 		(c.tcp.state == tcpEstablished || c.tcp.state == tcpCloseWait) {
 		c.accepted = true
@@ -581,56 +469,33 @@ func (s *Stack) maybeAccept(c *sconn) {
 	}
 }
 
-// reap ruimt een gesloten verbinding op: sleutel weg, buffers terug de pot in.
-// Aanroepen onder s.mu na elke recv/emit die de staat kan hebben gesloten.
+// reap removes a closed connection and returns its buffers. s.mu must be held.
 //
-// Staat er nog een RST klaar, dan verhuist die eerst naar de verbindingsloze
-// wachtrij. Zonder die stap gaat een abort-dan-reap-in-één-adem stil verloren
-// (de pomp loopt over s.conns, en die sleutel is dan al weg) — gemeten met de
-// backlog-overflow-test: de geweigerde beller bleef in ESTABLISHED wachten op
-// een antwoord dat nooit kwam. Weigeren moet luid, altijd.
+// Move any pending RST to the connectionless queue first, or abort-and-reap can
+// delete it before the pump sees it.
 func (s *Stack) reap(key connKey, c *sconn) {
 	if c.tcp.state != tcpClosed || c.reaped {
 		return
 	}
 	if r := c.tcp.rst; r.set {
-		// Normaal stuurt emit hem zelf, maar een verbinding die sterft vóór
-		// de pomp langskwam nam zijn afscheids-RST anders mee het graf in.
-		// Door de queue-cap, net als élke andere RST: een kale append
-		// omzeilde de begrenzing die queueRST juist bewaakte (review 13-08,
-		// vierde ronde). Geen eigen notify: hieronder staat de
-		// onvoorwaardelijke.
+		// Use the capped queue like every other reset; notification follows below.
 		c.tcp.rst = pendingRST{}
 		s.queueRSTLocked(key.rip, key.lport, key.rport, r.seq, r.ack, r.withAck)
 	}
 	c.reaped = true
 	delete(s.conns, key)
 	s.pot.release(c.tcp.rx.size() + c.tcp.tx.size())
-	// Iedereen wakker maken: een verbinding die via een TIMER stierf (opgave
-	// na retries, FIN-WAIT-2-verval) komt hier via de pomp binnen, en zonder
-	// notify bleef een geblokkeerde Read wachten tot er toevallig ander
-	// verkeer langskwam (review 13-08). Voor de recv-paden is dit een dubbele
-	// wek — en dat kost een kanaal-swap, geen ronde.
+	// Wake blocked operations when a timer, rather than ingress, killed the connection.
 	s.notify()
-	// De pot-boekhouding van deze verbinding is hiermee AFGESLOTEN: de teller
-	// eraf halen maakt élke latere grow/shrink een no-op. Zonder dit kon een
-	// read-na-reap die de ring leegde via shrinkRx een twééde release doen —
-	// een boekhoud-panic in de maak (gevonden bij review 13-08, L9).
+	// Detach budget accounting so later reads cannot release the same capacity twice.
 	c.tcp.pot = nil
-	// Buffer-hygiëne: het budget is logisch terug, maar een socket die de
-	// aanroeper nog vasthoudt hield de échte bytes vast terwijl nieuwe
-	// verbindingen datzelfde budget opnieuw mochten alloceren — 2× het budget
-	// aan werkelijk geheugen (review 13-08). Beide ringen mogen weg: reap komt
-	// alleen na een volledige sluiting of een reset, en in beide gevallen komt
-	// er geen read meer bij de ring (de socket-laag geeft ErrClosed na de eigen
-	// Close, en een reset-fout vóór hij de ring aanraakt). De leesbare staart
-	// van een half-gesloten peer leeft in CLOSE-WAIT, en dáár is nog niet
-	// gereapt.
+	// Drop actual backing arrays when returning their logical budget. Reap only
+	// follows full close or reset; readable half-closed data remains in CLOSE-WAIT.
 	c.tcp.tx = txRing{}
 	c.tcp.rx = ring{}
 }
 
-// newConnLocked maakt een verbinding op de floor-maat, uit de pot.
+// newConnLocked reserves and creates a connection at the floor sizes.
 func (s *Stack) newConnLocked(key connKey) (*sconn, error) {
 	if !s.pot.reserve(tcpFloorRing) {
 		return nil, errNoBudget
@@ -644,20 +509,14 @@ func (s *Stack) newConnLocked(key connKey) (*sconn, error) {
 	return c, nil
 }
 
-// nextISS geeft een startsequencenummer. Geen kryptografische eis in v1 —
-// wel per verbinding vooruit, zodat snelle poort-hergebruik geen oude
-// segmenten matcht.
+// nextISS advances per connection to keep rapid port reuse from matching old segments.
 func (s *Stack) nextISS() uint32 {
-	s.issSeed += 64007 // priem; loopt de hele ruimte af
+	s.issSeed += 64007 // prime increment traverses the full space
 	return s.issSeed
 }
 
-// ephemeralPort kiest sequentieel een vrije poort ≥ 49152 en slaat bezette
-// over; bij een botsing kiest de váller opnieuw in plaats van hard te falen
-// (BEVINDINGEN #14). inUse is de namespace van de vrager: TCP en UDP zijn
-// onafhankelijke poortruimtes (TCP:80 en UDP:80 bestaan naast elkaar) — de
-// oude gedeelde toets was asymmetrisch: TCP-na-UDP faalde, UDP-na-TCP niet
-// (review 13-08). De cursor blijft gedeeld; dat kost hoogstens een extra stap.
+// ephemeralPort chooses the next free dynamic port. inUse supplies the caller's
+// namespace because TCP and UDP ports are independent.
 func (s *Stack) ephemeralPort(inUse func(uint16) bool) (uint16, error) {
 	for i := 0; i <= ephemeralEnd-ephemeralBase; i++ {
 		p := s.nextEph
@@ -674,9 +533,7 @@ func (s *Stack) ephemeralPort(inUse func(uint16) bool) (uint16, error) {
 	return 0, errPortsInUse
 }
 
-// tcpPortInUse is de TCP-namespace: listeners plus lokale poorten van
-// verbindingen (TIME-WAIT inbegrepen — zolang die staat leeft, is snel
-// hergebruik van het vier-tupel het risico dat hij afdekt).
+// tcpPortInUse includes listeners and connections, including TIME-WAIT.
 func (s *Stack) tcpPortInUse(p uint16) bool {
 	if _, ok := s.listeners[p]; ok {
 		return true
@@ -689,11 +546,10 @@ func (s *Stack) tcpPortInUse(p uint16) bool {
 	return false
 }
 
-// ---- egress: de pomp ----
+// ---- egress pump ----
 
-// pump is de TX-motor: hij slaapt tot de vroegste deadline of een notify,
-// en schrijft dan alles wat de machines klaar hebben. Register-volgorde per
-// ronde: RST-weigeringen, ICMP, ARP, dan de TCP-verbindingen.
+// pump sleeps until the earliest deadline or notification, then drains all
+// ready output.
 func (s *Stack) pump() {
 	for {
 		s.mu.Lock()
@@ -707,14 +563,13 @@ func (s *Stack) pump() {
 		s.mu.Unlock()
 
 		if again {
-			continue // zelf-verkeer verwerkt: er staat mogelijk antwoord klaar
+			continue // loopback input may have produced an immediate response
 		}
 		if deadline == 0 {
 			<-ch
 			continue
 		}
-		// Geen ondergrens nodig: nextDeadlineLocked klemt een verstreken
-		// deadline al op now+10ms, en een negatieve timer vuurt gewoon meteen.
+		// nextDeadlineLocked already delays an expired deadline; negative timers fire now.
 		t := time.NewTimer(time.Duration(deadline - s.now()))
 		select {
 		case <-ch:
@@ -724,29 +579,21 @@ func (s *Stack) pump() {
 	}
 }
 
-// drainLocked schrijft alle klaarstaande frames. De transmit gebeurt onder de
-// lock (Device.Transmit is bij alle HopOS-drivers een korte ring-schrijf);
-// als dat ooit knelt is een dubbele buffer de uitweg, niet een fijner slot.
+// drainLocked writes every ready frame. Device.Transmit is a short ring write,
+// so it runs under the lock; double-buffer if that assumption changes.
 func (s *Stack) drainLocked() (again bool) {
 	now := s.now()
 
 	for _, o := range s.out {
-		// Route best-effort én zonder ARP-molen (query=false): zonder bekend
-		// MAC vervalt het pakket — de peer merkt het aan zijn timeout en
-		// herhaalt. In het legitieme geval is het MAC er altijd (de geldige
-		// SYN/echo die dit antwoord uitlokte is net passief geleerd); een
-		// actieve query hier gaf een spoofer per refuse-RST een verdringing
-		// in de cache (review 13-08, vijftiende ronde).
+		// Route best-effort without starting ARP. Legitimate request sources were
+		// just learned; querying spoofed sources would evict real cache entries.
 		if mac, ok := s.routeLocked(o.dst, now, false); ok {
 			s.sendIPv4Locked(mac, o.dst, o.proto, o.pkt)
 		}
 	}
 	s.out = s.out[:0]
 
-	// ARP zelf: replies en query-(re)tries. Een query die in deze ronde luid
-	// opgeeft moet zijn wachters wekken: een UDP-writer (of dial) die op
-	// noAnswer poll't kreeg anders pas bij zijn eigen deadline te horen dat
-	// de route dood is (review 13-08, achtentwintigste ronde).
+	// Wake route waiters when an ARP query gives up in this drain cycle.
 	gaveUpVoor := s.arp.cnt.GaveUp
 	for {
 		n, ok := s.arp.emit(s.txBuf[EthernetHeaderSize:], now)
@@ -764,26 +611,16 @@ func (s *Stack) drainLocked() (again bool) {
 		s.notify()
 	}
 
-	// TCP: elke verbinding mag zijn klaarstaande segmenten kwijt — mits de
-	// route er is. Zonder MAC slaan we de verbinding óver (emit is lui, er
-	// wordt geen sequence-staat verspild) en heeft arp.resolve de query al
-	// gestart; de reply komt via notify terug.
+	// Drain each TCP connection when its route is available. emit is lazy, so a
+	// missing MAC consumes no sequence state while ARP resolution runs.
 	for key, c := range s.conns {
 		mac, ok := s.routeLocked(key.rip, now, true)
 		if !ok {
-			// Route weg én ARP heeft luid opgegeven: dan is overslaan geen
-			// geduld maar een bevriezing — emit draait nooit, dus de
-			// retransmissietimer telt nooit door en de verbinding hangt
-			// voorgoed (review 13-08). Zelfde hop-keuze als de dial. En hop
-			// nul (peer buiten het subnet, geen gateway) is dezelfde dood
-			// zonder ARP-lot: een inbound SYN van zo'n peer maakte anders een
-			// embryo waarvan de timer nooit gewapend werd — een 20KiB-zombie
-			// per SYN, tot de pot leeg was (review 13-08, vijfde ronde).
+			// Abort once ARP gave up or routing has no gateway. Otherwise emit never
+			// arms retransmission and the connection retains its budget forever.
 			if hop, viaARP := s.nextHopLocked(key.rip); viaARP && (hop == ([4]byte{}) || s.arp.noAnswer(hop, now)) {
-				// Alleen een route MET ARP-lot kan zo doodgaan; met een
-				// statische gateway-MAC kwam routeLocked hierboven nooit op
-				// !ok uit (review 13-08, zesendertigste ronde).
-				c.tcp.abort() // reset: read/write falen luid
+				// Static-gateway routes never reach this failure path.
+				c.tcp.abort() // make reads and writes fail explicitly
 				s.reap(key, c)
 			}
 			continue
@@ -798,11 +635,9 @@ func (s *Stack) drainLocked() (again bool) {
 		s.reap(key, c)
 	}
 
-	// Zelf-verkeer: door de eigen ingress, niet de draad op. Wat hier
-	// binnenkomt kan een antwoord opleveren (een SYN wil een SYN-ACK), dus
-	// vraagt de pomp om nog een ronde in plaats van te gaan slapen — anders
-	// zou de notify die recvIPv4 zet net te laat komen (de pomp leest zijn
-	// wake-kanaal ná deze functie).
+	// Feed loopback through ingress. It may produce an immediate response, so ask
+	// for another drain cycle instead of relying on a notification raised before
+	// the pump captures its next wake channel.
 	if len(s.loopback) == 0 {
 		return false
 	}
@@ -817,8 +652,7 @@ func (s *Stack) drainLocked() (again bool) {
 	return true
 }
 
-// nextDeadlineLocked geeft de vroegste wektijd van alle machines, of 0 als
-// niets een timer heeft lopen (dan slaapt de pomp tot een notify).
+// nextDeadlineLocked returns the earliest machine deadline, or zero for none.
 func (s *Stack) nextDeadlineLocked() int64 {
 	var d int64
 	now := s.now()
@@ -826,11 +660,8 @@ func (s *Stack) nextDeadlineLocked() int64 {
 		if t == 0 {
 			return
 		}
-		// Een deadline in het verleden hoort al door drainLocked afgehandeld
-		// te zijn; blijft hij staan (verbinding zonder route wordt in drain
-		// overgeslagen), dan is dít het herkeur-tempo. De RTO-vloer volstaat:
-		// in die fase valt er niets te versturen, en 10ms betekende 100
-		// wakeups/s zolang de route zoek was (review 13-08, derde ronde).
+		// Recheck expired deadlines at the minimum RTO. A missing route may leave
+		// one pending, and a 10 ms retry caused 100 idle wakeups per second.
 		if t <= now {
 			t = now + int64(tcpRTOMin)
 		}
@@ -848,72 +679,40 @@ func (s *Stack) nextDeadlineLocked() int64 {
 		case arpFailed:
 			add(e.born + arpFailTTL)
 		case arpResolved:
-			// Bewust GEEN wektijd. Correctheid is lui gedekt (élk consult
-			// tikt, en arp.emit tikt de hele tabel per drain-ronde) en het
-			// geheugen is al begrensd (arpCacheCap; de vol-paden vegen
-			// verlopen entries precies wanneer de ruimte ertoe doet). Een
-			// wektijd hier kocht alleen eerder opruimen van al-begrensd
-			// geheugen — tegen de prijs dat een stille stack met een paar
-			// geleerde buren periodiek wakker werd, en "een idle stack kost
-			// geen CPU" is de les van HOP's poll-tijd-jacht (review 13-08,
-			// veertiende ronde).
+			// No wakeup: every lookup expires lazily and capacity paths sweep.
+			// Memory is already capped, so periodic cleanup would only cost idle CPU.
 		}
 	}
 	return d
 }
 
-// nextHopLocked geeft het IP waarvan het ARP-lot dit doel draagt, plus óf er
-// überhaupt een ARP-lot is. viaARP=false betekent: de route staat vast (een
-// geseede gateway-MAC) en geen enkele ARP-status mag hem blokkeren — de
-// vulwaarde-vorm die hier eerst stond liet dialTCP alsnog arp.noAnswer op de
-// eindbestemming vragen, en op een tabel vol onverdringbaar werk verklaarde
-// de vol-toets van de eenendertigste ronde die bestemming dan meteen
-// onbereikbaar terwijl de SYN gewoon via de bekende gateway-MAC kon
-// vertrekken (review 13-08, zesendertigste ronde). Eén beslissing voor dial,
-// UDP-write én de route-dood in de pomp (derde ronde).
+// nextHopLocked returns the address whose ARP state governs dst. viaARP=false
+// marks a static gateway route that no ARP failure may block. Dial, UDP, and the
+// pump share this decision.
 func (s *Stack) nextHopLocked(dst [4]byte) (hop [4]byte, viaARP bool) {
 	if s.hasGwMAC && (dst == s.cfg.GW || !sameSubnet(dst, s.cfg.IP, s.cfg.Prefix)) {
-		return dst, false // statisch plan: geen ARP-lot
+		return dst, false // static plan has no ARP outcome
 	}
 	if !sameSubnet(dst, s.cfg.IP, s.cfg.Prefix) {
-		return s.cfg.GW, true // nul = geen route geconfigureerd
+		return s.cfg.GW, true // zero means no configured route
 	}
 	return dst, true
 }
 
-// routeLocked beslist het volgende-hop-MAC: binnen het subnet direct via ARP,
-// daarbuiten de gateway (statisch plan of ARP). query=false raadpleegt alleen
-// de cache (arp.peek) en start nooit een query — voor het best-effort-pad,
-// zie drainLocked.
+// routeLocked resolves the next-hop MAC directly or through the gateway.
+// query=false only peeks, for best-effort output from drainLocked.
 func (s *Stack) routeLocked(dst [4]byte, now int64, query bool) ([6]byte, bool) {
-	// Ons eigen adres: nooit ARP'en, nooit de draad op. Zonder deze regel
-	// vraagt een wereld die zijn eigen IP dialt op de draad "who has <mijzelf>"
-	// — een vraag die niemand hoort te beantwoorden (een switch floodt naar
-	// iedereen BEHALVE de bron), dus gaf dat na vijf pogingen "no route to
-	// host". GEMETEN 12-08 op ijzer: cloudflared stond na een rolling update op
-	// het slot-IP dat zijn eigen config als origin noemde, en de fout wees vijf
-	// lagen weg van de oorzaak. Zie sendEthLocked voor de loopback-naad.
+	// Route our own address directly to loopback. ARPing for ourselves cannot
+	// succeed because a switch does not reflect the broadcast to its source.
 	if dst == s.cfg.IP {
 		return s.cfg.MAC, true
 	}
-	// Broadcast gaat naar ff:ff:ff:ff:ff:ff en wordt nooit geARP't. Zonder deze
-	// regel deed de routelaag er iets stils-fouts mee: 255.255.255.255 valt
-	// buiten élk subnet, dus ging het als UNICAST naar de gateway (die het
-	// terecht negeert), en een subnet-gericht adres (x.x.x.255) ging de
-	// ARP-molen in naar een adres dat niemand bezit — vijf pogingen, dan "no
-	// route to host". De gebruiker vandaag is een DHCP-rebind (RFC 2131
-	// §4.4.5): als de lessor verdwijnt is broadcast de enige manier om de lease
-	// te houden, en dan is een fout hier het verschil tussen doorleven en het
-	// IP verliezen. Ingress blijft broadcast-IP's negeren (zie ingressLocked):
-	// het antwoord op een rebind komt unicast op ciaddr terug.
+	// Route limited and directed broadcasts to the Ethernet broadcast MAC. This
+	// is required for DHCP rebind (RFC 2131 §4.4.5); replies arrive unicast.
 	if isBroadcastIP(dst, s.cfg.IP, s.cfg.Prefix) {
 		return bcastMAC, true
 	}
-	// Een geseede gateway geldt óók voor verkeer NAAR de gateway zelf: die is
-	// same-subnet en viel dus in de ARP-tak hieronder, terwijl appnet.Up juist
-	// belooft dat dials naar de host (10.100.0.1) nul ARP kosten — hopswitch
-	// maskeerde dat door de query alsnog te beantwoorden (review 13-08,
-	// zesendertigste ronde).
+	// A seeded gateway also covers traffic addressed to the gateway itself.
 	if s.hasGwMAC && dst == s.cfg.GW {
 		return s.gwMAC, true
 	}
@@ -925,12 +724,8 @@ func (s *Stack) routeLocked(dst [4]byte, now int64, query bool) ([6]byte, bool) 
 		if dst == ([4]byte{}) {
 			return [6]byte{}, false
 		}
-		// De gateway mag óók op het best-effort-pad een echte query starten:
-		// zijn IP komt uit de config, niet uit het pakket, dus een spoofer
-		// kan er nooit méér dan deze ene entry mee laten bestaan. Zonder deze
-		// uitzondering verdampte een refuse-RST naar een off-subnet peer stil
-		// op een verse node die nog nooit uitbelde (review 13-08, zestiende
-		// ronde).
+		// Even best-effort output may resolve the configured gateway: it can create
+		// only this one trusted entry and enables off-subnet refusal resets.
 		query = true
 	}
 	if !query {
@@ -939,10 +734,9 @@ func (s *Stack) routeLocked(dst [4]byte, now int64, query bool) ([6]byte, bool) 
 	return s.arp.resolve(dst, now)
 }
 
-// ---- wire-schrijvers (allemaal onder s.mu) ----
+// ---- wire writers; s.mu must be held ----
 
-// queueOutLocked legt een gebouwd verbindingsloos pakket klaar, begrensd:
-// vol = droppen mét teller (de peer herhaalt en krijgt hem dan alsnog).
+// queueOutLocked queues a bounded connectionless packet and counts overflow.
 func (s *Stack) queueOutLocked(dst [4]byte, proto byte, pkt []byte) {
 	if len(s.out) >= outQueueCap {
 		s.stats.DropReplyFull++
@@ -951,12 +745,8 @@ func (s *Stack) queueOutLocked(dst [4]byte, proto byte, pkt []byte) {
 	s.out = append(s.out, outPkt{dst: dst, proto: proto, pkt: pkt})
 }
 
-// queueRSTLocked bouwt een verbindingsloze RST en legt hem klaar. De bytes
-// ontstaan op het quéue-moment: alles wat PutTCP nodig heeft is hier al
-// bekend, en dan hoeft er geen tweede pending-vorm (rstPending + noAck) naast
-// de wachtrij te bestaan (review 13-08, zesde ronde). withAck kiest tussen
-// <SEQ,ACK><RST|ACK> (op een SYN of vanuit een verbinding) en de kale
-// <SEQ=SEG.ACK><RST> van RFC 9293 §3.10.7.1.
+// queueRSTLocked serializes and queues a reset. withAck selects RST|ACK versus
+// RFC 9293 §3.10.7.1's bare <SEQ=SEG.ACK><RST>.
 func (s *Stack) queueRSTLocked(dst [4]byte, sport, dport uint16, seq, ack uint32, withAck bool) {
 	flags := FlagRST
 	if withAck {
@@ -965,10 +755,9 @@ func (s *Stack) queueRSTLocked(dst [4]byte, sport, dport uint16, seq, ack uint32
 	buf := make([]byte, sizeTCP)
 	n, err := PutTCP(buf, sport, dport, seq, ack, flags, 0, nil, s.cfg.IP, dst, 0)
 	if err != nil {
-		return // kan alleen bij een interne maatfout
+		return // only an internal sizing error can reach this
 	}
-	// queueOutLocked draagt de cap en de teller; bij vol zijn de 20 gebouwde
-	// bytes het enige verlies (review 13-08, achtste ronde).
+	// queueOutLocked enforces the cap and counts overflow.
 	s.queueOutLocked(dst, ProtoTCP, buf[:n])
 }
 
@@ -979,50 +768,32 @@ func (s *Stack) sendEthLocked(dst [6]byte, etherType uint16, payloadLen int) err
 	eth.SetEtherType(etherType)
 	n := EthernetHeaderSize + payloadLen
 	if n < 60 {
-		// Minimale ethernet-framelengte; padding nul zodat er geen oud
-		// bufferafval het net op gaat.
+		// Zero-pad to the minimum Ethernet frame length to avoid leaking old data.
 		for i := EthernetHeaderSize + payloadLen; i < 60; i++ {
 			s.txBuf[i] = 0
 		}
 		n = 60
 	}
-	// Loopback: een frame aan onszelf gaat niet de draad op maar de eigen
-	// ingress in. Dat is wat "127.0.0.1" elders doet, hier op het enige adres
-	// dat we hebben — een agent die zijn eigen poort belt en een app die per
-	// ongeluk zijn eigen slot-IP als origin heeft, komen beide netjes uit
-	// (verbinding of connection refused, niet "no route to host").
+	// Frames to our own MAC enter local ingress rather than the wire, providing
+	// loopback semantics on this stack's only address.
 	//
-	// De kopie is nodig omdat txBuf de volgende regel al hergebruikt wordt.
-	// Bewust geen bulk-pad: dit draagt agent↔leader-verkeer, geen downloads.
-	// Loopt de wachtrij vol (een lokale peer die niet leest), dan dropt dit
-	// zoals elke volle ring dropt — TCP herzendt.
+	// Copy because txBuf is reused immediately. Overflow drops and TCP retransmits.
 	if dst == s.cfg.MAC {
 		if len(s.loopback) >= loopbackMax {
-			// Vol is een FOUT voor de aanroeper: TCP negeert hem (de
-			// retransmissie herstelt), maar een UDP-Write die "gelukt" meldt
-			// terwijl het datagram nergens ligt is een leugen zonder tweede
-			// kans (review 13-08, vijfde ronde).
+			// Report overflow: TCP can recover by retransmission, but UDP cannot.
 			s.stats.DropReplyFull++
 			return errLoopbackFull
 		}
 		s.loopback = append(s.loopback, append(s.lbBuf(), s.txBuf[:n]...))
-		// Wakker maken, want niet elke zender is de pomp: een UDP-Write
-		// schrijft rechtstreeks vanuit de socket-call, en zonder notify
-		// bleef zijn datagram in de wachtrij tot er iets ánders gebeurde
-		// (i/o timeout op een loopback-vraag, gemeten in de eerste versie
-		// van deze naad).
+		// Wake the pump because UDP may enqueue loopback directly from Write.
 		s.notify()
 		return nil
 	}
-	// De fout gaat terug naar de aanroeper. TCP negeert hem (de retransmissie
-	// ís het herstel), maar UDP heeft geen tweede kans: een Write die "gelukt"
-	// meldt terwijl de NIC het pakket weigerde, is een leugen (review 13-08).
+	// Return transmit errors; TCP retransmits, while UDP must report failure.
 	return s.dev.Transmit(s.txBuf[:n])
 }
 
-// lbBuf geeft een lege buffer voor de loopback-wachtrij: hergebruikt wat
-// drainLocked teruggaf, zodat een levendige lokale gesprekspartner niet elke
-// ronde nieuwe frames alloceert.
+// lbBuf reuses loopback buffers returned by drainLocked.
 func (s *Stack) lbBuf() []byte {
 	if n := len(s.lbFree); n > 0 {
 		b := s.lbFree[n-1]
@@ -1044,36 +815,35 @@ func (s *Stack) sendTCPLocked(dstMAC [6]byte, key connKey, w wireSeg) {
 	n, err := PutTCP(s.txBuf[off:], key.lport, key.rport, w.seg.seq, w.seg.ack,
 		w.seg.flags, w.seg.wnd, w.opts, s.cfg.IP, key.rip, w.payloadLen)
 	if err != nil {
-		s.stats.DropBadFrame++ // kan alleen bij een interne maatfout; tel hem luid
+		s.stats.DropBadFrame++ // count the internal sizing error explicitly
 		return
 	}
 	PutIPv4(s.txBuf[EthernetHeaderSize:], ProtoTCP, s.cfg.IP, key.rip, n)
 	s.sendEthLocked(dstMAC, EtherTypeIPv4, sizeIPv4+n)
 }
 
-// ---- TCP-segment ⇄ draad ----
+// ---- TCP segment ⇄ wire ----
 
-// wireSeg is een emit-resultaat plus zijn draaddetails.
+// wireSeg is an emitted segment plus wire-format details.
 type wireSeg struct {
 	seg        tcpSeg
 	opts       []byte
 	payloadLen int
 }
 
-// sconn is een verbinding zoals de stack hem kent: machine + identiteit.
+// sconn combines a TCP machine with stack identity.
 type sconn struct {
 	stack    *Stack
 	key      connKey
 	tcp      tcpConn
-	listener *tcpListener // gezet op embryo's; accept haalt hem hier weg
+	listener *tcpListener // set on embryos and cleared by accept
 	accepted bool
 	reaped   bool
 
 	optsBuf [8]byte
 }
 
-// emitWire laat de machine één segment produceren, direct in het tx-frame op
-// de plek waar de payload hoort (nul kopieën), en bouwt de SYN-opties erbij.
+// emitWire writes payload directly into its transmit-frame position and adds SYN options.
 func (c *sconn) emitWire(txBuf []byte, now int64) (wireSeg, bool) {
 	payloadAt := EthernetHeaderSize + sizeIPv4 + sizeTCP
 	seg, ok := c.tcp.emit(txBuf[payloadAt:], now)
@@ -1082,9 +852,8 @@ func (c *sconn) emitWire(txBuf []byte, now int64) (wireSeg, bool) {
 	}
 	w := wireSeg{seg: seg, payloadLen: len(seg.data)}
 	if seg.flags.Has(FlagSYN) {
-		// MSS (kind 2) + NOP + WS (kind 3): samen 8 bytes, netjes uitgelijnd.
-		// Een SYN draagt bij ons nooit payload, dus de optie-bytes overlappen
-		// niets.
+		// MSS plus NOP and window scale occupy one aligned eight-byte block. SYN
+		// carries no payload here, so options overlap nothing.
 		b := c.optsBuf[:0]
 		b = append(b, 2, 4, byte(seg.mss>>8), byte(seg.mss))
 		if seg.wsOK {
@@ -1095,8 +864,7 @@ func (c *sconn) emitWire(txBuf []byte, now int64) (wireSeg, bool) {
 	return w, true
 }
 
-// parseTCPSeg vertaalt een gevalideerd TCP-frame naar het machine-segment,
-// inclusief de SYN-opties (MSS, WS).
+// parseTCPSeg converts a validated frame and its MSS/WS options to machine form.
 func parseTCPSeg(f TCPFrame) (tcpSeg, bool) {
 	seg := tcpSeg{
 		seq:   f.Seq(),
@@ -1116,7 +884,7 @@ func parseTCPSeg(f TCPFrame) (tcpSeg, bool) {
 				continue
 			}
 			if len(opts) < 2 || int(opts[1]) < 2 || int(opts[1]) > len(opts) {
-				return seg, false // kapotte optielijst: frame weigeren
+				return seg, false // reject malformed options
 			}
 			switch opts[0] {
 			case 2: // MSS

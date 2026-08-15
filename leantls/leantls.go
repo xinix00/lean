@@ -1,119 +1,63 @@
-// Package leantls is een TLS 1.3-client voor een netwerk dat je zelf bezit: één
-// versie, één cipher suite, één sleuteluitwisseling, en een tegenpartij die je
-// herkent aan een VASTGEZETTE Ed25519-sleutel in plaats van aan een
-// certificaatketen. Stdlib-only.
+// Package leantls is a standard-library-only TLS 1.3 client for networks you
+// control: one version, cipher suite, key exchange, and a peer identified by a
+// pinned Ed25519 key instead of a certificate chain.
 //
-// Het gemeten probleem (2026-08-12, tamago/riscv64, dezelfde main met alleen de
-// TLS-kant verschillend, `-w -T 0x84010000`):
+// Measured with the same tamago/riscv64 main (`-w -T 0x84010000`, 2026-08-12):
 //
-//	board + fmt (de vloer) ................... 1,69 MB
-//	+ dit pakket, gepinde sleutel ............ 2,51 MB   (+0,82)
-//	+ dit pakket, keten via leantls/x509verify  3,73 MB   (+2,04)
-//	+ crypto/tls met CA-rootbundel ........... 4,09 MB   (+2,40)
+//	board + fmt baseline ...................... 1.69 MB
+//	+ this package, pinned key ................ 2.51 MB (+0.82)
+//	+ this package plus x509verify chain ...... 3.73 MB (+2.04)
+//	+ crypto/tls with CA root bundle .......... 4.09 MB (+2.40)
 //
-// LEES DIE TABEL GOED, want er staan twee heel verschillende getallen in:
+// Pinned mode saves 1.57 MB over crypto/tls. Chain mode alone saves 0.63 MB,
+// but also unlocks leanhttp's larger saving. For the same HTTPS download:
 //
-//   - Met een GEPINDE SLEUTEL is dit pakket 1,57 MB lichter dan crypto/tls, en
-//     dat is na de netstack het grootste enkele blok dat een bare-metal
-//     Go-programma kan laten staan. Dáár is dit pakket voor.
-//   - Met een ECHTE CERTIFICAATKETEN (leantls/x509verify) is het 0,63 MB lichter
-//     dan crypto/tls. Op zichzelf weinig — maar het ontsluit iets groters, en
-//     dat is de reden dat die modus bestaat. Zie hieronder.
+//	net/http + crypto/tls ................. 5.53 MB
+//	leanhttp + crypto/tls ................. 4.43 MB (-1.10)
+//	leanhttp + leantls + x509verify ....... 3.80 MB (-1.73)
 //
-// # Waarom de ketenmodus tóch de moeite is
+// Pinned mode avoids crypto/x509, encoding/asn1, math/big, RSA, NIST curves,
+// and the CA bundle. It uses X25519, AES-128-GCM, SHA-256, HMAC, HKDF,
+// Ed25519, and crypto/rand, linking no crypto/tls, crypto/x509, or encoding/asn1.
 //
-// Een programma dat een bestand over https ophaalt gebruikt geen crypto/tls
-// LOS; het gebruikt net/http, en dat is de echte basislijn. Gemeten met dezelfde
-// download:
+// # Pinned identity
 //
-//	net/http + crypto/tls ................. 5,53 MB
-//	leanhttp + crypto/tls ................. 4,43 MB   (-1,10)
-//	leanhttp + leantls + x509verify ....... 3,80 MB   (-1,73)
+// Ordinary HTTPS delegates identity to a CA chain. A pin instead distributes a
+// known 32-byte Ed25519 public key with the node. The handshake requires the
+// certificate key to equal it and verifies the transcript signature with that
+// key. This removes CA, name, and validity ambiguity at the cost of distributing
+// new pins when keys rotate, which fits a controlled fleet but not public hosts.
 //
-// Die 1,10 MB van leanhttp was vóór dit pakket NIET te verzilveren voor https:
-// leanhttp weigert een https-URL zonder een eigen Dial, en de enige Dial die
-// bestond was crypto/tls — waarmee de PKI en het halve net/http-gewicht weer
-// binnenkwamen. leantls is de Dial die dat opent. In een kern die vandaag
-// net/http plus crypto/tls draagt, is de hele stapel dus 1,73 MB lichter.
+// # Deliberate limits
 //
-// De winst zit dus niet in TLS maar in de PKI die je NIET nodig hebt zodra je de
-// tegenpartij al kent: crypto/x509, encoding/asn1, math/big, RSA, de NIST-curves
-// met hun voorberekende tabel (86 KB) en de CA-rootbundel (123 KB). Wat dit
-// pakket in de gepinde modus gebruikt is crypto/ecdh (X25519), crypto/aes +
-// crypto/cipher (AES-128-GCM), crypto/sha256, crypto/hmac, crypto/hkdf,
-// crypto/ed25519 en crypto/rand. Verder niets — geen enkel symbool van
-// crypto/tls, crypto/x509 of encoding/asn1 in het image.
+// Pinned mode performs no chain, CA, name, or validity checks; [Config.PeerKey]
+// is the identity. [Config.VerifyPeer] enables caller-supplied chain validation,
+// with leantls/x509verify providing the standard form. [Client] rejects a
+// missing or ambiguous trust model.
 //
-// # Wat "een gepinde sleutel" is
+// Only TLS 1.3, TLS_AES_128_GCM_SHA256, X25519, and Ed25519 are supported in
+// pinned mode. There is no downgrade, session resumption, PSK, 0-RTT, client
+// certificate, HelloRetryRequest, or renegotiation. Removing downgrade,
+// compression, CBC, RSA-PKCS#1v1.5, and custom chain validation eliminates the
+// usual dangerous TLS state space. RFC 8448 vectors test the key schedule;
+// crypto/tls interoperability tests the transcript and record layer.
 //
-// Gewone https werkt zo: je weet niet wie de server is, dus je vertrouwt een
-// KETEN. Het certificaat zegt "ik ben github.com" en een CA die jij vertrouwt
-// staat daarvoor in. Om dat na te rekenen heb je alles nodig wat hierboven
-// 1,05 MB kost — 119 roots, padopbouw, geldigheidsdata, naamvergelijking — en
-// je vertrouwt daarmee 119 organisaties om nooit een verkeerd certificaat uit
-// te geven.
+// # Usage
 //
-// Een pin draait dat om: je KENT de sleutel van de tegenpartij al, omdat je hem
-// er zelf hebt neergezet. De leader maakt één keer een Ed25519-sleutelpaar; zijn
-// PUBLIEKE helft (32 bytes) gaat mee in de config of het image van de node. Bij
-// de handshake doet dit pakket dan twee dingen: het vergelijkt de sleutel in het
-// certificaat met die 32 bytes, en het toetst dat de tegenpartij met de
-// bijbehorende geheime helft over het transcript heeft ondertekend.
-//
-// Daarmee vervalt de hele vraag "wie staat hiervoor in?". Je vraagt niet meer
-// "is dit echt github.com?" maar "is dit de sleutel die ik zelf in mijn config
-// heb gezet?" — en dat is geen zwakkere controle maar een strengere: er is geen
-// CA die zich kan vergissen, geen naam die kan matchen op iets anders, geen
-// datum die kan verlopen. Wat je ervoor inlevert is distributie: die 32 bytes
-// moeten bij de node komen, en als de sleutel wisselt moet dat opnieuw. Voor een
-// vloot die je zelf bezit is dat een configuratieregel. Voor github.com kan het
-// niet, want dáár ken je de sleutel niet vooraf en roteert hij per kwartaal.
-//
-// # Wat het niet doet, en waarom dat luid faalt
-//
-// De ruil is scherp en hij staat hier zodat niemand hem per ongeluk maakt:
-//
-//   - In de gepinde modus: GEEN certificaatketen, geen CA's, geen
-//     naamvergelijking, geen geldigheidsdata. Wie de tegenpartij is, staat in
-//     [Config.PeerKey]. Wil je een keten, dan zet je [Config.VerifyPeer] en doe
-//     je dat zelf — dit pakket importeert crypto/x509 niet, zodat wie met een pin
-//     werkt er niets voor betaalt. En zie de tabel hierboven vóór je dat doet.
-//   - Zonder vertrouwensmodel weigert [Client] te verbinden. Niet "vertrouw
-//     alles", niet een waarschuwing: een weigering die zegt wat de twee keuzes
-//     zijn.
-//   - Alleen TLS 1.3. Een server die 1.2 kiest krijgt geen stille terugval maar
-//     een fout: terugvallen is precies waar de aanvallen op TLS zitten.
-//   - Eén suite (TLS_AES_128_GCM_SHA256), één groep (X25519), één signatuur
-//     (Ed25519). Alles anders is een fout met het gekozen nummer erin.
-//   - Geen session resumption, geen PSK, geen 0-RTT, geen clientcertificaten,
-//     geen HelloRetryRequest, geen renegotiation (die bestaat niet in 1.3).
-//
-// Dat lijstje is niet alleen een beperking, het is de veiligheidsredenering.
-// Wat rolling-your-own-TLS historisch sloopt is bijna altijd version downgrade,
-// renegotiation, compressie, CBC-padding, RSA-PKCS#1v1.5, of een fout in
-// ketenvalidatie. Geen daarvan is hier voorzichtig aangepakt: ze bestaan niet.
-// Wat overblijft is de key schedule, de recordlaag en het transcript — en die
-// drie zijn deterministisch en met bekende antwoorden te toetsen. De schedule
-// staat in schedule_test.go tegen de uitgewerkte handshake van RFC 8448; de rest
-// staat in leantls_test.go tegen crypto/tls zelf als tegenpartij.
-//
-// # Gebruik
-//
-//	// Waar dit pakket voor is: een tegenpartij die je al kent.
+//	// A peer whose key is already known:
 //	conn, err := leantls.Dial("tcp", "leader:7443", &leantls.Config{
-//	    PeerKey: leaderKey, // 32 bytes, uit je eigen configuratie
+//	    PeerKey: leaderKey, // 32 bytes from your own configuration
 //	})
 //
-//	// En als het toch een echte keten moet zijn (lees eerst de tabel hierboven):
+//	// A public certificate chain:
 //	conn, err := leantls.Dial("tcp", "github.com:443", &leantls.Config{
 //	    ServerName:          "github.com",
 //	    VerifyPeer:          x509verify.Chain(nil),
 //	    SignatureAlgorithms: x509verify.SignatureAlgorithms,
 //	})
 //
-// Het resultaat is een gewone net.Conn, dus leanhttp of wat dan ook gaat er
-// bovenop. Dit pakket kent geen HTTP en geen netstack — het staat op net.Conn en
-// verder niets, zoals elk pakket hier.
+// The result is an ordinary net.Conn. This package knows neither HTTP nor the
+// underlying network stack.
 package leantls
 
 import (
@@ -128,78 +72,48 @@ import (
 	"time"
 )
 
-// Config beschrijft wie we verwachten aan de andere kant. Kies ÉÉN van de twee
-// vertrouwensmodellen: PeerKey (een gepinde sleutel) of VerifyPeer (je eigen
-// controle, bijvoorbeeld een echte certificaatketen). Beide leeg is een
-// weigering, en beide gezet ook — dan is niet duidelijk wat er telt.
+// Config identifies the expected peer. Set exactly one trust model: PeerKey for
+// a pin, or VerifyPeer for caller-supplied validation such as a certificate
+// chain. Missing and ambiguous trust both fail.
 type Config struct {
-	// PeerKey is de Ed25519-publieke sleutel die de server MOET hebben: geen
-	// keten, maar één vergelijking. Dit is de goedkope modus — er komt geen enkel
-	// stukje PKI aan te pas.
+	// PeerKey is the Ed25519 public key the server must prove. This mode links no
+	// PKI.
 	PeerKey ed25519.PublicKey
 
-	// VerifyPeer is de andere modus: jíj bepaalt of deze tegenpartij te
-	// vertrouwen is. Hij krijgt de certificaatketen zoals de server hem stuurde
-	// (DER, leaf eerst) plus de naam waarvoor hij hoort te gelden, en geeft terug
-	// hoe de handtekening van die server over het transcript getoetst moet worden.
-	//
-	// Waarom een HAAK en geen ingebouwde ketenvalidatie: wie een echte keten wil
-	// valideren, wil crypto/x509 — dat is de implementatie die de wereld al een
-	// decennium aanvalt, en zelf X.509 schrijven levert gemeten ~0,2 MB op tegen
-	// precies de code waar de CVE's in die categorie zitten. Maar crypto/x509
-	// kost ~0,75 MB, en dat mag niet gelden voor wie met een gepinde sleutel
-	// werkt. Met deze haak importeert leantls het niet: wie hem gebruikt, linkt
-	// het zelf.
-	//
-	// Voor de gewone https-vorm staat er een kant-en-klare in het subpakket
-	// leantls/x509verify.
+	// VerifyPeer receives the wire certificate chain in leaf-first DER order and
+	// the expected name, then returns a transcript-signature verifier. The hook
+	// keeps crypto/x509's ~0.75 MB out of pinned builds; leantls/x509verify
+	// provides standard HTTPS chain validation.
 	VerifyPeer func(certs [][]byte, serverName string) (SignatureVerifier, error)
 
-	// ServerName is de SNI die we sturen, en in de VerifyPeer-modus tevens de
-	// naam waarvoor het certificaat moet gelden. In de PeerKey-modus is hij
-	// optioneel: daar doet de pin het vertrouwen, niet de naam.
+	// ServerName is sent as SNI and passed to VerifyPeer for certificate identity.
+	// It is optional with PeerKey because the pin supplies identity.
 	ServerName string
 
-	// SignatureAlgorithms zijn de TLS-codes die we in ClientHello aanbieden voor
-	// de handtekening van de server (RFC 8446 §4.2.3). Leeg betekent alleen
-	// Ed25519 — precies wat de PeerKey-modus kan toetsen. Een VerifyPeer die
-	// meer kan, hoort hier te zeggen wát; x509verify.SignatureAlgorithms is de
-	// bijbehorende lijst.
-	//
-	// Een server kiest ALTIJD uit deze lijst, dus een algoritme aanbieden dat je
-	// niet kunt toetsen levert een handshake die pas bij de handtekening faalt.
+	// SignatureAlgorithms are offered for server CertificateVerify
+	// (RFC 8446 §4.2.3). Empty means Ed25519 only. A VerifyPeer supporting more
+	// should supply exactly those codes, such as x509verify.SignatureAlgorithms.
 	SignatureAlgorithms []uint16
 }
 
-// SignatureVerifier toetst de CertificateVerify van de server: sigAlg is de code
-// die de server koos, signed is precies wat er ondertekend hoort te zijn, en sig
-// de handtekening. Nil terug = goed.
-//
-// Een ALIAS en geen eigen type, en dat is functioneel: een eigen type zou pas
-// toewijsbaar zijn vanuit code die leantls importeert, en dan moet een
-// hulppakket als leantls/x509verify dit pakket importeren om er een verifier aan
-// te kunnen geven. Met een alias is de functievorm identiek en blijft dat
-// hulppakket een bouwsteen die op zichzelf staat — precies de regel waar deze
-// hele verzameling op rust.
+// SignatureVerifier checks server CertificateVerify. sigAlg is the selected
+// TLS code, signed is the exact transcript input, and sig is the signature. Nil
+// means success. The alias lets helper packages provide verifiers without
+// importing leantls.
 type SignatureVerifier = func(sigAlg uint16, signed, sig []byte) error
 
-// Conn is een TLS 1.3-verbinding en implementeert net.Conn.
+// Conn is a TLS 1.3 connection implementing net.Conn.
 type Conn struct {
 	conn net.Conn
 	cfg  Config
 
-	// Eén slot per richting. Dit is GEEN netheid: net.Conn staat toe dat
-	// meerdere goroutines hem tegelijk gebruiken, en twee gelijktijdige Writes
-	// zouden twee records met hetzelfde recordnummer kunnen opleveren. Dat is in
-	// AES-GCM een hergebruikte nonce, en een hergebruikte nonce is niet een bug
-	// met een verkeerd resultaat maar het einde van zowel de vertrouwelijkheid
-	// als de integriteit van die sleutel. Read heeft zijn eigen slot om dezelfde
-	// reden aan de leeskant, plus omdat hij post-handshake berichten verwerkt
-	// (en daarvoor de zendkant nodig heeft, vandaar wmu binnen rmu).
+	// One lock per direction preserves net.Conn concurrency without reusing an
+	// AES-GCM sequence number/nonce. Read also processes post-handshake messages
+	// and may acquire wmu while holding rmu.
 	rmu sync.Mutex
 	wmu sync.Mutex
 
-	// Recordlaag per richting. seq begint bij nul na élke sleutelwissel.
+	// Per-direction record state; sequence resets after every key change.
 	wKeys trafficKeys
 	wAEAD cipher.AEAD
 	wSeq  uint64
@@ -207,32 +121,27 @@ type Conn struct {
 	rAEAD cipher.AEAD
 	rSeq  uint64
 
-	transcript []byte // alle handshake-berichten; leeg na de handshake
-	hsBuf      []byte // handshake-bytes die nog geen heel bericht vormen
-	plain      []byte // uitgelezen applicatiedata die nog niet opgehaald is
-	readErr    error  // sticky: een recordlaag die faalde faalt voorgoed
+	transcript []byte // all handshake messages; cleared afterward
+	hsBuf      []byte // incomplete handshake-message bytes
+	plain      []byte // decrypted application data not yet returned
+	readErr    error  // sticky: record-layer failures are permanent
 }
 
 var _ net.Conn = (*Conn)(nil)
 
-// dialTimeout begrenst het opzetten van de verbinding én de handshake, elk
-// apart: een peer die de TCP-handdruk wél beantwoordt maar daarna zwijgt
-// (firewall-blackhole, kapotte middlebox) gijzelde anders de goroutine en de
-// socket voorgoed — en elke laag erboven (leanhttp's dialBounded) kan een
-// dialer alleen begrenzen als die zélf eindig is (review 13-08, dertiende
-// ronde). Zelfde waarde als leanhttp's dialTimeout.
+// dialTimeout separately bounds TCP setup and TLS handshake so a silent peer
+// cannot retain a goroutine and socket forever. It matches leanhttp's timeout.
 const dialTimeout = 10 * time.Second
 
-// Dial opent een TCP-verbinding en doet de handshake, beide met een termijn
-// (zie dialTimeout). Wie andere termijnen wil, dialt zelf en geeft de
-// verbinding aan [Client]; wie kan annuleren wil, neemt [DialContext].
+// Dial opens TCP and performs the handshake with [dialTimeout]. For custom
+// deadlines, dial separately and call [Client]; for cancellation use
+// [DialContext].
 func Dial(network, addr string, cfg *Config) (*Conn, error) {
 	return DialContext(context.Background(), network, addr, cfg)
 }
 
-// DialContext is Dial mét annulering: ctx kapt de TCP-dial af, en zijn
-// deadline klemt (indien eerder) ook de handshake-termijn — zo leeft er geen
-// dial voort nadat de aanroeper al opgaf (review 13-08, vijftiende ronde).
+// DialContext adds cancellation to Dial. An earlier context deadline also caps
+// the handshake so a dial cannot outlive its caller.
 func DialContext(ctx context.Context, network, addr string, cfg *Config) (*Conn, error) {
 	d := net.Dialer{Timeout: dialTimeout}
 	c, err := d.DialContext(ctx, network, addr)
@@ -253,12 +162,9 @@ func DialContext(ctx context.Context, network, addr string, cfg *Config) (*Conn,
 	return tc, nil
 }
 
-// Client doet de handshake over een bestaande verbinding. Bij een fout is de
-// onderliggende verbinding onbruikbaar en aan de aanroeper om te sluiten.
-//
-// De handshake gebeurt hier en niet bij de eerste Read of Write: een fout in het
-// vertrouwen (verkeerde sleutel, geen 1.3) hoort te vallen waar je hem
-// verwacht, niet drie lagen verderop bij een lees.
+// Client performs the handshake over an existing connection. On error, the
+// caller must close the unusable underlying connection. Handshake is eager so
+// trust failures occur here instead of during later application I/O.
 func Client(conn net.Conn, cfg *Config) (*Conn, error) {
 	if cfg == nil {
 		return nil, errors.New("leantls: a Config is required")
@@ -272,8 +178,7 @@ func Client(conn net.Conn, cfg *Config) (*Conn, error) {
 		return nil, fmt.Errorf("leantls: Config.PeerKey is %d bytes, an Ed25519 public key is %d",
 			len(cfg.PeerKey), ed25519.PublicKeySize)
 	case !pinned && cfg.VerifyPeer == nil:
-		// Lean-regel 2 op de plek waar het het meest telt: geen stille
-		// "vertrouw alles", maar een weigering die zegt wat de twee keuzes zijn.
+		// Never invent a trust-all fallback.
 		return nil, errors.New("leantls: no trust model — set Config.PeerKey for a pinned peer, " +
 			"or Config.VerifyPeer to check a certificate chain yourself (see leantls/x509verify)")
 	case !pinned && cfg.ServerName == "":
@@ -287,12 +192,9 @@ func Client(conn net.Conn, cfg *Config) (*Conn, error) {
 	return c, nil
 }
 
-// hash is de Transcript-Hash over alles wat er tot nu toe gewisseld is.
-//
-// Het transcript wordt als BYTES bijgehouden en niet als lopende hash, omdat de
-// schedule er op vijf momenten een momentopname van nodig heeft (§4.4.1) en een
-// hash die je vijf keer moet klonen meer fout kan gaan dan een buffer van een
-// paar kilobyte. Na de handshake gaat hij op nil.
+// hash returns the transcript hash. Keeping a few KiB of bytes is simpler than
+// cloning running hash state at five RFC 8446 §4.4.1 checkpoints; the transcript
+// is cleared after handshake.
 func (c *Conn) hash() []byte {
 	sum := sha256.Sum256(c.transcript)
 	return sum[:]
@@ -306,17 +208,14 @@ func (c *Conn) setWrite(k trafficKeys) {
 	c.wKeys, c.wAEAD, c.wSeq = k, aeadFor(k), 0
 }
 
-// writeCCS stuurt het lege change_cipher_spec-record. Altijd plaintext, ook als
-// de sleutels al staan — daarom niet via writeRecord.
+// writeCCS sends the empty plaintext change_cipher_spec compatibility record.
 func (c *Conn) writeCCS() error {
 	_, err := c.conn.Write([]byte{recCCS, 3, 3, 0, 1, 1})
 	return err
 }
 
-// readHandshakeMsg geeft het volgende handshake-bericht (type + body) en voegt
-// het aan het transcript toe. Berichten en records staan los van elkaar: één
-// record kan meerdere berichten dragen en één bericht kan over records
-// verdeeld zijn, dus dit buffert over recordgrenzen heen.
+// readHandshakeMsg returns and records the next handshake message. It buffers
+// across record boundaries because records and messages do not align.
 func (c *Conn) readHandshakeMsg() (byte, []byte, error) {
 	for {
 		if len(c.hsBuf) >= 4 {
@@ -334,8 +233,7 @@ func (c *Conn) readHandshakeMsg() (byte, []byte, error) {
 		}
 		switch typ {
 		case recCCS:
-			// Middlebox-compatibiliteit, zonder betekenis in 1.3 (§5). Niet in
-			// het transcript, want het is geen handshake-bericht.
+			// TLS 1.3 middlebox compatibility (§5); not a handshake message.
 		case recAlert:
 			return 0, nil, alertError(payload)
 		case recHandshake:
@@ -349,15 +247,12 @@ func (c *Conn) readHandshakeMsg() (byte, []byte, error) {
 	}
 }
 
-// maxHandshake begrenst wat één handshake-bericht mag zijn. Een certificaatketen
-// is het grootste dat hier langskomt en die is in de praktijk enkele KB; dit is
-// de grens waarboven een tegenpartij ons geheugen laat claimen in plaats van een
-// handshake te doen.
+// maxHandshake prevents a peer from turning one handshake message into an
+// unbounded allocation; certificate chains are normally only a few KiB.
 const maxHandshake = 1 << 16
 
-// Read levert applicatiedata. Post-handshake berichten van de tegenpartij
-// (NewSessionTicket, KeyUpdate) worden hier afgehandeld en zijn voor de
-// aanroeper onzichtbaar — dat is de enige plek waar ze langs kunnen komen.
+// Read returns application data and transparently handles post-handshake
+// NewSessionTicket and KeyUpdate messages.
 func (c *Conn) Read(p []byte) (int, error) {
 	c.rmu.Lock()
 	defer c.rmu.Unlock()
@@ -377,7 +272,7 @@ func (c *Conn) Read(p []byte) (int, error) {
 			c.readErr = alertError(payload)
 			return 0, c.readErr
 		case recCCS:
-			// negeren, ook na de handshake
+			// Ignore compatibility CCS even after handshake.
 		case recHandshake:
 			if err := c.postHandshake(payload); err != nil {
 				c.readErr = err
@@ -393,7 +288,7 @@ func (c *Conn) Read(p []byte) (int, error) {
 	return n, nil
 }
 
-// postHandshake verwerkt wat een server ná de handshake nog mag sturen.
+// postHandshake processes messages a server may send after handshake.
 func (c *Conn) postHandshake(payload []byte) error {
 	r := reader{buf: payload}
 	for !r.empty() {
@@ -407,23 +302,17 @@ func (c *Conn) postHandshake(payload []byte) error {
 		}
 		switch typ {
 		case hsNewSessionTicket:
-			// We doen geen resumption, dus dit is informatie die we niet
-			// gebruiken. Overslaan en niet als fout melden: een server die
-			// tickets stuurt doet niets verkeerd.
+			// Resumption is unsupported, but sending tickets is valid.
 		case hsKeyUpdate:
-			// §4.6.3. De tegenpartij vernieuwt zijn zendsleutel, dus wij
-			// vernieuwen onze leessleutel. Vraagt hij er ook om (1), dan doen we
-			// hetzelfde met onze zendkant en melden dat — anders zou hij op een
-			// antwoord wachten dat nooit komt.
+			// RFC 8446 §4.6.3: update read keys and reciprocate when requested.
 			req, err := body.u8()
 			if err != nil {
 				return err
 			}
 			c.setRead(c.rKeys.next())
 			if req == 1 {
-				// Expliciet slot en geen defer: er kunnen meer KeyUpdates in
-				// één record zitten, en een defer in deze lus zou bij de tweede
-				// op zijn eigen slot gaan staan.
+				// Unlock explicitly: multiple updates in one record must not
+				// deadlock on a deferred unlock.
 				c.wmu.Lock()
 				err := c.writeRecord(recHandshake, keyUpdateMsg())
 				if err == nil {
@@ -441,7 +330,7 @@ func (c *Conn) postHandshake(payload []byte) error {
 	return nil
 }
 
-// Write verstuurt applicatiedata, gefragmenteerd op de recordgrens van de RFC.
+// Write sends application data fragmented at the RFC record limit.
 func (c *Conn) Write(p []byte) (int, error) {
 	c.wmu.Lock()
 	defer c.wmu.Unlock()
@@ -457,24 +346,20 @@ func (c *Conn) Write(p []byte) (int, error) {
 	return total, nil
 }
 
-// Close stuurt close_notify en sluit de verbinding. De alert is niet optioneel
-// als je wilt dat de andere kant het verschil ziet tussen "klaar" en
-// "weggevallen" — dat onderscheid is precies wat een afgekapte download
-// onzichtbaar zou maken.
+// Close sends close_notify before closing, allowing the peer to distinguish a
+// complete stream from a truncated connection.
 func (c *Conn) Close() error {
 	if c.wAEAD != nil {
 		c.wmu.Lock()
-		// Een fout hier mag het sluiten niet tegenhouden: de verbinding kan al
-		// weg zijn, en dan is close_notify sturen zinloos maar niet erg.
+		// A failed close_notify must not prevent closing an already broken socket.
 		_ = c.writeRecord(recAlert, []byte{2, alertCloseNotify})
 		c.wmu.Unlock()
 	}
 	return c.conn.Close()
 }
 
-// keyUpdateMsg is het antwoord op een KeyUpdate die om een wederdienst vraagt:
-// wij vernieuwen ook, en vragen op onze beurt niets (anders blijven twee
-// implementaties elkaar eindeloos om sleutelwissels vragen).
+// keyUpdateMsg reciprocates a requested update without requesting another,
+// avoiding an infinite exchange.
 func keyUpdateMsg() []byte {
 	var b builder
 	b.u8(hsKeyUpdate)
@@ -488,7 +373,6 @@ func (c *Conn) SetDeadline(t time.Time) error      { return c.conn.SetDeadline(t
 func (c *Conn) SetReadDeadline(t time.Time) error  { return c.conn.SetReadDeadline(t) }
 func (c *Conn) SetWriteDeadline(t time.Time) error { return c.conn.SetWriteDeadline(t) }
 
-// PeerKey geeft de sleutel waarmee deze verbinding tot stand kwam — dezelfde als
-// in de Config, maar bewezen: hij zat in het certificaat én hij zette de
-// handtekening over het transcript.
+// PeerKey returns the configured key proven by certificate inclusion and the
+// transcript signature.
 func (c *Conn) PeerKey() ed25519.PublicKey { return c.cfg.PeerKey }

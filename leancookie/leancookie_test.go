@@ -22,11 +22,11 @@ func TestZettenEnTerugsturen(t *testing.T) {
 	j.SetFrom(u, []string{"sid=abc123; Path=/", "theme=dark; Path=/app"})
 
 	got := j.Header(mustURL(t, "http://example.com/app/other"))
-	// Langste pad eerst: /app vóór /.
+
 	if got != "theme=dark; sid=abc123" {
 		t.Fatalf("Cookie = %q", got)
 	}
-	// Buiten het pad: alleen de root-cookie.
+
 	if got := j.Header(mustURL(t, "http://example.com/elders")); got != "sid=abc123" {
 		t.Fatalf("buiten /app: %q", got)
 	}
@@ -34,13 +34,13 @@ func TestZettenEnTerugsturen(t *testing.T) {
 
 func TestPadRegels(t *testing.T) {
 	j := New(0)
-	// Zonder Path is het default-pad de directory van het verzoek.
+
 	j.SetFrom(mustURL(t, "http://example.com/a/b/page"), []string{"x=1"})
 	for _, tc := range []struct{ path, want string }{
 		{"/a/b/page", "x=1"},
 		{"/a/b/", "x=1"},
 		{"/a/b", "x=1"},
-		{"/a/bc", ""}, // prefix, maar geen pad-grens
+		{"/a/bc", ""},
 		{"/a", ""},
 	} {
 		if got := j.Header(mustURL(t, "http://example.com"+tc.path)); got != tc.want {
@@ -49,21 +49,17 @@ func TestPadRegels(t *testing.T) {
 	}
 }
 
-// Het hart van de pakketdoc: zonder public-suffix-lijst is "a.co.uk mag co.uk
-// niet" niet te onderscheiden van "sub.example.com mag example.com wel" — het
-// is dezelfde vorm. Dus is de default host-only, en dan kan geen enkele
-// suffix-aanval bestaan.
 func TestDomainDefaultIsHostOnly(t *testing.T) {
 	for _, tc := range []struct {
 		host, domain string
 		ok           bool
 	}{
-		{"example.com", "example.com", true}, // eigen host = host-only
+		{"example.com", "example.com", true},
 		{"sub.example.com", "example.com", false},
-		{"a.co.uk", "co.uk", false}, // de aanval, en de legitieme vorm: beide nee
+		{"a.co.uk", "co.uk", false},
 		{"example.com", "com", false},
 		{"example.com", "other.com", false},
-		{"example.com", "ample.com", false}, // geen labelgrens
+		{"example.com", "ample.com", false},
 	} {
 		j := New(0)
 		j.SetFrom(mustURL(t, "http://"+tc.host+"/"), []string{"x=1; Domain=" + tc.domain})
@@ -76,9 +72,6 @@ func TestDomainDefaultIsHostOnly(t *testing.T) {
 	}
 }
 
-// TestAllowDomainHook: wie de suffix-vraag zelf kan beantwoorden, doet dat —
-// en de twee harde regels (labelgrens, suffix van de host) blijven gelden, ook
-// als de hook alles goedkeurt.
 func TestAllowDomainHook(t *testing.T) {
 	alles := func(host, domain string) bool { return true }
 
@@ -89,8 +82,6 @@ func TestAllowDomainHook(t *testing.T) {
 		t.Errorf("met hook: %q, want a=1 op het subdomein", got)
 	}
 
-	// Zelfs met een hook die alles goedkeurt: geen cookie voor een domein dat
-	// geen suffix van de host is, en geen halve labelgrens.
 	for _, d := range []string{"other.com", "ample.com"} {
 		j2 := New(0)
 		j2.AllowDomain = alles
@@ -100,7 +91,6 @@ func TestAllowDomainHook(t *testing.T) {
 		}
 	}
 
-	// En een hook die alleen eigen domeinen kent, doet precies dat.
 	j3 := New(0)
 	j3.AllowDomain = func(_, domain string) bool { return domain == "gethop.org" }
 	j3.SetFrom(mustURL(t, "http://www.gethop.org/"), []string{"a=1; Domain=gethop.org"})
@@ -114,7 +104,7 @@ func TestSubdomeinBereik(t *testing.T) {
 	j := New(0)
 	j.AllowDomain = func(_, domain string) bool { return domain == "example.com" }
 	j.SetFrom(mustURL(t, "http://www.example.com/"), []string{"a=1; Domain=example.com", "b=2"})
-	// a geldt overal onder example.com, b alleen op www.
+
 	if got := j.Header(mustURL(t, "http://api.example.com/")); got != "a=1" {
 		t.Errorf("api-subdomein: %q, want a=1", got)
 	}
@@ -147,12 +137,12 @@ func TestVervalEnVerwijderen(t *testing.T) {
 	if got := j.Header(u); !strings.Contains(got, "a=1") || !strings.Contains(got, "c=3") {
 		t.Errorf("Cookie = %q, want a en c", got)
 	}
-	// Een verlopen Expires verwijdert een bestaande cookie.
+
 	j.SetFrom(u, []string{"a=1; Expires=Mon, 02 Jan 2006 15:04:05 GMT"})
 	if got := j.Header(u); strings.Contains(got, "a=1") {
 		t.Errorf("verlopen cookie leeft nog: %q", got)
 	}
-	// Max-Age wint van Expires, ook als Expires in het verleden ligt.
+
 	j.SetFrom(u, []string{"d=4; Expires=Mon, 02 Jan 2006 15:04:05 GMT; Max-Age=600"})
 	if got := j.Header(u); !strings.Contains(got, "d=4") {
 		t.Errorf("Max-Age verloor van Expires: %q", got)
@@ -221,15 +211,12 @@ func TestMaxCookies(t *testing.T) {
 	}
 }
 
-// De hele reden dat dit pakket bestaat: geen net/http, dus geen crypto/tls.
 func TestGeenNetHTTP(t *testing.T) {
-	// Compile-time bewijs staat in de imports van dit bestand; deze test
-	// documenteert de eis en faalt zichtbaar als iemand hem later toevoegt.
+
 	for _, forbidden := range []string{"net/http", "crypto/tls"} {
 		_ = forbidden
 	}
-	// De echte controle staat in leanhttps' TestGeenEcdsaInPin-stijl test; hier
-	// houden we het bij de constructie: dit pakket werkt op url.URL en strings.
+
 	u := mustURL(t, "http://example.com/")
 	j := New(0)
 	j.SetFrom(u, []string{"x=1"})

@@ -9,20 +9,12 @@ import (
 	"testing"
 )
 
-// De testen bouwen hun eigen ELF64's en leggen het resultaat naast debug/elf.
-// Dat is het punt: dit pakket bestaat om debug/elf niet te linken, niet om
-// iets anders te lezen dan debug/elf leest. Waar ze van elkaar afwijken op een
-// geldig image, is dit pakket fout.
-
-// segSpec is één PT_LOAD zoals de builder hem legt: content komt in het
-// bestand, memsz-filesz is BSS.
 type segSpec struct {
 	paddr   uint64
 	content []byte
 	memsz   uint64
 }
 
-// symSpec is één ingang in .symtab.
 type symSpec struct {
 	name  string
 	value uint64
@@ -30,17 +22,12 @@ type symSpec struct {
 	shndx uint16
 }
 
-// build zet een geldige, kleine ELF64 in elkaar: header, programheaders, de
-// segmentinhoud, en (als er symbolen zijn) .symtab + .strtab + .shstrtab met
-// hun sectieheaders. Alles little-endian, class 64 — precies wat onze images
-// zijn.
 func build(t *testing.T, entry uint64, segs []segSpec, syms []symSpec) []byte {
 	t.Helper()
 
 	var buf bytes.Buffer
 	buf.Write(make([]byte, ehdrSize+phdrSize*len(segs)))
 
-	// De segmentinhoud, elk op een eigen 16-uitgelijnde offset.
 	offs := make([]uint64, len(segs))
 	for i, s := range segs {
 		for buf.Len()%16 != 0 {
@@ -50,8 +37,6 @@ func build(t *testing.T, entry uint64, segs []segSpec, syms []symSpec) []byte {
 		buf.Write(s.content)
 	}
 
-	// .symtab en .strtab. De eerste symtab-ingang is per ABI nul, en de
-	// strtab begint met een nulbyte zodat naam-offset 0 de lege naam is.
 	var symtab, strtab bytes.Buffer
 	symtab.Write(make([]byte, symSize))
 	strtab.WriteByte(0)
@@ -62,7 +47,7 @@ func build(t *testing.T, entry uint64, segs []segSpec, syms []symSpec) []byte {
 
 		var e [symSize]byte
 		binary.LittleEndian.PutUint32(e[0:], nameOff)
-		e[4] = 0x12 // STB_GLOBAL | STT_FUNC
+		e[4] = 0x12
 		binary.LittleEndian.PutUint16(e[6:], s.shndx)
 		binary.LittleEndian.PutUint64(e[8:], s.value)
 		binary.LittleEndian.PutUint64(e[16:], s.size)
@@ -88,39 +73,37 @@ func build(t *testing.T, entry uint64, segs []segSpec, syms []symSpec) []byte {
 			buf.WriteByte(0)
 		}
 		shoff = uint64(buf.Len())
-		// 0: SHT_NULL, 1: .symtab, 2: .strtab, 3: .shstrtab.
+
 		buf.Write(make([]byte, shdrSize))
-		buf.Write(shdr(nameSymtab, 2 /*SHT_SYMTAB*/, symOff, uint64(symtab.Len()), 2 /*link*/, symSize))
-		buf.Write(shdr(nameStrtab, 3 /*SHT_STRTAB*/, strOff, uint64(strtab.Len()), 0, 0))
+		buf.Write(shdr(nameSymtab, 2, symOff, uint64(symtab.Len()), 2, symSize))
+		buf.Write(shdr(nameStrtab, 3, strOff, uint64(strtab.Len()), 0, 0))
 		buf.Write(shdr(nameShstrtab, 3, shstrOff, uint64(len(shstrtab)), 0, 0))
 	}
 
 	img := buf.Bytes()
 
-	// De header.
 	copy(img, []byte{0x7f, 'E', 'L', 'F', 2, 1, 1, 0})
-	binary.LittleEndian.PutUint16(img[16:], 2)              // ET_EXEC
-	binary.LittleEndian.PutUint16(img[18:], MachineAArch64) //
-	binary.LittleEndian.PutUint32(img[20:], 1)              // EV_CURRENT
+	binary.LittleEndian.PutUint16(img[16:], 2)
+	binary.LittleEndian.PutUint16(img[18:], MachineAArch64)
+	binary.LittleEndian.PutUint32(img[20:], 1)
 	binary.LittleEndian.PutUint64(img[24:], entry)
-	binary.LittleEndian.PutUint64(img[32:], ehdrSize) // e_phoff
+	binary.LittleEndian.PutUint64(img[32:], ehdrSize)
 	binary.LittleEndian.PutUint64(img[40:], shoff)
 	binary.LittleEndian.PutUint16(img[52:], ehdrSize)
 	binary.LittleEndian.PutUint16(img[54:], phdrSize)
 	binary.LittleEndian.PutUint16(img[56:], uint16(len(segs)))
 	binary.LittleEndian.PutUint16(img[58:], shdrSize)
 	if shoff != 0 {
-		binary.LittleEndian.PutUint16(img[60:], 4) // e_shnum
-		binary.LittleEndian.PutUint16(img[62:], 3) // e_shstrndx
+		binary.LittleEndian.PutUint16(img[60:], 4)
+		binary.LittleEndian.PutUint16(img[62:], 3)
 	}
 
-	// De programheaders.
 	for i, s := range segs {
 		e := img[ehdrSize+i*phdrSize:]
 		binary.LittleEndian.PutUint32(e[0:], PTLoad)
-		binary.LittleEndian.PutUint32(e[4:], 5) // PF_R|PF_X
+		binary.LittleEndian.PutUint32(e[4:], 5)
 		binary.LittleEndian.PutUint64(e[8:], offs[i])
-		binary.LittleEndian.PutUint64(e[16:], s.paddr) // vaddr == paddr
+		binary.LittleEndian.PutUint64(e[16:], s.paddr)
 		binary.LittleEndian.PutUint64(e[24:], s.paddr)
 		binary.LittleEndian.PutUint64(e[32:], uint64(len(s.content)))
 		memsz := s.memsz
@@ -150,8 +133,6 @@ func u64(v uint64) []byte {
 	return b[:]
 }
 
-// open is de gewone weg in de testen: met bestandsgrootte, zoals een loader
-// die een image in handen heeft hem ook kent.
 func open(t *testing.T, img []byte) *File {
 	t.Helper()
 	f, err := Open(bytes.NewReader(img), int64(len(img)))
@@ -164,7 +145,7 @@ func open(t *testing.T, img []byte) *File {
 func TestSegmentsMatchDebugELF(t *testing.T) {
 	img := build(t, 0x50010000, []segSpec{
 		{paddr: 0x50010000, content: bytes.Repeat([]byte{0xaa}, 128)},
-		{paddr: 0x50020000, content: []byte("data"), memsz: 4096}, // met BSS
+		{paddr: 0x50020000, content: []byte("data"), memsz: 4096},
 	}, []symSpec{{name: "runtime.text", value: 0x50010000, shndx: 1}})
 
 	want, err := elf.NewFile(bytes.NewReader(img))
@@ -233,8 +214,8 @@ func TestLookupMatchesDebugELF(t *testing.T) {
 
 func TestLookupSkipsUndefined(t *testing.T) {
 	img := build(t, 0x1000, []segSpec{{paddr: 0x1000, content: []byte("x")}}, []symSpec{
-		{name: "dubbel", value: 0, shndx: 0},      // SHN_UNDEF: geen adres
-		{name: "dubbel", value: 0x1234, shndx: 1}, // de echte definitie
+		{name: "dubbel", value: 0, shndx: 0},
+		{name: "dubbel", value: 0x1234, shndx: 1},
 	})
 	got, err := open(t, img).Lookup("dubbel")
 	if err != nil {
@@ -255,7 +236,7 @@ func TestLookupZonderSymtab(t *testing.T) {
 func TestReadAtPaddr(t *testing.T) {
 	body := append(u64(0xdeadbeefcafebabe), bytes.Repeat([]byte{0x11}, 24)...)
 	img := build(t, 0x50010000, []segSpec{
-		{paddr: 0x50010000, content: body, memsz: uint64(len(body)) + 4096}, // staart = BSS
+		{paddr: 0x50010000, content: body, memsz: uint64(len(body)) + 4096},
 		{paddr: 0x60000000, content: u64(7)},
 	}, nil)
 	f := open(t, img)
@@ -274,15 +255,13 @@ func TestReadAtPaddr(t *testing.T) {
 		t.Errorf("tweede segment: las %d", v)
 	}
 
-	// Buiten élk segment, en in de BSS-staart (bestaat in het geheugen, niet
-	// in het bestand): beide een fout en geen nullen.
 	if err := f.ReadAtPaddr(b[:], 0x40000000); err == nil {
 		t.Error("adres buiten alle segmenten gaf geen fout")
 	}
 	if err := f.ReadAtPaddr(b[:], 0x50010000+uint64(len(body))); err == nil {
 		t.Error("adres in de BSS-staart gaf geen fout")
 	}
-	// Een lees die halverwege het bestandsdeel begint en erover heen loopt.
+
 	if err := f.ReadAtPaddr(b[:], 0x50010000+uint64(len(body))-4); err == nil {
 		t.Error("lees die over het einde van het segment loopt gaf geen fout")
 	}
@@ -322,7 +301,6 @@ func TestOpenWeigert(t *testing.T) {
 		})
 	}
 
-	// ErrNotELF is apart, want daarop test een aanroeper die meer formaten kan.
 	if _, err := Open(bytes.NewReader([]byte("MZ...")), 5); !errors.Is(err, ErrNotELF) {
 		t.Errorf("magic-fout = %v, wilde ErrNotELF", err)
 	}
@@ -348,7 +326,7 @@ func TestSymtabWeigert(t *testing.T) {
 			binary.LittleEndian.PutUint32(b[shoff+shdrSize+40:], 99)
 		}},
 		{"symtab linkt niet naar een strtab", func(b []byte) {
-			binary.LittleEndian.PutUint32(b[shoff+2*shdrSize+4:], 1) // .strtab → SHT_PROGBITS
+			binary.LittleEndian.PutUint32(b[shoff+2*shdrSize+4:], 1)
 		}},
 		{"symtab buiten het bestand", func(b []byte) {
 			binary.LittleEndian.PutUint64(b[shoff+shdrSize+24:], 1<<40)
@@ -359,8 +337,7 @@ func TestSymtabWeigert(t *testing.T) {
 		{"symtab is SHT_NOBITS", func(b []byte) {
 			binary.LittleEndian.PutUint32(b[shoff+shdrSize+4:], 2)
 			binary.LittleEndian.PutUint32(b[shoff+2*shdrSize+4:], 3)
-			// .symtab als NOBITS herschrijven kan niet (dan is het geen
-			// symtab meer); dus doe het op de strtab waar hij naar wijst.
+
 			binary.LittleEndian.PutUint32(b[shoff+2*shdrSize+4:], 3)
 			binary.LittleEndian.PutUint64(b[shoff+2*shdrSize+24:], 1<<40)
 		}},
@@ -371,7 +348,7 @@ func TestSymtabWeigert(t *testing.T) {
 			c.f(img)
 			f, err := Open(bytes.NewReader(img), int64(len(img)))
 			if err != nil {
-				return // ook goed: dan viel hij al bij Open om
+				return
 			}
 			if _, err := f.Lookup("iets"); err == nil {
 				t.Fatal("geen fout")
@@ -381,9 +358,7 @@ func TestSymtabWeigert(t *testing.T) {
 }
 
 func TestStrtabZonderAfsluitendeNul(t *testing.T) {
-	// Een naam die tot het einde van de stringtabel doorloopt is geen naam:
-	// hij wordt overgeslagen in plaats van dat er over de tabelgrens gelezen
-	// wordt.
+
 	if got, ok := cstr([]byte("abc"), 0); ok {
 		t.Errorf("cstr zonder nul gaf %q, ok", got)
 	}
@@ -396,8 +371,7 @@ func TestStrtabZonderAfsluitendeNul(t *testing.T) {
 }
 
 func TestZonderBestandsgrootte(t *testing.T) {
-	// size < 0: de aanroeper kent de grootte niet, en dan is de io.ReaderAt de
-	// enige grens. Een geldig image moet gewoon werken.
+
 	img := build(t, 0x1000, []segSpec{{paddr: 0x1000, content: u64(42)}}, nil)
 	f, err := Open(bytes.NewReader(img), -1)
 	if err != nil {
@@ -413,8 +387,7 @@ func TestZonderBestandsgrootte(t *testing.T) {
 }
 
 func TestGeenProgramheaders(t *testing.T) {
-	// Een object zonder programheaders is geldig — er valt alleen niets te
-	// laden, en dat merkt de aanroeper aan een lege Segments.
+
 	img := build(t, 0, nil, []symSpec{{name: "iets", value: 8, shndx: 1}})
 	f := open(t, img)
 	if len(f.Segments) != 0 {
@@ -429,8 +402,6 @@ func TestGeenProgramheaders(t *testing.T) {
 	}
 }
 
-// io.ReaderAt-implementaties mogen (n, io.EOF) teruggeven voor een lees die
-// precies tot het einde loopt; dat is geen fout.
 type eofAtEnd struct{ b []byte }
 
 func (r eofAtEnd) ReadAt(p []byte, off int64) (int, error) {

@@ -6,11 +6,6 @@ import (
 	"time"
 )
 
-// De testen kijken naar eigenschappen, niet naar waarden: een generator die
-// een verwachte uitkomst geeft is stuk. Waar er een grens getest wordt is die
-// zo ruim dat een correcte implementatie hem niet per ongeluk raakt (geen
-// flaky test in een gate die elke commit draait).
-
 func TestBytesLengte(t *testing.T) {
 	if b := Bytes(32); len(b) != 32 {
 		t.Errorf("len = %d", len(b))
@@ -24,9 +19,7 @@ func TestBytesLengte(t *testing.T) {
 }
 
 func TestBytesVultEchtVol(t *testing.T) {
-	// Een implementatie die de buffer niet vult (of hem twee keer hetzelfde
-	// vult) valt hier om: 64 bytes twee keer helemaal gelijk gebeurt niet, en
-	// 64 nullen ook niet.
+
 	a, b := Bytes(64), Bytes(64)
 	if string(a) == string(b) {
 		t.Error("twee trekkingen van 64 bytes waren identiek")
@@ -60,10 +53,7 @@ func TestNLeegBereik(t *testing.T) {
 }
 
 func TestNIsRedelijkVlak(t *testing.T) {
-	// Geen scherpe statistiek, wel een net die een kapotte verdeling vangt:
-	// 60.000 trekkingen over 6 bakken, elke bak binnen ±15% van 10.000. Een
-	// implementatie die bits weggooit of % gebruikt op een klein bereik komt
-	// hier ver buiten.
+
 	const bakken, per = 6, 10000
 	tel := make([]int, bakken)
 	for i := 0; i < bakken*per; i++ {
@@ -106,8 +96,7 @@ func TestID(t *testing.T) {
 }
 
 func TestIDsZijnUniek(t *testing.T) {
-	// 20.000 id's van 12 tekens (60 bits): een dubbele hier betekent dat de
-	// bron of het alfabet stuk is, niet dat we ongelukkig waren.
+
 	const n = 20000
 	gezien := make(map[string]bool, n)
 	for i := 0; i < n; i++ {
@@ -161,8 +150,7 @@ func TestJitterZonderWachttijd(t *testing.T) {
 }
 
 func TestUint64VultAlleBits(t *testing.T) {
-	// Over 200 trekkingen hoort élk bit minstens één keer 1 te zijn geweest;
-	// een generator die een byte vergeet valt hier om.
+
 	var of uint64
 	for i := 0; i < 200; i++ {
 		of |= Uint64()
@@ -180,6 +168,6 @@ func BenchmarkID12(b *testing.B) {
 
 func BenchmarkN(b *testing.B) {
 	for i := 0; i < b.N; i++ {
-		N(1<<63 + 1) // het slechtste geval voor rejection sampling
+		N(1<<63 + 1)
 	}
 }

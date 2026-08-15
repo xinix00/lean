@@ -1,14 +1,12 @@
 package leannet
 
-// socket.go — de rand naar Go's net-pakket: net.Conn, net.Listener en
-// net.PacketConn over de stack, toewijsbaar aan tamago's net.SocketFunc.
-// De contract-eisen (naad-rapport): fouten zijn fouten en nooit een waarde
-// (BEVINDINGEN #4), deadlines zijn echt en overal (deadline-gedreven, nooit
-// iteration-capped), ReadFrom levert *net.UDPAddr, en Accept levert een
-// net.Conn met werkende adressen.
+// socket.go adapts the stack to net.Conn, net.Listener, net.PacketConn, and
+// TamaGo's net.SocketFunc. Errors never masquerade as values, deadlines govern
+// all blocking, ReadFrom returns *net.UDPAddr, and accepted connections expose
+// usable addresses.
 //
-// Blokkeer-patroon: conditie toetsen onder s.mu, zo niet dan het wake-kanaal
-// pakken, loslaten, en selecten op wake/deadline. Geen polling, geen slaap.
+// Blocking checks a condition under s.mu, captures wake, unlocks, then selects
+// on notification and deadline. It never polls or sleeps.
 
 import (
 	"context"
@@ -20,7 +18,7 @@ import (
 	"time"
 )
 
-// Socket-familie/type-constanten (gelijk aan syscall op alle targets).
+// Socket family and type values match syscall on supported targets.
 const (
 	afINET     = 2
 	afINET6    = 10
@@ -29,31 +27,22 @@ const (
 )
 
 const (
-	// dialTimeoutDefault begrenst een dial zonder context-deadline: een SYN
-	// naar een zwijgende host mag niet eeuwig blijven backoffen.
+	// Bound dials without a context deadline against silent hosts.
 	dialTimeoutDefault = 30 * time.Second
 
-	// udpQueueCap is de wachtrij per UDP-socket (bytes, uit de pot): ruim voor
-	// DNS/SNTP, genoeg voor een QUIC-transport.
+	// Per-socket UDP queue bytes, sufficient for DNS, SNTP, and QUIC transport.
 	udpQueueCap = 32 << 10
 
-	// tcpBacklog is hoeveel voltooide handshakes een listener maximaal laat
-	// wachten op Accept. Vol = luide RST, geen stil vastgehouden slot — de
-	// les van de console-dood van 11-08.
+	// Completed handshakes awaiting Accept. Overflow gets RST rather than
+	// retaining an invisible connection slot.
 	tcpBacklog = 8
 )
 
-// waitCtx wacht op een wek (ch), een deadline, of een annuleerbare context —
-// een dial die via net.DialContext loopt hoort op ctx.Done() terug te keren,
-// niet pas op zijn deadline (review 13-08). ctx mag nil zijn (contextloze
-// paden) — en dat pad is de hete lus van élke geblokkeerde Read/Write, dus het
-// slaat de select-machinerie over waar een kale ontvangst volstaat.
+// waitCtx waits for notification, deadline, or context cancellation. ctx may be
+// nil; that hot path avoids unnecessary select machinery when no deadline exists.
 //
-// De fout komt uit ctx.Err() zodra de context erbij betrokken is: rond een
-// context-DEADLINE racen de eigen timer en ctx.Done(), en wie won bepaalde of
-// de aanroeper os.ErrDeadlineExceeded of context.Canceled zag — terwijl
-// context.DeadlineExceeded het verwachte antwoord is (review 13-08, negende
-// ronde). Daarom wint ctx.Err() ook als de éigen timer als eerste vuurde.
+// Context deadlines must consistently report context.DeadlineExceeded even if
+// the local timer wins the race with ctx.Done.
 func waitCtx(ctx context.Context, ch <-chan struct{}, deadline time.Time) error {
 	if deadline.IsZero() {
 		if ctx == nil {
@@ -91,11 +80,8 @@ func waitCtx(ctx context.Context, ch <-chan struct{}, deadline time.Time) error 
 	}
 }
 
-// deadlineErr kiest de fout bij een verstreken termijn. Draagt de context een
-// deadline die niet ná de onze ligt, dan ís onze verstreken timer de zijne —
-// context.DeadlineExceeded dus, ook als zijn eigen klok een haar achterloopt
-// (de twee timers vuren nooit exact gelijk; wie won bepaalde anders de fout —
-// review 13-08, negende ronde).
+// deadlineErr maps a local timer matching the context deadline to
+// context.DeadlineExceeded, independent of timer race order.
 func deadlineErr(ctx context.Context, deadline time.Time) error {
 	if ctx != nil {
 		if err := ctx.Err(); err != nil {
@@ -108,16 +94,9 @@ func deadlineErr(ctx context.Context, deadline time.Time) error {
 	return os.ErrDeadlineExceeded
 }
 
-// await draait cond onder s.mu tot hij klaar is (finished, of een fout).
-// dl wordt per ronde ónder de lock herlezen — dat is het Set*Deadline-contract:
-// een nieuwe deadline geldt ook voor I/O die al staat te wachten. ctx mag nil
-// zijn (contextloze paden). Dit is hét blokkeer-patroon van dit bestand; het stond vijf keer
-// uitgeschreven, en dan zijn er vijf plekken waar de wake/deadline-dans fout
-// kan (review 13-08, zesde ronde).
-// closedFirst laat een al-gesloten socket vóór de deadline-toets falen: het
-// net.Conn-contract geeft "use of closed connection" voorrang op een
-// verstreken termijn, en de deadline-eerst-regel in await zou hem anders
-// maskeren (review 13-08, achtentwintigste ronde).
+// await evaluates cond under s.mu until completion or error. It rereads dl each
+// cycle so Set*Deadline affects blocked I/O. closedFirst preserves net.Conn's
+// rule that an already-closed socket takes precedence over an expired deadline.
 func (s *Stack) closedFirst(closed func() bool) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -130,10 +109,8 @@ func (s *Stack) closedFirst(closed func() bool) error {
 func (s *Stack) await(ctx context.Context, dl func() time.Time, cond func() (bool, error)) error {
 	s.mu.Lock()
 	for {
-		// De deadline wint van gereed I/O: een net.Conn met een verstreken
-		// termijn hoort ÉLKE operatie meteen te weigeren, ook als er al data
-		// klaarstaat — anders consumeerde een Read na de deadline vrolijk de
-		// wachtrij leeg (review 13-08, achtentwintigste ronde).
+		// An expired deadline rejects even ready I/O; otherwise a late Read would
+		// still consume queued data.
 		if d := dl(); !d.IsZero() && !time.Now().Before(d) {
 			s.mu.Unlock()
 			return deadlineErr(ctx, d)
@@ -149,12 +126,8 @@ func (s *Stack) await(ctx context.Context, dl func() time.Time, cond func() (boo
 		werr := waitCtx(ctx, ch, deadline)
 		s.mu.Lock()
 		if werr != nil {
-			// Een verstreken timer is pas een deadline-fout als de ÁCTUELE
-			// deadline ook verstreken is: Set*Deadline wekt bewust niet bij
-			// verruimen of wissen (de notify-storm), dus een verlengde of
-			// gewiste termijn wordt hiér herkeurd — anders liep een Read af op
-			// een deadline die allang niet meer bestond (review 13-08,
-			// zevende ronde).
+			// Recheck the current deadline: extending or clearing it deliberately
+			// does not broadcast, so the timer may represent obsolete state.
 			if errors.Is(werr, os.ErrDeadlineExceeded) {
 				if cur := dl(); cur.IsZero() || time.Now().Before(cur) {
 					continue
@@ -173,12 +146,9 @@ func udpAddr(ip [4]byte, port uint16) *net.UDPAddr {
 	return &net.UDPAddr{IP: net.IP(ip[:]).To16(), Port: int(port)}
 }
 
-// addrPort haalt (ip, poort) uit een net.Addr. ok=false voor nil of niet-IPv4.
+// addrPort extracts an IPv4 address and port from net.Addr.
 func addrPort(a net.Addr) (ip [4]byte, port uint16, ok bool) {
-	// *net.TCPAddr en *net.UDPAddr dragen beide AddrPort(): één uitpak-pad
-	// (review 13-08, achttiende ronde). De nil-wachten blijven expliciet —
-	// een getypte nil als laddr is een geldige net.Addr, en een lege
-	// &TCPAddr{} (bind op alles) hoort juist wél te slagen.
+	// Handle typed nils explicitly while accepting an empty address as wildcard.
 	var ap netip.AddrPort
 	switch v := a.(type) {
 	case *net.TCPAddr:
@@ -197,15 +167,12 @@ func addrPort(a net.Addr) (ip [4]byte, port uint16, ok bool) {
 	if a4 := ap.Addr().Unmap(); a4.Is4() {
 		ip = a4.As4()
 	} else if a4.IsValid() {
-		return ip, 0, false // echt IPv6-adres: niet de onze
+		return ip, 0, false // native IPv6 is unsupported
 	}
 	return ip, ap.Port(), true
 }
 
-// portInRange toetst de RUWE poort van een adres: *net.TCPAddr/*net.UDPAddr
-// dragen hem als int, en -1 of 65536 vermomde zich via de uint16-conversie
-// als geldige poort — waarna de dial stil een listener werd (review 13-08,
-// achtentwintigste ronde).
+// portInRange validates the original int before conversion to uint16 can wrap it.
 func portInRange(a net.Addr) bool {
 	switch v := a.(type) {
 	case *net.TCPAddr:
@@ -216,14 +183,11 @@ func portInRange(a net.Addr) bool {
 	return false
 }
 
-// (netip.AddrPort draagt de poort al als uint16, dus een negatieve of te
-// grote poort uit een *net.TCPAddr is dáár al verminkt — de wacht daarop zit
-// hieronder in Socket: een remote zónder bruikbare poort is een fout, geen
-// listener.)
+// Socket also rejects unusable remote ports so an invalid dial cannot become a listener.
 
 // ---- TCP listener ----
 
-// tcpListener implementeert net.Listener.
+// tcpListener implements net.Listener.
 type tcpListener struct {
 	s       *Stack
 	port    uint16
@@ -232,8 +196,8 @@ type tcpListener struct {
 	closed  bool
 }
 
-// Listen opent een TCP-listener; port 0 kiest een efemere poort. Een listener
-// kost niets uit de pot — pas een verbinding kost (floor, dan groei).
+// Listen opens a TCP listener; port zero selects an ephemeral port. Only
+// connections consume buffer budget.
 func (s *Stack) Listen(port uint16) (net.Listener, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -255,13 +219,11 @@ func (s *Stack) Listen(port uint16) (net.Listener, error) {
 	return l, nil
 }
 
-// offer geeft een voltooide handshake aan Accept. Backlog vol = luid weigeren
-// (RST + teller): een trage accepter mag geen stille slot-verzameling kweken.
-// Aangeroepen onder s.mu.
+// offer sends a completed handshake to Accept. Backlog overflow aborts it.
+// s.mu must be held.
 func (l *tcpListener) offer(c *sconn) {
-	// Een dichte listener neemt niets meer aan: een handshake die net ná Close
-	// voltooit zou anders in een backlog belanden die niemand ooit nog leest —
-	// een gevestigde verbinding plus floor-budget, voorgoed (review 13-08).
+	// Reject handshakes finishing after Close so they cannot retain budget in an
+	// unread backlog.
 	if l.closed {
 		c.tcp.abort()
 		l.s.reap(c.key, c)
@@ -291,10 +253,7 @@ func (l *tcpListener) Close() error {
 	return nil
 }
 
-// closeLocked is de ene definitie van "een listener gaat dicht"; Stack.Close
-// gebruikt hem ook (die had er een eigen, half afwijkende kopie van — review
-// 13-08, vijfde ronde). Aanroepen onder s.mu; idempotent, en abort/reap zijn
-// no-ops op verbindingen die al gereapt zijn.
+// closeLocked is the shared idempotent listener teardown. s.mu must be held.
 func (l *tcpListener) closeLocked() {
 	if l.closed {
 		return
@@ -302,19 +261,15 @@ func (l *tcpListener) closeLocked() {
 	l.closed = true
 	delete(l.s.listeners, l.port)
 	close(l.done)
-	// Wachtende, nog niet geaccepteerde verbindingen netjes weg — óók hun
-	// referenties in het kanaal, want Accept select't over backlog én done en
-	// kon anders willekeurig een dode verbinding teruggeven.
+	// Drain backlog references so Accept cannot select an already-dead connection.
 	for {
 		select {
 		case c := <-l.backlog:
 			c.tcp.abort()
 			l.s.reap(c.key, c)
 		default:
-			// En de embryo's die nog midden in hun handshake zitten: die wijzen
-			// naar déze listener en zouden hun handshake-backoff (~6s) uitzitten
-			// op een deur die al dicht is — of erger, hem voltooien en dan in
-			// offer stranden. Nu meteen weg, mét hun budget (review 13-08).
+			// Abort in-progress embryos immediately rather than retaining their
+			// budget through handshake backoff against a closed listener.
 			for key, c := range l.s.conns {
 				if c.listener == l && !c.accepted {
 					c.tcp.abort()
@@ -331,7 +286,7 @@ func (l *tcpListener) Addr() net.Addr { return tcpAddr(l.s.cfg.IP, l.port) }
 
 // ---- TCP conn ----
 
-// tcpSock implementeert net.Conn over een stack-verbinding.
+// tcpSock implements net.Conn over a stack connection.
 type tcpSock struct {
 	s *Stack
 	c *sconn
@@ -339,24 +294,17 @@ type tcpSock struct {
 	rdDeadline time.Time
 	wrDeadline time.Time
 
-	// closed: de gebruiker heeft Close geroepen. Vanaf dan faalt élke I/O op
-	// deze socket met net.ErrClosed — óók een Read die al stond te wachten
-	// (het net.Conn-contract: "Close unblocks blocked I/O", review 13-08).
-	// De TCP-machine sluit intussen netjes af (FIN); dit is de socket-rand.
+	// closed makes all socket I/O return net.ErrClosed while TCP completes its FIN.
 	closed bool
 }
 
-// DialTCP opent actief een verbinding en wacht deadline-gedreven op de
-// uitkomst: verbonden, geweigerd (RST), onbereikbaar (ARP gaf luid op) of
-// deadline.
+// DialTCP actively opens a connection and waits for success, RST, ARP failure,
+// or deadline.
 func (s *Stack) DialTCP(raddr [4]byte, rport uint16, deadline time.Time) (net.Conn, error) {
 	return s.dialTCP(nil, raddr, rport, deadline)
 }
 
-// dialTCP is DialTCP met een annuleerbare context (nil = geen); de
-// SocketFunc-rand geeft zijn context door zodat net.DialContext echt
-// annuleerbaar is — en de fout op een context-deadline stabiel
-// context.DeadlineExceeded (zie deadlineErr).
+// dialTCP adds an optional cancellable context for SocketFunc and net.DialContext.
 func (s *Stack) dialTCP(ctx context.Context, raddr [4]byte, rport uint16, deadline time.Time) (net.Conn, error) {
 	if deadline.IsZero() {
 		deadline = time.Now().Add(dialTimeoutDefault)
@@ -366,11 +314,8 @@ func (s *Stack) dialTCP(ctx context.Context, raddr [4]byte, rport uint16, deadli
 		s.mu.Unlock()
 		return nil, errStackClosed
 	}
-	// Route-loze bestemming: meteen zeggen, niet de deadline uitzitten. Zonder
-	// gateway (statisch noch geconfigureerd) start routeLocked nooit een query,
-	// dus zou arp.noAnswer hieronder nooit waar worden en wachtte een dial naar
-	// buiten het subnet zijn volle 30s uit op een fout die bij de eerste blik
-	// vaststond (review 13-08).
+	// Fail immediately when an off-subnet destination has no gateway; no ARP
+	// query could ever make progress.
 	hop, hopViaARP := s.nextHopLocked(raddr)
 	if hopViaARP && hop == ([4]byte{}) {
 		s.mu.Unlock()
@@ -388,8 +333,8 @@ func (s *Stack) dialTCP(ctx context.Context, raddr [4]byte, rport uint16, deadli
 		return nil, err
 	}
 	c.tcp.openActive(s.nextISS(), uint16(MTU-40), s.cfg.AdvWS)
-	// hop (hierboven) bepaalt wiens ARP-lot deze dial deelt.
-	s.notify() // pomp: SYN eruit (en zo nodig eerst de ARP-query)
+	// hop determines which ARP outcome governs this dial.
+	s.notify() // pump the SYN, resolving ARP first if needed
 
 	s.mu.Unlock()
 
@@ -399,42 +344,25 @@ func (s *Stack) dialTCP(ctx context.Context, raddr [4]byte, rport uint16, deadli
 			case s.closed:
 				return false, errStackClosed
 			case c.tcp.state == tcpEstablished || c.tcp.state == tcpCloseWait:
-				// CLOSE-WAIT telt ook: een peer die accepteert, data stuurt
-				// en meteen sluit kan vóór deze waiter wakker werd al door
-				// ESTABLISHED heen zijn — de verbinding is dan gewoon
-				// bruikbaar (lezen tot EOF, schrijven mag nog)
-				// (review 13-08, zevenentwintigste ronde).
+				// A peer may send data and FIN before this waiter wakes, moving
+				// through ESTABLISHED into a still-usable CLOSE-WAIT.
 				return true, nil
 			case hopViaARP && s.arp.noAnswer(hop, s.now()):
-				// Alleen als de route een ARP-lot HEEFT: met een statische
-				// gateway-MAC is hop een vulwaarde zonder eigen query, en de
-				// vol-tabel-toets in noAnswer verklaarde die bestemming
-				// anders meteen onbereikbaar terwijl de SYN gewoon via de
-				// bekende MAC vertrekt (review 13-08, zesendertigste ronde).
-				// VÓÓR de closed-toets: het route-dood-vangnet in de pomp kan
-				// deze verbinding al geabort hebben (zelfde noAnswer, andere
-				// goroutine), en dan las de closed-tak "connect timed out"
-				// waar "no route" hoort — het soort verkeerd-wijzende fout dat
-				// op 12-08 vijf lagen zoeken kostte. De arpFailed-status leeft
-				// nog arpFailTTL, dus hij is hier nog te lezen (review 13-08,
-				// vijfde ronde).
+				// Only ARP-governed routes can fail here. Check before tcpClosed
+				// because the pump may already have aborted the connection for the
+				// same route failure; report no route rather than timeout.
 				return false, errUnreachable
 			case c.tcp.state == tcpClosed:
 				if c.tcp.refused {
 					return false, errors.New("leannet: connection refused")
 				}
-				// Geen RST maar ook geen antwoord: de handshake gaf op na
-				// zijn backoff-ladder (~6s).
+				// No RST or response: handshake retries exhausted.
 				return false, errors.New("leannet: connect timed out, no response")
 			}
 			return false, nil
 		})
 	if err != nil {
-		// Hét opruimpad, voor élke fout: uit de switch én uit het wachten
-		// (deadline/cancel). De takken hierboven ruimen bewust níets zelf op —
-		// dat deden ze eerst wel, en dan stond exact dezelfde abort+reap hier
-		// nóg eens (review 13-08, achtste ronde). Idempotent voor het geval de
-		// pomp of Stack.Close ons voor was.
+		// One idempotent cleanup path covers state errors, deadlines, and cancellation.
 		s.mu.Lock()
 		c.tcp.abort()
 		s.reap(key, c)
@@ -449,10 +377,7 @@ func (t *tcpSock) Read(p []byte) (int, error) {
 		return 0, err
 	}
 	if len(p) == 0 {
-		// net.Conn-contract: een lege read is meteen klaar. Zonder deze regel
-		// kwam hij in await terecht (tcp.read geeft (0, nil)) en wachtte een
-		// levende verbinding op verkeer dat er niet hoeft te komen
-		// (review 13-08, dertiende ronde).
+		// net.Conn requires a zero-length read to return immediately.
 		return 0, nil
 	}
 	var total int
@@ -464,15 +389,14 @@ func (t *tcpSock) Read(p []byte) (int, error) {
 			n, err := t.c.tcp.read(p)
 			if n > 0 {
 				total = n
-				t.s.notify() // het venster kan geopend zijn: de pomp mag de update versturen
+				t.s.notify() // reading may have opened the receive window
 				return true, nil
 			}
 			if err == errTCPClosed {
-				// Een échte FIN: de stroom is compleet. errTCPReset valt hier
-				// bewust búiten — een reset is een fout, geen einde.
+				// FIN is EOF; reset remains an error.
 				return false, io.EOF
 			}
-			return false, err // err == nil: wachten op data
+			return false, err // nil means wait for data
 		})
 	return total, err
 }
@@ -494,14 +418,14 @@ func (t *tcpSock) Write(p []byte) (int, error) {
 					return false, err
 				}
 				if total == len(p) {
-					t.s.notify() // de pomp mag gaan zenden
+					t.s.notify() // let the pump transmit
 					return true, nil
 				}
 				if n == 0 {
-					// Ring vol en niet verder gegroeid: wachten op ACK-ruimte.
+					// Full ring that could not grow: wait for ACK space.
 					return false, nil
 				}
-				t.s.notify() // deel geplaatst; meteen nog een poging
+				t.s.notify() // partial write; pump it before retrying
 			}
 		})
 	return total, err
@@ -511,29 +435,23 @@ func (t *tcpSock) Close() error {
 	s := t.s
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	t.closed = true       // wachtende Reads/Writes zien dit bij hun wek-ronde
-	_ = t.c.tcp.close()   // dubbel sluiten is geen fout op de socket-rand
-	t.c.tcp.abandonRead() // VOLLE close: de ontvangkant mag zijn ring kwijt (zie tcp.abandonRead)
-	s.notify()            // de FIN mag eruit én de waiters worden wakker
+	t.closed = true       // blocked I/O observes this on wake
+	_ = t.c.tcp.close()   // duplicate socket close is not an error
+	t.c.tcp.abandonRead() // full close may release the receive ring
+	s.notify()            // send FIN and wake waiters
 	return nil
 }
 
 func (t *tcpSock) LocalAddr() net.Addr  { return tcpAddr(t.s.cfg.IP, t.c.key.lport) }
 func (t *tcpSock) RemoteAddr() net.Addr { return tcpAddr(t.c.key.rip, t.c.key.rport) }
 
-// De Set*Deadline's wekken de waiters — maar alleen als een waiter de nieuwe
-// deadline kan MISSEN: vervroegd, of van eeuwig (nul) naar eindig. Een láter
-// gezette deadline haalt de wachtlus vanzelf (hij wordt wakker op de oude,
-// herleest, en wacht door). Het contract blijft heel, en de notify-storm van
-// een verzoek dat 4+ deadlines vooruitschuift verdwijnt: élke notify wekt
-// ALLE waiters op een GOMAXPROCS=1-target (review 13-08, derde ronde).
+// Wake deadline waiters only when a new deadline is earlier or replaces zero.
+// Extending one is observed when the old timer fires, avoiding broadcast storms.
 func deadlineNeedsWake(old, new time.Time) bool {
 	return !new.IsZero() && (old.IsZero() || new.Before(old))
 }
 
-// storeDeadline zet één of twee deadline-velden onder s.mu, met de wek-regel
-// van deadlineNeedsWake — één definitie voor de zes Set*Deadline's van TCP en
-// UDP. b mag nil zijn.
+// storeDeadline updates one or two fields under s.mu and applies the shared wake rule.
 func (s *Stack) storeDeadline(tm time.Time, a, b *time.Time) error {
 	s.mu.Lock()
 	wake := deadlineNeedsWake(*a, tm)
@@ -561,7 +479,7 @@ func (t *tcpSock) SetWriteDeadline(tm time.Time) error {
 
 // ---- UDP ----
 
-// udpSock implementeert net.PacketConn, en als hij connected is ook net.Conn.
+// udpSock implements net.PacketConn and, when connected, net.Conn.
 type udpSock struct {
 	s     *Stack
 	port  *udpPort
@@ -575,7 +493,7 @@ type udpSock struct {
 	wrDeadline time.Time
 }
 
-// ListenUDP bindt een UDP-poort (0 = efemeer) met een wachtrij uit de pot.
+// ListenUDP binds a UDP port, selecting an ephemeral one for zero.
 func (s *Stack) ListenUDP(port uint16) (*udpSock, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -596,8 +514,7 @@ func (s *Stack) ListenUDP(port uint16) (*udpSock, error) {
 	return &udpSock{s: s, port: u, lport: port}, nil
 }
 
-// DialUDP is ListenUDP op een efemere poort plus een vast doel: Write/Read
-// in plaats van WriteTo/ReadFrom, en vreemde afzenders worden gefilterd.
+// DialUDP binds an ephemeral port to one peer for Read and Write.
 func (s *Stack) DialUDP(raddr [4]byte, rport uint16) (*udpSock, error) {
 	u, err := s.ListenUDP(0)
 	if err != nil {
@@ -622,17 +539,15 @@ func (u *udpSock) ReadFrom(p []byte) (int, net.Addr, error) {
 		func() (bool, error) {
 			for {
 				if u.port.closed {
-					// Dekt de eigen Close én Stack.Close: de wachtrij is terug
-					// en er komt nooit meer een datagram — eeuwig wachten is
-					// dan het contract breken.
+					// Both socket and stack close release the queue; no datagram can follow.
 					return false, net.ErrClosed
 				}
 				n, src, sport, ok := u.port.recvFrom(p)
 				if !ok {
-					return false, nil // wachten op een datagram
+					return false, nil // wait for a datagram
 				}
 				if u.connected && (src != u.raddr || sport != u.rport) {
-					continue // niet onze peer: stil verder (connected-semantiek)
+					continue // connected sockets ignore other senders
 				}
 				total, from = n, udpAddr(src, sport)
 				return true, nil
@@ -643,18 +558,12 @@ func (u *udpSock) ReadFrom(p []byte) (int, net.Addr, error) {
 
 func (u *udpSock) WriteTo(p []byte, addr net.Addr) (int, error) {
 	if u.connected {
-		// net.UDPConn-contract: een connected socket schrijft alleen naar
-		// zijn peer — en replies van een ánder adres worden toch al bij
-		// deliver weggegooid, dus dit was hoe dan ook een zwart gat
-		// (review 13-08, dertigste ronde).
+		// A connected UDP socket may only write to its peer.
 		return 0, net.ErrWriteToConnected
 	}
 	ua, isUDP := addr.(*net.UDPAddr)
 	if !isUDP || ua == nil || ua.Port <= 0 || ua.Port > 65535 {
-		// Strikt een *net.UDPAddr mét bruikbare poort: de generieke addrPort
-		// accepteerde zelfs een *net.TCPAddr, en de test daarop was
-		// vals-groen op een verlopen write-deadline (review 13-08, dertigste
-		// ronde).
+		// Require *net.UDPAddr explicitly; generic extraction also accepts TCP addresses.
 		return 0, errors.New("leannet: WriteTo needs an IPv4 *net.UDPAddr with a valid port")
 	}
 	dst, dport, ok := addrPort(addr)
@@ -664,8 +573,7 @@ func (u *udpSock) WriteTo(p []byte, addr net.Addr) (int, error) {
 	return u.writeUDP(p, dst, dport)
 }
 
-// writeUDP bouwt en verstuurt één datagram; op een onopgeloste route wacht
-// hij deadline-gedreven op ARP (het eerste DNS-pakket van een verse node).
+// writeUDP sends one datagram, waiting by deadline for unresolved ARP routes.
 func (u *udpSock) writeUDP(p []byte, dst [4]byte, dport uint16) (int, error) {
 	if err := u.s.closedFirst(func() bool { return u.port.closed }); err != nil {
 		return 0, err
@@ -690,8 +598,7 @@ func (u *udpSock) writeUDP(p []byte, dst [4]byte, dport uint16) (int, error) {
 				}
 				PutIPv4(s.txBuf[EthernetHeaderSize:], ProtoUDP, s.cfg.IP, dst, n)
 				if err := s.sendEthLocked(mac, EtherTypeIPv4, sizeIPv4+n); err != nil {
-					// De NIC weigerde het pakket: dat is een fout, geen succes
-					// — UDP heeft geen retransmissie die dit later goedmaakt.
+					// UDP cannot recover a rejected transmit through retransmission.
 					return false, err
 				}
 				sent = len(p)
@@ -699,20 +606,19 @@ func (u *udpSock) writeUDP(p []byte, dst [4]byte, dport uint16) (int, error) {
 			}
 			hop, viaARP := s.nextHopLocked(dst)
 			if viaARP && hop == ([4]byte{}) {
-				// Zelfde regel als DialTCP: geen gateway is een antwoord,
-				// geen wachttijd.
+				// No gateway is an immediate answer, not a reason to wait.
 				return false, errNoRoute
 			}
 			if viaARP && s.arp.noAnswer(hop, now) {
 				return false, errUnreachable
 			}
-			s.notify() // pomp: ARP-query eruit
+			s.notify() // pump the ARP query
 			return false, nil
 		})
 	return sent, err
 }
 
-// Read/Write: de connected helft (net.Conn).
+// Read and Write implement the connected net.Conn side.
 func (u *udpSock) Read(p []byte) (int, error) {
 	n, _, err := u.ReadFrom(p)
 	return n, err
@@ -728,7 +634,7 @@ func (u *udpSock) Close() error {
 	s := u.s
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	u.port.close() // idempotent; port.closed is de ene waarheid
+	u.port.close() // idempotent; port.closed is authoritative
 	s.notify()
 	return nil
 }
@@ -741,7 +647,7 @@ func (u *udpSock) RemoteAddr() net.Addr {
 	return udpAddr(u.raddr, u.rport)
 }
 
-// Zelfde wek-regel als bij TCP: één definitie, zie storeDeadline.
+// UDP uses the same deadline wake rule as TCP; see storeDeadline.
 func (u *udpSock) SetDeadline(t time.Time) error {
 	return u.s.storeDeadline(t, &u.rdDeadline, &u.wrDeadline)
 }
@@ -752,12 +658,11 @@ func (u *udpSock) SetWriteDeadline(t time.Time) error {
 	return u.s.storeDeadline(t, &u.wrDeadline, nil)
 }
 
-// ---- de SocketFunc-rand ----
+// ---- SocketFunc boundary ----
 
-// Socket is toewijsbaar aan tamago's net.SocketFunc. De vorm-eisen staan in
-// net_tamago.go: Listener bij laddr-zonder-raddr, anders Conn/PacketConn.
-// Fouten komen terug als fouten — een dial die faalt levert (nil, err), nooit
-// een waarde die geen verbinding is (BEVINDINGEN #4).
+// Socket implements TamaGo's net.SocketFunc contract: a local address without
+// a remote creates a listener; otherwise it returns Conn or PacketConn. Failed
+// dials return (nil, err), never a substitute value.
 func (s *Stack) Socket(ctx context.Context, network string, family, sotype int, laddr, raddr net.Addr) (interface{}, error) {
 	if family == afINET6 {
 		return nil, errors.ErrUnsupported
@@ -767,30 +672,22 @@ func (s *Stack) Socket(ctx context.Context, network string, family, sotype int, 
 	}
 	lip, lport, hasL := addrPort(laddr)
 	if laddr != nil && (!hasL || !portInRange(laddr)) {
-		// Zelfde regel als voor het remote-adres: een niet-nil maar
-		// onbruikbaar lokaal adres (IPv6, vreemd type, poort buiten bereik)
-		// werd stil een wildcard-listener (review 13-08, dertigste ronde).
+		// Reject unusable non-nil local addresses instead of silently using wildcard.
 		return nil, errors.New("leannet: unsupported local address")
 	}
 	if lip != ([4]byte{}) && lip != s.cfg.IP {
-		// We dragen één adres; binden op iets anders is een bedradingsfout,
-		// geen wens die stil genegeerd hoort te worden.
+		// This stack owns one address and must not ignore a different binding.
 		return nil, errors.New("leannet: local address is not this stack's address")
 	}
 	rip, rport, hasR := addrPort(raddr)
 	if raddr != nil && (!hasR || rport == 0 || !portInRange(raddr)) {
-		// Een niet-nil maar onbruikbaar remote-adres (IPv6, vreemd type) werd
-		// stil een LISTENER — een dial die faalt hoort (nil, err) te geven,
-		// nooit iets anders dan gevraagd (review 13-08, vijfentwintigste
-		// ronde; zelfde geest als BEVINDINGEN #4).
+		// An invalid remote must fail the dial, not silently create a listener.
 		return nil, errors.New("leannet: unsupported remote address")
 	}
 	isDial := hasR
 	if isDial && lport != 0 {
-		// Een gevraagde bronpoort op een dial werd stil genegeerd (de stack
-		// kiest altijd een efemere poort): wie hem zet — een firewall-afspraak,
-		// een protocol met vaste bronpoort — hoort te horen dat dat hier niet
-		// bestaat (review 13-08, eenendertigste ronde).
+		// The stack always chooses an ephemeral dial source port; reject a fixed
+		// request rather than silently ignoring it.
 		return nil, errors.New("leannet: dialing from a fixed local port is not supported")
 	}
 

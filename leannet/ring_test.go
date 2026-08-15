@@ -5,18 +5,13 @@ import (
 	"testing"
 )
 
-// TestRingExhaustive loopt de hele toestandsruimte af voor kleine ringen:
-// elke maat, elke kop-positie, elke vulling, en verifieert schrijf/lees/wrap
-// tegen een naïef model (een gewone slice). De les van lneto's ring (twee
-// keer dezelfde fix, BEVINDINGEN #25): leeg-detectie en wrap-rekenkunde
-// horen op één plek te wonen en uitputtend getest te zijn.
 func TestRingExhaustive(t *testing.T) {
 	for size := 1; size <= 8; size++ {
 		for headStart := 0; headStart < size; headStart++ {
 			for fill := 0; fill <= size; fill++ {
 				r := ring{buf: make([]byte, size), head: headStart}
 				var model []byte
-				// Vullen met herkenbare bytes.
+
 				seed := make([]byte, fill)
 				for i := range seed {
 					seed[i] = byte(0x40 + i)
@@ -28,11 +23,11 @@ func TestRingExhaustive(t *testing.T) {
 				if r.buffered() != len(model) || r.free() != size-len(model) {
 					t.Fatalf("size=%d head=%d fill=%d: buffered=%d free=%d", size, headStart, fill, r.buffered(), r.free())
 				}
-				// Overschrijven mag niet: extra write levert 0 op bij vol.
+
 				if r.free() == 0 && r.write([]byte{0xEE}) != 0 {
 					t.Fatal("write into full ring accepted bytes")
 				}
-				// Halve read, dan bijschrijven (dwingt wrap af), dan alles lezen.
+
 				h := len(model) / 2
 				dst := make([]byte, h)
 				if got := r.read(dst); got != h || !bytes.Equal(dst, model[:h]) {
@@ -58,7 +53,7 @@ func TestRingExhaustive(t *testing.T) {
 }
 
 func TestRingPeekOffset(t *testing.T) {
-	r := ring{buf: make([]byte, 8), head: 6} // dwing wrap af
+	r := ring{buf: make([]byte, 8), head: 6}
 	r.write([]byte("abcdefg"))
 	got := make([]byte, 3)
 	if n := r.peek(got, 2); n != 3 || string(got) != "cde" {
@@ -70,7 +65,7 @@ func TestRingPeekOffset(t *testing.T) {
 	if n := r.peek(got, 7); n != 0 {
 		t.Fatalf("peek past end = %d", n)
 	}
-	// peek consumeert niet.
+
 	all := make([]byte, 7)
 	if n := r.read(all); n != 7 || string(all) != "abcdefg" {
 		t.Fatalf("read after peeks = %q", all[:n])
@@ -90,7 +85,7 @@ func TestRingDropPanicsBeyondBuffered(t *testing.T) {
 
 func TestRingGrowPreservesOrderAcrossWrap(t *testing.T) {
 	r := ring{buf: make([]byte, 4), head: 3}
-	r.write([]byte("wxyz")) // wrapt over de fysieke rand
+	r.write([]byte("wxyz"))
 	r.grow(make([]byte, 16))
 	if r.size() != 16 || r.head != 0 || r.buffered() != 4 {
 		t.Fatalf("after grow: size=%d head=%d n=%d", r.size(), r.head, r.n)
@@ -108,7 +103,7 @@ func TestTxRingSendAckRewind(t *testing.T) {
 	if tx.unsent() != 5 {
 		t.Fatalf("unsent = %d", tx.unsent())
 	}
-	// Verstuur in twee stukken.
+
 	p := make([]byte, 3)
 	if n := tx.nextSend(p); n != 3 || string(p) != "hal" {
 		t.Fatalf("nextSend 1 = %q (%d)", p[:n], n)
@@ -119,12 +114,12 @@ func TestTxRingSendAckRewind(t *testing.T) {
 	if tx.unsent() != 0 || tx.buffered() != 5 {
 		t.Fatalf("after full send: unsent=%d buffered=%d", tx.unsent(), tx.buffered())
 	}
-	// Peer bevestigt 2; er komt ruimte, verzonden-cursor schuift mee.
+
 	tx.ack(2)
 	if tx.buffered() != 3 || tx.unsent() != 0 {
 		t.Fatalf("after ack: buffered=%d unsent=%d", tx.buffered(), tx.unsent())
 	}
-	// RTO: alles onbevestigde geldt weer als te verzenden (go-back-N).
+
 	tx.rewind()
 	if tx.unsent() != 3 {
 		t.Fatalf("after rewind: unsent = %d", tx.unsent())
@@ -132,7 +127,7 @@ func TestTxRingSendAckRewind(t *testing.T) {
 	if n := tx.nextSend(p); n != 3 || string(p) != "llo" {
 		t.Fatalf("retransmit read = %q (%d)", p[:n], n)
 	}
-	// Nieuwe app-bytes achter een gedeeltelijk bevestigde stroom.
+
 	tx.writeApp([]byte("!!"))
 	if tx.unsent() != 2 {
 		t.Fatalf("new bytes unsent = %d", tx.unsent())

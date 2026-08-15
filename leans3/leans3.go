@@ -1,69 +1,42 @@
-// Package leans3 praat S3: SigV4-signeren plus de objectoperaties (GET, PUT,
-// DELETE, listen), inclusief de streamende vormen en het conditionele verkeer
-// (If-Match, If-None-Match, ETag) waar een CAS-protocol op leunt.
+// Package leans3 implements SigV4 signing and the S3 object operations GET,
+// PUT, DELETE, and LIST, including streaming bodies and conditional ETag-based
+// CAS traffic.
 //
-// Het bestaat om een meting, en de meting is een DUBBELING. In één stapel
-// stonden twee eigen SigV4-implementaties:
+// It replaces two custom SigV4 implementations in one stack:
 //
-//	hoplock/s3/sigv4.go .......................... ~200 regels, volledig
-//	hop/internal/runner/download_s3.go ........... ~100 regels, alleen GET
+//	hoplock/s3/sigv4.go .......................... ~200 lines, complete
+//	hop/internal/runner/download_s3.go ........... ~100 lines, GET only
 //
-// Die tweede is niet de helft van de eerste maar de zwakkere: geen
-// URI-escaping (een key met een spatie of een '+' signeert fout), geen
-// sessietoken, alleen virtual-hosted adressering. Dat is precies het soort
-// kopie dat ontstaat als het blok ontbreekt — iemand heeft één GET nodig, ziet
-// de 200 regels niet zitten, en schrijft 100 die het in de gewone gevallen
-// doen. De derde gebruiker schrijft er weer 100.
+// The smaller copy omitted URI escaping, session tokens, and path-style
+// addressing. Spaces or `+` in a key therefore produced invalid signatures.
 //
-// De tweede meting is waarom hij hier woont en niet op net/http: net/http
-// linkt crypto/tls onvoorwaardelijk, en in een kern-image dat op een node van
-// 64MB draait kost die keten ~2 MB. Gemeten 12-08 met twee binaries die
-// dezelfde ene taak doen — één getekende https-GET naar een S3-endpoint —
-// darwin/arm64, go1.26.4, `-ldflags=-w`:
+// Avoiding net/http also matters because it links crypto/tls unconditionally.
+// For the same signed HTTPS GET on darwin/arm64 with Go 1.26.4 and
+// `-ldflags=-w` (2026-08-12):
 //
-//	net/http + crypto/tls .............. 5,68 MB   (en dat signeert nog niet)
-//	dit pakket op leanhttps ............ 3,95 MB   (-1,73, signeren erbij)
+//	net/http + crypto/tls .............. 5.68 MB (without signing)
+//	this package over leanhttps ........ 3.95 MB (-1.73, including signing)
 //
-// Dat is dezelfde 1,73 MB die leantls/x509verify voor de hele stapel op
-// tamago/riscv64 meet, dus de winst zit waar hij daar zit: niet in TLS maar in
-// net/http, dat crypto/tls meeneemt of je hem gebruikt of niet.
+// # Deliberate limits
 //
-// # Wat dit NIET doet
+// There are no streaming signatures, SigV4a, presigned URLs, IMDS/IAM
+// credentials, multipart upload, versioning, object lock, or tagging. PUT uses
+// a known Content-Length and payload hash; [Client.PutFrom] rejects a missing
+// hash rather than silently choosing [UnsignedPayload]. One object maps to one
+// request; orchestration and provider-specific retry policy belong above it.
 //
-//   - Streaming signatures (STREAMING-AWS4-HMAC-SHA256-PAYLOAD). Een PUT
-//     draagt dus een Content-Length en een payload-hash die de aanroeper
-//     kent; [Client.PutFrom] weigert luid zonder hash in plaats van stil
-//     [UnsignedPayload] te sturen (dat mag alleen over https, en meerdere
-//     providers wijzen het op een write af).
-//   - sigv4a (multi-region), presigned URL's, credentials uit IMDS/IAM.
-//     Statische sleutels, eventueel met sessietoken.
-//   - multipart upload, versioning, object-lock, tagging. Eén object is één
-//     verzoek; wat een orkestrator of een lease-laag daarmee doet — sleutel-
-//     indeling, retries op een provider-eigenaardigheid, wie mag schrijven —
-//     hoort niet hier.
+// # Contexts
 //
-// # Over de invoer die geen invoer is
+// Operations map a [context.Context] deadline to leanhttp Call.Timeout and
+// reject an already canceled context. Bare cancellation after a call starts is
+// not observed: leanhttp has no context seam, and closing one request's pooled
+// connection safely would require a watcher goroutine per call.
 //
-// De operaties nemen een [context.Context], maar alleen zijn DEADLINE wordt
-// gebruikt: die wordt leanhttp's Call.Timeout. Een kale cancel volgt dit
-// pakket niet — leanhttp kent geen context, en met een verbindingspool eronder
-// is "sluit de verbinding van dit verzoek" niet veilig te doen zonder een
-// goroutine per aanroep die op ctx.Done wacht. Een al afgebroken context
-// weigert wél meteen. Dat staat hier omdat élke aanroeper een context heeft en
-// de deadline anders geruisloos verdwijnt.
+// # Composition
 //
-// # Over de import van leanhttps
-//
-// Dit pakket importeert een SAMENSTELLING, en de README zegt dat een
-// samenstelling dat niet doet ("one level deep"). De reden dat het hier tóch
-// klopt: leans3 is geen samenstelling maar een blok met een eigen protocol
-// (SigV4 en de S3-API), en het alternatief is de knoop die leanhttps al legt —
-// SNI per verbinding, poort 443 mét vertrouwensmodel — hier over te schrijven.
-// Dat is de dubbeling die dit pakket juist bestrijdt.
-//
-// Wie geen https praat (MinIO op een LAN) betaalt daar wél de PKI-keten voor:
-// de schemakeuze is bereikbaar vanuit elke aanroep, dus de linker kan hem niet
-// weggooien. Dat is de prijs van één knop minder aan de gebruikerskant.
+// leans3 is a protocol block, not a composition, so it imports leanhttps rather
+// than duplicating its SNI and trust-model seam. This means a plain-HTTP MinIO
+// consumer still links the reachable PKI path.
 package leans3
 
 import (
@@ -83,132 +56,110 @@ import (
 	"github.com/xinix00/lean/leantls/x509verify"
 )
 
-// HTTP-methodes die dit pakket gebruikt; leanhttp heeft er geen constanten voor.
+// HTTP methods used here; leanhttp intentionally has no method constants.
 const (
 	methodGet    = "GET"
 	methodPut    = "PUT"
 	methodDelete = "DELETE"
 )
 
-// Statuscodes die leanhttp zelf niet noemt.
+// Status codes not named by leanhttp.
 const (
 	statusConflict           = 409
 	statusPreconditionFailed = 412
 )
 
-// UnsignedPayload is de literal die zegt "ik signeer de inhoud niet". Alleen
-// voor [Client.PutFrom] van een bron die niet twee keer te lezen is, en alleen
-// over https: zonder TLS is een niet-gesigneerde payload onderweg te wijzigen.
-// Meerdere S3-compatibele providers weigeren hem op een write, dus het is een
-// uitweg en geen default.
+// UnsignedPayload marks content excluded from the signature. Use it only with
+// [Client.PutFrom] over HTTPS for non-replayable sources. Without TLS the body
+// is mutable in transit, and several providers reject it for writes.
 const UnsignedPayload = "UNSIGNED-PAYLOAD"
 
-// Sentinels. Ze zijn er omdat de twee gevallen waarin een niet-2xx GEEN
-// storing is, aan de aanroeper toebehoren: een object dat er niet is (een
-// schone start), en een voorwaarde die niet gold (iemand anders was eerder).
+// Sentinel errors represent expected protocol outcomes rather than outages.
 var (
-	// ErrNotFound is een 404: de key bestaat niet.
+	// ErrNotFound reports a 404 for an absent key.
 	ErrNotFound = errors.New("leans3: no such key")
 
-	// ErrPreconditionFailed is een 412 (of de 409 die sommige providers voor
-	// een gelijktijdige If-None-Match-race sturen): de If-Match/If-None-Match
-	// gold niet, dus er is niets geschreven.
+	// ErrPreconditionFailed reports a 412, or a provider's 409 for a concurrent
+	// If-None-Match race. Nothing was written.
 	ErrPreconditionFailed = errors.New("leans3: precondition failed")
 )
 
-// StatusError is elk ánder niet-succes: de status zoals de server hem stuurde
-// plus het begin van de body. Die body staat er omdat S3 de echte reden in een
-// XML-antwoord zet (SignatureDoesNotMatch, AccessDenied, NoSuchBucket) en hem
-// weglaten een debug-sessie kost.
+// StatusError represents any other unsuccessful response. Body retains a
+// bounded prefix because S3 reports causes such as SignatureDoesNotMatch and
+// AccessDenied in XML.
 type StatusError struct {
 	Op     string // "GET", "PUT", "DELETE", "LIST"
-	Key    string // key of prefix waar het om ging
+	Key    string // affected key or prefix
 	Code   int    // 403, 500, …
-	Status string // "403 Forbidden", zoals op de draad
-	Body   string // begin van de antwoordbody, getrimd
+	Status string // wire status, such as "403 Forbidden"
+	Body   string // trimmed response-body prefix
 }
 
 func (e *StatusError) Error() string {
 	return fmt.Sprintf("leans3: %s %s: status %s: %s", e.Op, e.Key, e.Status, e.Body)
 }
 
-// Client praat met één bucket op één endpoint. Vul hem als struct-literal; de
-// vereiste velden zijn geëxporteerd. Hij is veilig voor gelijktijdig gebruik.
-//
-// Gebruik hem per POINTER en kopieer hem niet zodra hij gebruikt is: hij bezit
-// een verbindingspool (keep-alive per host), en dat is geen luxe — een
-// lease-vernieuwing gaat elke paar seconden, en zonder pool betaalt elke ronde
-// een TCP-handdruk plus over https een sleuteluitwisseling.
+// Client accesses one bucket at one endpoint and is safe for concurrent use.
+// Configure it as a struct literal, then use it by pointer without copying: it
+// owns a keep-alive pool that avoids a TCP and TLS handshake per request.
 type Client struct {
-	// Endpoint is de basis-URL van de dienst, bijvoorbeeld
+	// Endpoint is the service base URL, for example
 	// "https://s3.us-east-1.amazonaws.com" of
-	// "https://<account>.r2.cloudflarestorage.com". Verplicht.
+	// "https://<account>.r2.cloudflarestorage.com". Required.
 	Endpoint string
 
-	// Bucket is de bucketnaam. Verplicht.
+	// Bucket is the required bucket name.
 	Bucket string
 
-	// Region is de regio in de credential-scope van de signatuur. Verplicht;
-	// "auto" voor Cloudflare R2.
+	// Region is the required credential-scope region; use "auto" for R2.
 	Region string
 
-	// AccessKeyID en SecretAccessKey zijn de statische sleutels. Verplicht.
+	// AccessKeyID and SecretAccessKey are required static credentials.
 	AccessKeyID     string
 	SecretAccessKey string
 
-	// SessionToken gaat als X-Amz-Security-Token mee als hij gezet is (STS).
+	// SessionToken is sent as X-Amz-Security-Token when set (STS).
 	SessionToken string
 
-	// UsePathStyle zet de bucket in het PAD ("<endpoint>/<bucket>/<key>") in
-	// plaats van in de hostnaam ("<bucket>.<endpoint>/<key>"). Nodig voor
-	// MinIO en de meeste niet-AWS-providers; bij R2 mag beide.
+	// UsePathStyle puts the bucket in the path instead of the hostname. MinIO and
+	// most non-AWS providers require it; R2 supports both forms.
 	UsePathStyle bool
 
-	// Dial vervangt de manier van verbinden (context-vorm sinds review 13-08,
-	// dertigste ronde: één dialer-gedaante in de hele stapel). nil — het
-	// normale geval — kiest
-	// op het schema van Endpoint: https krijgt een TLS-dialer die de
-	// certificaatketen valideert, http verbindt kaal (dan linkt leanhttp zelf
-	// niets van TLS). Zet hem voor een proxy, een unix-socket of een test die
-	// een lokale server onder een virtual-hosted bucketnaam moet bereiken —
-	// en weet dan dat je de versleuteling vervangt.
+	// Dial overrides connection setup for proxies, Unix sockets, or tests. Nil
+	// selects certificate-validating TLS for HTTPS and plain TCP for HTTP.
+	// Overriding an HTTPS dialer also assumes responsibility for encryption.
 	Dial func(ctx context.Context, network, addr string) (net.Conn, error)
 
-	// Now vervangt de klok in de signatuur. nil = time.Now. Voor tests: een
-	// signatuur is per definitie tijdgebonden, dus zonder deze naad is er geen
-	// deterministische assertie mogelijk.
+	// Now overrides signature time. Nil uses time.Now; tests need this seam for
+	// deterministic signatures.
 	Now func() time.Time
 
 	mu   sync.Mutex
 	pool *leanhttp.Client
 }
 
-// request is één uitgaande aanroep vóór het signeren. Hij bestaat omdat SigV4
-// precies een (methode, URL, headers)-drietal dekt: die drie op één plek
-// verzamelen is wat verhindert dat de signeerder en de draad uit elkaar lopen.
+// request holds one outbound call before signing. Keeping method, URL, and
+// headers together prevents the signed request from diverging from the wire.
 type request struct {
-	op     string // voor de foutmelding: "GET", "PUT", …
-	key    string // idem
+	op     string // operation name for errors
+	key    string // key or prefix for errors
 	method string
 	url    *url.URL
-	header leanhttp.Header // mag nil zijn
+	header leanhttp.Header // may be nil
 
-	// body is een body in het geheugen; stream plus streamLen is dezelfde
-	// body als stroom, voor payloads die niet in het geheugen horen. Zet één
-	// van de twee.
+	// Set either body for in-memory payloads or stream plus streamLen.
 	body      []byte
 	stream    io.Reader
 	streamLen int64
 
-	// payloadHash is de hex-sha256 van de body, of [UnsignedPayload].
+	// payloadHash is the body's hexadecimal SHA-256 or [UnsignedPayload].
 	payloadHash string
 }
 
-// do signeert r en stuurt hem over de pool van deze Client.
+// do signs r and sends it through the Client's pool.
 //
-// Host, Content-Length, Connection en Accept-Encoding staan bewust NIET in
-// r.header: leanhttp schrijft die zelf en weigert luid als de aanroeper ze
-// zet. Dat is precies wat de signeerder verwacht — zie canonicalRequest.
+// Host, Content-Length, Connection, and Accept-Encoding stay out of r.header;
+// leanhttp owns them and canonicalRequest signs accordingly.
 func (c *Client) do(ctx context.Context, r request) (*leanhttp.Response, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -236,37 +187,24 @@ func (c *Client) do(ctx context.Context, r request) (*leanhttp.Response, error) 
 		BodyReader: r.stream,
 		BodyLen:    r.streamLen,
 		Timeout:    timeoutFor(ctx),
-		// NoFollow, altijd: een SigV4-signatuur dekt exact déze host en dit
-		// pad, dus op de nieuwe URL is hij per definitie ongeldig — en erger:
-		// de gesigneerde headers (waaronder X-Amz-Security-Token) reisden mee
-		// naar waar de Location ook maar wees. Een 3xx wordt zo gewoon een
-		// StatusError met de Location in de body-dump (review 13-08,
-		// eenendertigste ronde).
+		// A SigV4 signature covers this host and path. Following a redirect would
+		// invalidate it and could leak signed headers such as a session token.
 		NoFollow: true,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("leans3: %s %s: %w", r.op, r.key, err)
 	}
-	// Een 204 of 304 zonder body hoeft hier niet meer opgevangen te worden:
-	// leanhttp doet dat sinds 12-08 zelf (RFC 9112 §6.3). Dit pakket vond die
-	// bug — een S3-DELETE antwoordt met 204, en zonder de regel stond élke
-	// delete stil op een read die nooit een byte kon opleveren, tot de server
-	// zijn idle-timeout haalde. De test daarop staat hieronder én in leanhttp.
+	// leanhttp centrally handles bodyless 204 and 304 responses (RFC 9112 §6.3),
+	// preventing S3 DELETE from waiting until the server's idle timeout.
 	return resp, nil
 }
 
-// fail vertaalt een niet-succes-antwoord naar de fout die erbij hoort. Hij
-// leest de body BEGRENSD: een stukgelopen of hostiele stream mag de heap niet
-// laten groeien.
+// fail maps an unsuccessful response to its error while bounding body reads.
 func (c *Client) fail(op, key string, resp *leanhttp.Response) error {
 	switch resp.StatusCode {
 	case leanhttp.StatusNotFound, statusPreconditionFailed, statusConflict:
-		// De sentinel-gevallen zijn geen storing maar protocol (een miss, een
-		// verloren CAS-race) en komen dus VAAK: hun kleine XML-body begrensd
-		// leegdrinken houdt de (TLS-)verbinding poolbaar — de vroege return
-		// zonder drain sloot hem, en elke miss kostte zo een handshake
-		// (review 13-08, eenendertigste ronde). Groter dan de grens? Dan is
-		// hij niet leeg en sluit Close hem gewoon.
+		// Expected misses and CAS races are common. Drain their small XML bodies
+		// within bounds to keep the TLS connection reusable; larger bodies close it.
 		io.Copy(io.Discard, io.LimitReader(resp.Body, 4<<10))
 		if resp.StatusCode == leanhttp.StatusNotFound {
 			return ErrNotFound
@@ -284,7 +222,7 @@ func (c *Client) fail(op, key string, resp *leanhttp.Response) error {
 	}
 }
 
-// client geeft de pool, gebouwd bij het eerste gebruik.
+// client returns the lazily constructed connection pool.
 func (c *Client) client() (*leanhttp.Client, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -298,14 +236,10 @@ func (c *Client) client() (*leanhttp.Client, error) {
 	return c.pool, nil
 }
 
-// dialer kiest het transport op het schema van Endpoint. Een nil-dialer is het
-// antwoord voor http: leanhttp verbindt dan zelf kaal.
+// dialer selects transport from Endpoint. Nil means leanhttp's plain HTTP dial.
 //
-// De roots zijn nil, dus x509.SystemCertPool: op een host is dat de trust
-// store van het OS, op bare-metal wat het image meebakte (importeer
-// golang.org/x/crypto/x509roots/fallback in de main). Er is bewust geen
-// skip-verify-knop — een bucket met sleutels erin is de laatste plek waar je
-// met de verkeerde tegenpartij wil praten.
+// Nil roots use x509.SystemCertPool: the host trust store or roots embedded in
+// a bare-metal image. There is deliberately no skip-verify option.
 func (c *Client) dialer() (func(ctx context.Context, network, addr string) (net.Conn, error), error) {
 	if c.Dial != nil {
 		return c.Dial, nil
@@ -327,8 +261,7 @@ func (c *Client) dialer() (func(ctx context.Context, network, addr string) (net.
 	}
 }
 
-// CloseIdle sluit de ongebruikte verbindingen in de pool. Voor wie klaar is,
-// of wiens netwerk onder hem is weggevallen; een lopend verzoek raakt hij niet.
+// CloseIdle closes unused pooled connections without affecting active requests.
 func (c *Client) CloseIdle() {
 	c.mu.Lock()
 	pool := c.pool
@@ -338,8 +271,7 @@ func (c *Client) CloseIdle() {
 	}
 }
 
-// timeoutFor maakt van een context-deadline leanhttp's termijn per aanroep.
-// Geen deadline = geen termijn, net als een http.Client zonder Timeout.
+// timeoutFor maps a context deadline to leanhttp's per-call timeout.
 func timeoutFor(ctx context.Context) time.Duration {
 	deadline, ok := ctx.Deadline()
 	if !ok {
@@ -348,7 +280,7 @@ func timeoutFor(ctx context.Context) time.Duration {
 	if d := time.Until(deadline); d > 0 {
 		return d
 	}
-	return time.Nanosecond // al voorbij: falen op de eerste read, niet blokkeren
+	return time.Nanosecond // Already expired: fail on first I/O instead of blocking.
 }
 
 func (c *Client) now() time.Time {
@@ -358,11 +290,8 @@ func (c *Client) now() time.Time {
 	return time.Now()
 }
 
-// URLFor geeft de request-URL voor key, in de adresseringsstijl van deze
-// Client. Openbaar omdat een aanroeper die zijn eigen verzoek wil doen (een
-// HEAD, een operatie die hier niet in zit) precies deze URL nodig heeft — en
-// hem anders zelf samenstelt, met de kans op de fout die pad-stijl en
-// host-stijl door elkaar haalt.
+// URLFor returns the request URL for key using this Client's addressing style.
+// It supports custom operations without duplicating path/host-style logic.
 func (c *Client) URLFor(key string) (*url.URL, error) {
 	if key == "" {
 		return nil, errors.New("leans3: key is required")
@@ -375,9 +304,8 @@ func (c *Client) URLFor(key string) (*url.URL, error) {
 	return u, nil
 }
 
-// bucketURL is de URL van de bucket zelf (afsluitende slash, geen key): de
-// basis die URLFor met een key verlengt en die een listing as-is gebruikt.
-// Pad-stijl: "<endpoint>/<bucket>/". Host-stijl: "<bucket>.<endpoint-host>/".
+// bucketURL returns the trailing-slash bucket URL without a key. URLFor extends
+// it; LIST uses it directly.
 func (c *Client) bucketURL() (*url.URL, error) {
 	if c.Endpoint == "" {
 		return nil, errors.New("leans3: Endpoint is required")

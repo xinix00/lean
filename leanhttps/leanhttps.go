@@ -1,51 +1,34 @@
-// Package leanhttps is https voor bare-metal Go: het knoopt [leanhttp] aan
-// [leantls] en verder niets. Het is een SAMENSTELLING (zie de README): het
-// voegt geen protocol en geen gedrag toe, het doet één knoop goed die anders
-// elke gebruiker zelf legt.
+// Package leanhttps provides HTTPS for bare-metal Go by composing [leanhttp]
+// with [leantls]. It adds no protocol behavior; it centralizes three error-prone
+// integration details:
 //
-// Waarom die knoop een pakket verdient — het zijn precies de drie dingen die
-// je erin fout kunt doen:
+//  1. SNI follows each dial host, including cross-host redirects.
+//  2. The caller's explicit pinned-key or certificate-chain trust model reaches
+//     leantls unchanged.
+//  3. leanhttp invokes the dialer per request and closes redirect connections.
 //
-//  1. SNI per HOST, niet per verzoek. Een release-URL van GitHub redirect naar
-//     een CDN op een ándere hostnaam; wie zijn TLS-config één keer opbouwt met
-//     een vaste ServerName, valideert na die redirect tegen de verkeerde naam.
-//     Hier komt de naam uit het dial-adres, dus hij volgt de redirect mee.
-//  2. Poort 443 zonder vertrouwensmodel. leantls weigert dat zelf luid, maar
-//     alleen als je zijn Config doorgeeft in plaats van er zelf een te maken
-//     met een lege VerifyPeer — dit pakket geeft hem door.
-//  3. De verbinding sluiten op een 3xx. Dat doet leanhttp al, maar alleen als
-//     de dialer per verzoek geroepen wordt (en dat is hier zo).
+// Importing [leanhttp] directly still links no TLS; this package is the sole
+// seam between them, and a test protects that composition boundary.
 //
-// Wat het NIET doet: TLS aan wie het niet vraagt. Importeer je [leanhttp]
-// rechtstreeks, dan linkt je binary geen byte TLS — dit pakket is de enige
-// plek waar de twee elkaar zien. Dat is de eigenschap die een samenstelling
-// van een framework onderscheidt, en er staat een test op.
+// Measured with the same tamago/riscv64 main (`-w -T 0x84010000`, 2026-08-12):
 //
-// Gemeten (2026-08-12, tamago/riscv64, zelfde main met alleen de HTTP/TLS-kant
-// verschillend, `-w -T 0x84010000`):
+//	board + fmt baseline ....................... 2.09 MB
+//	net/http + crypto/tls + CA bundle .......... 5.77 MB
+//	this package, leantls/x509verify chain ..... 3.75 MB (-2.01)
+//	this package, pinned key ................... 2.65 MB (-3.12)
 //
-//	board + fmt (de vloer) .................... 2,09 MB
-//	net/http + crypto/tls + CA-bundel ......... 5,77 MB   (wat je vervangt)
-//	dit pakket, keten via leantls/x509verify .. 3,75 MB   (−2,01)
-//	dit pakket, gepinde sleutel ............... 2,65 MB   (−3,12)
+// The chain variants both perform HTTPS with certificate validation. Most of
+// the saving comes from replacing net/http, which links crypto/tls
+// unconditionally.
 //
-// Alle vier met dezelfde main en dezelfde board-vloer, alleen de HTTP/TLS-kant
-// verschilt; de twee middelste doen functioneel hetzelfde (https ophalen met
-// echte certificaatvalidatie).
+// # Usage
 //
-// De sprong zit vooral in net/http: dat pakket linkt crypto/tls
-// onvoorwaardelijk, dus zolang het in je binary staat kost TLS je niets extra
-// én levert het weglaten ervan niets op. Vervang eerst de HTTP-kant; daarna is
-// de TLS-keuze pas een keuze.
-//
-// # Gebruik
-//
-// Een tegenpartij die je al kent (goedkoop: geen PKI in het image):
+// For a known peer without PKI in the image:
 //
 //	c := leanhttps.Client{TLS: &leantls.Config{PeerKey: leaderKey}}
 //	resp, err := c.Get("https://leader.internal/v1/jobs")
 //
-// Een echte certificaatketen (github.com en andere publieke servers):
+// For a public server with a certificate chain:
 //
 //	c := leanhttps.Client{TLS: &leantls.Config{
 //	    VerifyPeer:          x509verify.Chain(nil),
@@ -53,9 +36,8 @@
 //	}}
 //	resp, err := c.Get("https://github.com/org/repo/releases/download/tag/app.elf")
 //
-// Laat ServerName leeg: dit pakket vult hem per verbinding met de host die hij
-// dialt. Zet je hem zelf, dan geldt hij voor élke host in de redirect-keten en
-// dat is bijna nooit wat je bedoelt — daarom weigert Client dat luid.
+// Leave ServerName empty. This package sets it to each connection's dial host;
+// a fixed value would incorrectly apply across a redirect chain and is rejected.
 package leanhttps
 
 import (
@@ -70,23 +52,22 @@ import (
 	"github.com/xinix00/lean/leantls"
 )
 
-// Client doet https-verzoeken. TLS is verplicht: zonder vertrouwensmodel is er
-// niets te knopen, en een default verzinnen zou precies de stille fout zijn die
-// leantls weigert te maken.
+// Client performs HTTPS requests. TLS is mandatory because inventing a default
+// trust model would silently defeat peer authentication.
 type Client struct {
-	// TLS is het vertrouwensmodel: PeerKey (gepind) of VerifyPeer (keten).
-	// ServerName hoort leeg te blijven — zie de pakketdoc.
+	// TLS defines trust through PeerKey (pinned) or VerifyPeer (certificate
+	// chain). ServerName must remain empty; see the package documentation.
 	TLS *leantls.Config
 
-	// Timeout dekt één verzoek inclusief het lezen van de body; 0 = geen
-	// termijn (een blijvende stream hoort niet af te lopen).
+	// Timeout covers one request including its body. Zero allows indefinite
+	// streams.
 	Timeout time.Duration
 }
 
 var errNoConfig = errors.New("leanhttps: Client.TLS is nil — set PeerKey (a pinned peer) or VerifyPeer (a chain); there is no default")
 
-// Get haalt één URL op en geeft de response; een niet-200 is een fout, net als
-// bij [leanhttp.Get]. Voor alles anders dan GET: [Client.Do].
+// Get retrieves one URL. Like [leanhttp.Get], it treats non-200 status as an
+// error. Use [Client.Do] for other methods.
 func (c Client) Get(url string) (*leanhttp.Response, error) {
 	call, err := c.call(leanhttp.Call{URL: url})
 	if err != nil {
@@ -95,8 +76,8 @@ func (c Client) Get(url string) (*leanhttp.Response, error) {
 	return leanhttp.GetCall(call)
 }
 
-// Do voert één verzoek uit; een foutstatus is geen fout (de aanroeper leest hem
-// zelf), net als bij [leanhttp.Do].
+// Do executes one request. Like [leanhttp.Do], it returns error statuses to the
+// caller rather than treating them as Go errors.
 func (c Client) Do(call leanhttp.Call) (*leanhttp.Response, error) {
 	call, err := c.call(call)
 	if err != nil {
@@ -105,19 +86,17 @@ func (c Client) Do(call leanhttp.Call) (*leanhttp.Response, error) {
 	return leanhttp.Do(call)
 }
 
-// DialerContext geeft de TLS-dialer los, om in een [leanhttp.Client] te
-// hangen: dan poolt die versleutelde verbindingen (keep-alive over TLS).
+// DialerContext returns the TLS dialer for a [leanhttp.Client], enabling pooled
+// keep-alive over TLS.
 //
 //	pool := &leanhttp.Client{DialContext: leanhttps.DialerContext(tlsCfg)}
 //
-// De config wordt niet gemuteerd en ServerName komt per verbinding uit het
-// dial-adres, net als bij [Client]. (De contextloze Dialer-vorm is gesloopt
-// in review 13-08, dertigste ronde: één dialer-gedaante.)
+// It does not mutate cfg and derives ServerName from each dial address.
 func DialerContext(cfg *leantls.Config) func(ctx context.Context, network, addr string) (net.Conn, error) {
 	return Client{TLS: cfg}.dial
 }
 
-// call hangt de TLS-dialer aan een leanhttp.Call. Dit is het hele pakket.
+// call attaches the TLS dialer to a leanhttp.Call.
 func (c Client) call(call leanhttp.Call) (leanhttp.Call, error) {
 	if c.TLS == nil {
 		return call, errNoConfig
@@ -130,36 +109,30 @@ func (c Client) call(call leanhttp.Call) (leanhttp.Call, error) {
 	if call.Timeout == 0 {
 		call.Timeout = c.Timeout
 	}
-	// DialContext, niet Dial: dan draagt de totaaltermijn van de call als
-	// context-deadline door tot in de TCP-dial en de handshake — een dial die
-	// leanhttp allang opgaf leeft dan ook zelf niet meer door (review 13-08,
-	// vijftiende ronde).
+	// DialContext carries the total deadline through TCP dial and handshake, so
+	// canceled HTTP work cannot leave a live dial behind.
 	call.DialContext = c.dial
 	return call, nil
 }
 
-// dial verbindt versleuteld. De SNI-naam komt uit addr — dus uit de host die
-// leanhttp op DIT moment wil bereiken, niet uit de oorspronkelijke URL.
+// dial creates an encrypted connection, deriving SNI from the current dial
+// address rather than the original URL.
 func (c Client) dial(ctx context.Context, network, addr string) (net.Conn, error) {
 	if c.TLS == nil {
-		// DialerContext(nil) levert deze dialer zónder de wacht in call():
-		// een fout bij het dialen is laat maar leesbaar, een nil-deref op
-		// c.TLS.PeerKey hieronder was een panic vijf lagen van de oorzaak
-		// (review 13-08, eenendertigste ronde).
+		// DialerContext(nil) bypasses call, so preserve a readable dial error
+		// instead of panicking on c.TLS below.
 		return nil, errNoConfig
 	}
 	host := addr
 	if h, _, err := net.SplitHostPort(addr); err == nil {
 		host = h
 	}
-	// Een IP-adres is geen naam om tegen te valideren; met een gepinde sleutel
-	// hoeft dat ook niet (de sleutel ís de identiteit), met een keten wél — en
-	// dan hoort dat luid te falen in plaats van tegen een lege naam te matchen.
+	// Certificate chains need a name; pinned keys already supply identity.
 	if c.TLS.PeerKey == nil && net.ParseIP(host) != nil {
 		return nil, fmt.Errorf("leanhttps: %s is an IP address, so there is no name to verify a "+
 			"chain against — use a hostname, or pin the peer's key", host)
 	}
-	cfg := *c.TLS // kopie: de dialer mag de config van de aanroeper niet muteren
+	cfg := *c.TLS // Copy: dialing must not mutate caller configuration.
 	cfg.ServerName = strings.TrimSuffix(host, ".")
 	return leantls.DialContext(ctx, network, addr, &cfg)
 }

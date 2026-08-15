@@ -6,17 +6,11 @@ import (
 	"fmt"
 )
 
-// Twee minuscule helpers voor het TLS-draadformaat, dat volledig uit
-// lengte-geprefixte velden bestaat: een builder die de lengte achteraf invult en
-// een reader die nooit buiten zijn buffer leest.
-//
-// Waarom niet golang.org/x/crypto/cryptobyte, dat precies dit doet: dat is de
-// vierde regel van de lean-regels die we níet mogen breken (stdlib only), en het
-// is veertig regels. Wat het ons hier extra oplevert is de belangrijkste
-// eigenschap van de reader: élke lees geeft een fout in plaats van te paniekeren,
-// want dit zijn bytes van een tegenpartij die wij niet schreven.
+// Minimal helpers for TLS length-prefixed wire data: a builder that backfills
+// lengths and a reader that returns errors instead of crossing its buffer.
+// Keeping these forty lines avoids a non-standard cryptobyte dependency.
 
-// builder bouwt een bytestroom met lengte-prefixen die achteraf ingevuld worden.
+// builder creates a byte stream with backfilled length prefixes.
 type builder struct {
 	buf []byte
 }
@@ -25,10 +19,8 @@ func (b *builder) u8(v byte)      { b.buf = append(b.buf, v) }
 func (b *builder) u16(v uint16)   { b.buf = binary.BigEndian.AppendUint16(b.buf, v) }
 func (b *builder) bytes(p []byte) { b.buf = append(b.buf, p...) }
 
-// u8len/u16len/u24len schrijven een blok met zijn lengte ervoor. De lengte wordt
-// gereserveerd, f() vult de inhoud, en dan gaat de echte lengte op zijn plek —
-// dat is de enige vorm waarin je geen enkele lengte met de hand kunt uitrekenen,
-// en handmatig uitgerekende lengtes zijn in dit protocol dé bron van fouten.
+// u8len, u16len, and u24len reserve a prefix, let f append content, then backfill
+// its actual length to avoid error-prone manual size calculations.
 func (b *builder) u8len(f func()) {
 	at := len(b.buf)
 	b.buf = append(b.buf, 0)
@@ -64,11 +56,10 @@ func (b *builder) u24len(f func()) {
 	b.buf[at+2] = byte(n)
 }
 
-// errShort is wat élke te korte lees oplevert. Eén sentinel, zodat de
-// aanroeper hem kan herkennen zonder op tekst te matchen.
+// errShort is the sentinel for every truncated read.
 var errShort = errors.New("leantls: truncated message")
 
-// reader leest lengte-geprefixte velden en raakt nooit buiten zijn buffer.
+// reader consumes length-prefixed fields without crossing its buffer.
 type reader struct {
 	buf []byte
 }
@@ -103,8 +94,8 @@ func (r *reader) u24() (uint32, error) {
 	return v, nil
 }
 
-// take pakt n rauwe bytes. Het resultaat wijst IN de buffer van de reader —
-// goedkoop, en veilig omdat elke aanroeper het meteen verwerkt of kopieert.
+// take returns n bytes backed by the reader buffer; callers consume or copy them
+// immediately.
 func (r *reader) take(n int) ([]byte, error) {
 	if n < 0 || len(r.buf) < n {
 		return nil, errShort
@@ -114,7 +105,7 @@ func (r *reader) take(n int) ([]byte, error) {
 	return v, nil
 }
 
-// vec8/vec16/vec24 lezen een lengte-geprefixt blok en geven het als eigen reader.
+// vec8, vec16, and vec24 return a length-prefixed block as its own reader.
 func (r *reader) vec8() (reader, error) {
 	n, err := r.u8()
 	if err != nil {
@@ -142,9 +133,8 @@ func (r *reader) vec24() (reader, error) {
 	return reader{buf: p}, err
 }
 
-// eachExtension loopt een extensieblok af en geeft per extensie het type en de
-// body. Onbekende extensies overslaan is hier GEEN slordigheid maar het
-// protocol: een server mag er meer sturen dan wij kennen.
+// eachExtension visits every extension type and body. Callers may ignore unknown
+// extensions because TLS explicitly permits them.
 func eachExtension(r reader, f func(typ uint16, body reader) error) error {
 	for !r.empty() {
 		typ, err := r.u16()

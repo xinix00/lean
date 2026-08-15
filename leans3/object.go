@@ -1,7 +1,7 @@
 package leans3
 
-// De objectoperaties. Eén object is één verzoek: geen multipart, geen retries,
-// geen beleid — wie een lease of een orkestrator bouwt, bouwt dat erbovenop.
+// Object operations map one object to one request. Multipart, retries, and
+// orchestration policy belong above this layer.
 
 import (
 	"context"
@@ -14,40 +14,29 @@ import (
 	"github.com/xinix00/lean/leanhttp"
 )
 
-// PutOptions zijn de voorwaarde en de metadata van één PUT. nil = onvoorwaardelijk
-// schrijven met "application/octet-stream".
-//
-// IfMatch en IfNoneMatch zijn de RUWE headerwaarden, niet een vriendelijker
-// vorm ("alleen aanmaken", "vervang versie X"). Dat is opzet: providers zijn
-// het oneens over de vorm van een ETag — sommige geven hem met dubbele
-// aanhalingstekens terug en vergelijken hem zonder — en wie dat moet omzeilen,
-// moet exact kunnen zeggen wat er op de draad staat.
+// PutOptions contains one PUT's conditions and metadata. Nil means an
+// unconditional application/octet-stream write. IfMatch and IfNoneMatch are raw
+// header values because providers disagree about quoted ETag forms.
 type PutOptions struct {
-	// ContentType is de Content-Type van het object; leeg =
-	// "application/octet-stream".
+	// ContentType defaults to "application/octet-stream".
 	ContentType string
 
-	// IfMatch schrijft alleen als de opgeslagen ETag dit is.
+	// IfMatch writes only when the stored ETag matches.
 	IfMatch string
 
-	// IfNoneMatch schrijft alleen als hij NIET matcht; "*" betekent "alleen als
-	// het object nog niet bestaat" — dat is de conditionele create waar een
-	// CAS-protocol op staat.
+	// IfNoneMatch writes only when it does not match. "*" creates only when the
+	// object does not exist, supporting CAS protocols.
 	IfNoneMatch string
 }
 
-// DeleteOptions is de voorwaarde van één DELETE. nil = onvoorwaardelijk.
+// DeleteOptions contains one DELETE's condition. Nil means unconditional.
 type DeleteOptions struct {
-	// IfMatch verwijdert alleen als de opgeslagen ETag dit is.
+	// IfMatch deletes only when the stored ETag matches.
 	IfMatch string
 }
 
-// Get haalt het object op en geeft de bytes plus zijn ETag. Een key die niet
-// bestaat geeft [ErrNotFound].
-//
-// Voor iets groters dan een configuratie of een staat-snapshot: [Client.GetTo].
-// Deze vorm houdt het hele object in het geheugen, en op een node met 64MB is
-// dat het verschil tussen werken en een OOM.
+// Get returns an object's bytes and ETag, or [ErrNotFound]. It buffers the full
+// object; use [Client.GetTo] for data larger than configuration or state.
 func (c *Client) Get(ctx context.Context, key string) ([]byte, string, error) {
 	u, err := c.URLFor(key)
 	if err != nil {
@@ -71,13 +60,9 @@ func (c *Client) Get(ctx context.Context, key string) ([]byte, string, error) {
 	return data, resp.Header.Get("ETag"), nil
 }
 
-// GetTo streamt het object naar w en geeft het aantal geschreven bytes plus de
-// ETag. Een key die niet bestaat geeft [ErrNotFound], en dan is er niets naar w
-// geschreven.
-//
-// Een schrijffout van w breekt de download af en komt ONGEWIKKELD terug (via
-// %w te ontrafelen), zodat een aanroeper zijn eigen volle schijf van een
-// transportstoring kan onderscheiden.
+// GetTo streams an object to w and returns its byte count and ETag. An absent
+// key returns [ErrNotFound] before writing. Writer errors remain unwrap-able so
+// callers can distinguish local storage failures from transport failures.
 func (c *Client) GetTo(ctx context.Context, key string, w io.Writer) (int64, string, error) {
 	u, err := c.URLFor(key)
 	if err != nil {
@@ -102,20 +87,16 @@ func (c *Client) GetTo(ctx context.Context, key string, w io.Writer) (int64, str
 	return n, etag, nil
 }
 
-// Put schrijft data naar key en geeft de ETag die de server teruggaf ("" als hij
-// er geen stuurde). De payload-hash wordt hier berekend — de body zit al in het
-// geheugen, dus dat kost één pass en geen tweede kopie.
-//
-// Met een voorwaarde in opt die niet gold: [ErrPreconditionFailed], en dan is er
-// niets geschreven.
+// Put writes data to key and returns the server's ETag, or "" when absent. It
+// computes the payload hash without another body copy. Failed conditions return
+// [ErrPreconditionFailed] without writing.
 func (c *Client) Put(ctx context.Context, key string, data []byte, opt *PutOptions) (string, error) {
 	u, err := c.URLFor(key)
 	if err != nil {
 		return "", err
 	}
-	// Een leeg object moet nog steeds Content-Length: 0 aankondigen — S3
-	// antwoordt 411 op een PUT zonder — en leanhttp schrijft die header alleen
-	// voor een body die niet nil is.
+	// S3 requires Content-Length: 0 for empty PUT; a non-nil empty slice makes
+	// leanhttp emit it.
 	if data == nil {
 		data = []byte{}
 	}
@@ -131,9 +112,8 @@ func (c *Client) Put(ctx context.Context, key string, data []byte, opt *PutOptio
 	defer resp.Body.Close()
 	switch resp.StatusCode {
 	case leanhttp.StatusOK, leanhttp.StatusCreated, leanhttp.StatusNoContent:
-		// Leegdrinken is wat de verbinding aan de pool teruggeeft: leanhttp
-		// hergebruikt alleen een body die tot het einde gelezen is. Niet vóór
-		// de switch — de foutweg heeft die bytes nodig.
+		// Draining proves the body complete and returns the connection to the pool.
+		// Error handling below needs its body first.
 		io.Copy(io.Discard, resp.Body)
 		return resp.Header.Get("ETag"), nil
 	default:
@@ -141,20 +121,11 @@ func (c *Client) Put(ctx context.Context, key string, data []byte, opt *PutOptio
 	}
 }
 
-// PutFrom streamt precies size bytes uit r naar key, zonder de payload in het
-// geheugen te houden, en geeft de ETag terug.
-//
-// payloadSHA256 is de lowercase hex-sha256 van die bytes: SigV4 signeert de
-// payload-hash, en bij een stroom kan dit pakket hem niet berekenen zonder
-// alles te bufferen — dus komt hij van de aanroeper, die de bron bezit
-// (meestal een goedkope eerste pass over een lokaal bestand). Een bron die niet
-// twee keer te lezen is, kan [UnsignedPayload] meegeven; leeg is een FOUT en
-// geen stille keuze, want stil UNSIGNED-PAYLOAD sturen is precies het soort
-// verzwakking dat niemand terugvindt.
-//
-// Levert r een ander aantal bytes, dan faalt het verzoek luid (leanhttp
-// vergelijkt met BodyLen); levert hij andere inhoud, dan wijst S3 hem af
-// (BadDigest). Een gescheurde bron is dus nooit een stil beschadigd object.
+// PutFrom streams exactly size bytes from r and returns the ETag without
+// buffering the payload. payloadSHA256 is the lowercase hash supplied by the
+// source owner; use [UnsignedPayload] only for a non-replayable source. Empty is
+// rejected rather than silently weakening integrity. A length mismatch fails in
+// leanhttp and a content mismatch fails at S3 as BadDigest.
 func (c *Client) PutFrom(ctx context.Context, key string, r io.Reader, size int64, payloadSHA256 string, opt *PutOptions) (string, error) {
 	if payloadSHA256 == "" {
 		return "", errors.New("leans3: PutFrom needs the payload's sha256 " +
@@ -164,10 +135,7 @@ func (c *Client) PutFrom(ctx context.Context, key string, r io.Reader, size int6
 		return "", fmt.Errorf("leans3: PutFrom needs the size up front, got %d", size)
 	}
 	if payloadSHA256 == UnsignedPayload && !strings.HasPrefix(strings.ToLower(c.Endpoint), "https://") {
-		// De pakketdoc beloofde dit al ("dat mag alleen over https") maar
-		// dwong het niet af: een niet-gesigneerde én niet-versleutelde payload
-		// is onderweg door iedereen te vervangen zonder dat S3 of wij dat ooit
-		// merken (review 13-08, eenendertigste ronde).
+		// An unsigned, unencrypted payload is silently modifiable in transit.
 		return "", errors.New("leans3: UnsignedPayload over a plain-http endpoint would be silently modifiable in transit — use https, or pass the payload's sha256")
 	}
 	u, err := c.URLFor(key)
@@ -175,10 +143,8 @@ func (c *Client) PutFrom(ctx context.Context, key string, r io.Reader, size int6
 		return "", err
 	}
 	if size == 0 {
-		// Nul bytes stromen niet: het gewone Content-Length: 0-pad, zonder de
-		// Expect-dans die voor een lege body niets uitspaart (review 13-08,
-		// eenendertigste ronde). De hash blijft die van de aanroeper — S3
-		// verifieert hem tegen de (lege) payload.
+		// Zero bytes use the regular Content-Length: 0 path without an unnecessary
+		// Expect exchange. S3 still verifies the caller's hash.
 		resp, err := c.do(ctx, request{
 			op: methodPut, key: key, method: methodPut, url: u,
 			header:      putHeader(opt),
@@ -191,16 +157,14 @@ func (c *Client) PutFrom(ctx context.Context, key string, r io.Reader, size int6
 		defer resp.Body.Close()
 		switch resp.StatusCode {
 		case leanhttp.StatusOK, leanhttp.StatusCreated, leanhttp.StatusNoContent:
-			io.Copy(io.Discard, resp.Body) // leegdrinken: zie Put
+			io.Copy(io.Discard, resp.Body) // Drain for reuse; see Put.
 			return resp.Header.Get("ETag"), nil
 		default:
 			return "", c.fail(methodPut, key, resp)
 		}
 	}
-	// BodyReader plus BodyLen stuurt de payload als stroom mét een
-	// Content-Length. Die lengte is geen netheid: zonder hem zou het verzoek
-	// gechunkt moeten worden, en S3 accepteert een gechunkte upload alleen met
-	// een streaming signature — die dit pakket bewust niet heeft.
+	// BodyReader plus BodyLen sends a known-length stream. Without the length,
+	// S3 requires chunking and a streaming signature, both outside scope.
 	resp, err := c.do(ctx, request{
 		op: methodPut, key: key, method: methodPut, url: u,
 		header:      putHeader(opt),
@@ -214,17 +178,16 @@ func (c *Client) PutFrom(ctx context.Context, key string, r io.Reader, size int6
 	defer resp.Body.Close()
 	switch resp.StatusCode {
 	case leanhttp.StatusOK, leanhttp.StatusCreated, leanhttp.StatusNoContent:
-		io.Copy(io.Discard, resp.Body) // leegdrinken: zie Put
+		io.Copy(io.Discard, resp.Body) // Drain for reuse; see Put.
 		return resp.Header.Get("ETag"), nil
 	default:
 		return "", c.fail(methodPut, key, resp)
 	}
 }
 
-// Delete verwijdert key. Een object dat er niet is geeft [ErrNotFound]; wie een
-// idempotente delete wil, negeert die met errors.Is.
-//
-// Met een IfMatch die niet gold: [ErrPreconditionFailed].
+// Delete removes key. Missing objects return [ErrNotFound], which idempotent
+// callers may ignore with errors.Is. A failed IfMatch returns
+// [ErrPreconditionFailed].
 func (c *Client) Delete(ctx context.Context, key string, opt *DeleteOptions) error {
 	u, err := c.URLFor(key)
 	if err != nil {
@@ -245,16 +208,15 @@ func (c *Client) Delete(ctx context.Context, key string, opt *DeleteOptions) err
 	defer resp.Body.Close()
 	switch resp.StatusCode {
 	case leanhttp.StatusOK, leanhttp.StatusNoContent:
-		io.Copy(io.Discard, resp.Body) // leegdrinken: zie Put
+		io.Copy(io.Discard, resp.Body) // Drain for reuse; see Put.
 		return nil
 	default:
 		return c.fail(methodDelete, key, resp)
 	}
 }
 
-// putHeader zet de Content-Type en de voorwaarde van een PUT. Content-Length
-// staat er bewust niet in: die schrijft leanhttp, en de signatuur dekt hem niet
-// (zie canonicalRequest).
+// putHeader sets PUT content type and conditions. leanhttp owns Content-Length,
+// which canonicalRequest deliberately does not sign.
 func putHeader(opt *PutOptions) leanhttp.Header {
 	contentType := "application/octet-stream"
 	hdr := leanhttp.Header{}
@@ -273,31 +235,23 @@ func putHeader(opt *PutOptions) leanhttp.Header {
 	return hdr
 }
 
-// listBucketResult is het deel van het ListObjectsV2-antwoord dat dit pakket
-// leest; listparse.go haalt het uit de XML. De namespace van het S3-document
-// hoeft geen aandacht: er wordt op lokale elementnaam gematcht.
+// listBucketResult is the ListObjectsV2 subset extracted by listparse.go. It
+// matches local element names independently of namespace.
 type listBucketResult struct {
 	IsTruncated           bool
 	NextContinuationToken string
 	Contents              []listEntry
 }
 
-// listEntry is één object in een pagina. Alleen de key: zie [Client.List] voor
-// waarom dat het antwoord is en niet een keuze die dit pakket maakt.
+// listEntry is one page object. [Client.List] explains why only its key remains.
 type listEntry struct {
 	Key string
 }
 
-// List geeft de keys van elk object waarvan de key met prefix begint, in de
-// lexicale orde van S3, en pagineert intern tot de listing op is.
-//
-// max > 0 begrenst het aantal keys; truncated zegt dan of die grens de listing
-// afkapte. max <= 0 is onbegrensd — met zorg te gebruiken: een grote prefix
-// wordt een grote slice, en op een node is dat de heap van iemand anders.
-//
-// Bewust alleen keys, geen maten of datums: dat is wat een "map" in een bucket
-// nodig heeft, en een rijker resultaat zou dit pakket het antwoord laten
-// bepalen dat de aanroeper hoort te kiezen.
+// List returns keys with prefix in S3 lexical order and follows pagination.
+// Positive max bounds the result and sets truncated when reached; non-positive
+// max is unbounded and may consume memory proportional to the bucket. It
+// deliberately omits sizes and dates because current consumers need a key map.
 func (c *Client) List(ctx context.Context, prefix string, max int) (keys []string, truncated bool, err error) {
 	token := ""
 	for {
@@ -321,7 +275,7 @@ func (c *Client) List(ctx context.Context, prefix string, max int) (keys []strin
 	}
 }
 
-// listPage haalt één ListObjectsV2-pagina op.
+// listPage fetches one ListObjectsV2 page.
 func (c *Client) listPage(ctx context.Context, prefix, token string) (*listBucketResult, error) {
 	u, err := c.bucketURL()
 	if err != nil {
@@ -347,9 +301,8 @@ func (c *Client) listPage(ctx context.Context, prefix, token string) (*listBucke
 	if resp.StatusCode != leanhttp.StatusOK {
 		return nil, c.fail("LIST", prefix, resp)
 	}
-	// Begrensd lezen vóór het parsen: een pagina noemt maximaal 1000 keys van
-	// elk maximaal 1KB, dus een correcte pagina past ruim; een vastgelopen of
-	// hostiele stream mag de heap niet ongebonden laten groeien.
+	// A valid page has at most 1,000 keys of at most 1 KiB. Bound reads before
+	// parsing so a stalled or hostile response cannot grow the heap indefinitely.
 	const maxPage = 4 << 20
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxPage))
 	if err != nil {

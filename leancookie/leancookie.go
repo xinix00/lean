@@ -1,45 +1,29 @@
-// Package leancookie is een cookie-jar (RFC 6265) op stdlib alleen: het slaat
-// Set-Cookie op, kiest bij een verzoek de cookies die erbij horen, en houdt
-// zich aan domein, pad, verval en Secure. Het weet niets van HTTP — je geeft
-// het de headerregels en een URL, en het geeft je de Cookie-header terug.
+// Package leancookie is a standard-library-only RFC 6265 cookie jar. It stores
+// Set-Cookie fields and selects Cookie values by domain, path, expiry, and
+// Secure without depending on HTTP.
 //
-// Het gemeten probleem: `net/http/cookiejar` sleept net/http mee, en net/http
-// linkt onvoorwaardelijk crypto/tls. Wie op bare metal een jar wil, betaalt dus
-// ~3,2 MB voor iets wat over een paar honderd regels gaat (gemeten 2026-08-12,
-// tamago/riscv64: net/http + crypto/tls + CA-bundel = 3,68 MB boven een
-// board-vloer van 2,09 MB). Dit pakket is die paar honderd regels.
+// net/http/cookiejar pulls net/http and crypto/tls into a bare-metal image. On
+// tamago/riscv64 (2026-08-12), net/http + crypto/tls + a CA bundle added about
+// 3.2 MB above a 2.09 MB board baseline.
 //
-// # Wat het niet doet, en waarom dat eerlijk is
+// # Deliberate limits
 //
-// Er is GEEN public-suffix-lijst. Die is honderden KB's en verandert
-// maandelijks — precies wat niet in een bare-metal image hoort. Zonder die
-// lijst kan dit pakket niet weten dat "co.uk" een suffix is en "example.com"
-// niet, en dus zou een server op "a.co.uk" een cookie voor heel ".co.uk"
-// kunnen zetten die naar iedereen daarbinnen meegaat.
+// The package has no public suffix list: it costs hundreds of KiB and changes
+// monthly. Without one, distinguishing unsafe `a.co.uk` → `co.uk` scope from
+// valid `sub.example.com` → `example.com` scope is impossible. Cookies are
+// therefore host-only by default. Domain attributes are rejected and counted
+// in [Jar.Rejected] unless caller knowledge in [Jar.AllowDomain] permits them.
 //
-// En "a.co.uk mag co.uk niet zetten" is niet te onderscheiden van
-// "sub.example.com mag example.com wel zetten": het is dezelfde vorm, één
-// label eraf. Zonder de lijst is er geen regel die het ene toestaat en het
-// andere weigert — dat is geen implementatiedetail, dat is de reden dat die
-// lijst bestaat.
+// SameSite enforcement belongs to browser navigation policy and is omitted, as
+// are __Host-/__Secure- prefix handling and per-domain limits beyond the total
+// jar limit.
 //
-// Dus is de default: cookies gelden ALLEEN voor de host die ze zette. Een
-// Domain-attribuut wordt geweigerd en geteld ([Jar.Rejected]). Wie
-// subdomein-cookies nodig heeft, brengt zijn eigen kennis mee via
-// [Jar.AllowDomain] — een lijstje eigen domeinen is drie regels, en wie een
-// echte suffix-lijst toch al heeft, hangt die daar aan. Het pakket doet de
-// helft die veilig te doen is, en laat de rest aan wie het kan weten.
-//
-// Verder niet: geen SameSite-handhaving (dat is browser-navigatiebeleid, niet
-// jar-beleid), geen __Host-/__Secure-voorvoegsels, geen cookie-limiet per
-// domein anders dan een totaalmaximum.
-//
-// # Gebruik
+// # Usage
 //
 //	jar := leancookie.New(0)
-//	// na een antwoord:
+//	// After a response:
 //	jar.SetFrom(u, resp.Header.Values("Set-Cookie"))
-//	// bij het volgende verzoek:
+//	// On the next request:
 //	if h := jar.Header(u); h != "" {
 //	    call.Header = leanhttp.Header{"Cookie": h}
 //	}
@@ -53,30 +37,25 @@ import (
 	"time"
 )
 
-// defaultMax is het aantal cookies dat een jar bewaart. Een browsersessie op
-// een node komt daar niet aan; een server die er duizenden stuurt hoort niet
-// het geheugen van de node te bepalen.
+// defaultMax bounds server-controlled memory while exceeding ordinary node
+// browser sessions.
 const defaultMax = 256
 
-// Jar bewaart cookies. Veilig voor gelijktijdig gebruik.
+// Jar stores cookies and is safe for concurrent use.
 type Jar struct {
 	mu   sync.Mutex
 	max  int
 	list []cookie
 
-	// Rejected telt cookies die geweigerd zijn (kromme regel, geweigerd Domain,
-	// verlopen bij aankomst, jar vol). Nul betekent niet "geen cookies" maar
-	// "niets afgekeurd" — een teller die stil op nul blijft is de reden dat
-	// niemand merkt dat zijn login niet werkt.
+	// Rejected counts malformed, disallowed-domain, already expired, and
+	// over-capacity cookies. It makes otherwise silent login failures visible.
 	Rejected int
 
-	// AllowDomain beslist of een Domain-attribuut mag. nil = nee, en dan zijn
-	// alle cookies host-only (de veilige default; zie de pakketdoc). De
-	// aanroeper krijgt de host die de cookie stuurde en het gevraagde domein,
-	// beide lowercase en zonder punt ervoor.
+	// AllowDomain decides whether to accept a Domain attribute. Nil keeps every
+	// cookie host-only. host and domain are lowercase without a leading dot.
 	//
-	// Wie dit zet, neemt de suffix-vraag over. De simpelste veilige vorm is een
-	// lijst van domeinen die je zelf bezit:
+	// Setting this transfers public-suffix responsibility to the caller. A safe
+	// simple policy lists domains the caller owns:
 	//
 	//	jar.AllowDomain = func(host, domain string) bool {
 	//	    return domain == "example.com" || domain == "gethop.org"
@@ -86,14 +65,14 @@ type Jar struct {
 
 type cookie struct {
 	name, value string
-	host        string // de host waarvoor hij geldt (zonder punt)
+	host        string // applicable host, without a leading dot
 	path        string
-	expires     time.Time // nulwaarde = sessie-cookie
-	subdomains  bool      // gezet via Domain: geldt ook voor subdomeinen
+	expires     time.Time // zero means a session cookie
+	subdomains  bool      // Domain permits subdomains
 	secure      bool
 }
 
-// New maakt een jar; max 0 = 256 cookies.
+// New creates a jar. A non-positive max uses the 256-cookie default.
 func New(max int) *Jar {
 	if max <= 0 {
 		max = defaultMax
@@ -101,9 +80,9 @@ func New(max int) *Jar {
 	return &Jar{max: max}
 }
 
-// SetFrom neemt de Set-Cookie-regels van één antwoord op. Onbruikbare regels
-// worden geteld, niet gemeld: één server die rommel stuurt hoort een verzoek
-// niet te laten falen.
+// SetFrom consumes Set-Cookie fields from one response. Unusable fields are
+// counted rather than returned because one malformed cookie should not fail a
+// request.
 func (j *Jar) SetFrom(u *url.URL, lines []string) {
 	if u == nil {
 		return
@@ -121,8 +100,8 @@ func (j *Jar) SetFrom(u *url.URL, lines []string) {
 	}
 }
 
-// Header geeft de Cookie-header voor u, of "" als er niets bij hoort. De
-// volgorde is langste pad eerst (RFC 6265 §5.4).
+// Header returns the Cookie field for u, or "" when none apply. RFC 6265 §5.4
+// requires longest paths first.
 func (j *Jar) Header(u *url.URL) string {
 	if u == nil {
 		return ""
@@ -138,7 +117,7 @@ func (j *Jar) Header(u *url.URL) string {
 	kept := j.list[:0]
 	for _, c := range j.list {
 		if !c.expires.IsZero() && !c.expires.After(now) {
-			continue // verlopen: onderweg opruimen
+			continue // Remove expired entries while scanning.
 		}
 		kept = append(kept, c)
 		switch {
@@ -153,7 +132,7 @@ func (j *Jar) Header(u *url.URL) string {
 	if len(hits) == 0 {
 		return ""
 	}
-	// Langste pad eerst; bij gelijk pad de invoegvolgorde (die is al zo).
+	// Longest path first; preserve insertion order for equal paths.
 	for i := 1; i < len(hits); i++ {
 		for k := i; k > 0 && len(hits[k].path) > len(hits[k-1].path); k-- {
 			hits[k], hits[k-1] = hits[k-1], hits[k]
@@ -171,31 +150,28 @@ func (j *Jar) Header(u *url.URL) string {
 	return b.String()
 }
 
-// Len geeft het aantal bewaarde cookies (diagnose).
+// Len returns the number of stored cookies.
 func (j *Jar) Len() int {
 	j.mu.Lock()
 	defer j.mu.Unlock()
 	return len(j.list)
 }
 
-// store voegt toe of vervangt. Vervangen gaat op (naam, host, pad) — dat is de
-// identiteit die de RFC gebruikt, en het is waarom een tweede login-cookie de
-// eerste niet naast zich laat staan.
+// store adds or replaces by the RFC identity (name, host, path).
 func (j *Jar) store(c cookie, now time.Time) {
 	j.mu.Lock()
 	defer j.mu.Unlock()
 	for i := range j.list {
 		if j.list[i].name == c.name && j.list[i].host == c.host && j.list[i].path == c.path {
 			if c.value == "" && !c.expires.IsZero() && !c.expires.After(now) {
-				j.list = append(j.list[:i], j.list[i+1:]...) // verlopen = verwijderen
+				j.list = append(j.list[:i], j.list[i+1:]...) // Expiry deletes.
 				return
 			}
 			j.list[i] = c
 			return
 		}
 	}
-	// Een cookie die al verlopen aankomt is een verwijdering van iets dat we
-	// niet hebben: niets te doen.
+	// An already expired unknown cookie is a deletion with nothing to remove.
 	if !c.expires.IsZero() && !c.expires.After(now) {
 		j.Rejected++
 		return
@@ -207,7 +183,7 @@ func (j *Jar) store(c cookie, now time.Time) {
 	j.list = append(j.list, c)
 }
 
-// parse ontleedt één Set-Cookie-regel tegen de URL waar hij van kwam.
+// parse interprets one Set-Cookie field against its source URL.
 func (j *Jar) parse(line string, u *url.URL, now time.Time) (cookie, bool) {
 	first, rest, _ := strings.Cut(line, ";")
 	name, value, found := strings.Cut(first, "=")
@@ -216,7 +192,7 @@ func (j *Jar) parse(line string, u *url.URL, now time.Time) (cookie, bool) {
 	if !found || name == "" || strings.ContainsAny(name, " \t\r\n;") {
 		return cookie{}, false
 	}
-	// Aanhalingstekens rond de waarde horen bij de waarde niet.
+	// Surrounding quotes delimit rather than form part of the value.
 	if len(value) >= 2 && value[0] == '"' && value[len(value)-1] == '"' {
 		value = value[1 : len(value)-1]
 	}
@@ -242,7 +218,7 @@ func (j *Jar) parse(line string, u *url.URL, now time.Time) (cookie, bool) {
 		case "domain":
 			d := strings.ToLower(strings.TrimPrefix(strings.TrimSpace(v), "."))
 			if !j.domainOK(host, d) {
-				return cookie{}, false // host-only tenzij AllowDomain zegt van wel
+				return cookie{}, false // Host-only unless AllowDomain permits it.
 			}
 			c.host, c.subdomains = d, true
 		case "expires":
@@ -250,7 +226,7 @@ func (j *Jar) parse(line string, u *url.URL, now time.Time) (cookie, bool) {
 				c.expires = t
 			}
 		case "max-age":
-			// Max-Age wint van Expires (RFC 6265 §5.3 stap 3).
+			// Max-Age overrides Expires (RFC 6265 §5.3 step 3).
 			if n, err := strconv.Atoi(v); err == nil {
 				maxAge = &n
 				if n <= 0 {
@@ -266,20 +242,19 @@ func (j *Jar) parse(line string, u *url.URL, now time.Time) (cookie, bool) {
 	return c, true
 }
 
-// domainOK beslist over een Domain-attribuut. Twee dingen gelden altijd, ook
-// met een AllowDomain-hook: het domein moet een suffix van de host zijn op een
-// labelgrens (anders zet een server cookies voor iemand anders), en de host
-// zelf mag altijd. De rest is de vraag die alleen de aanroeper kan beantwoorden.
+// domainOK accepts the source host itself and otherwise requires a label-boundary
+// suffix plus caller approval. This prevents a server setting another host's
+// cookies even when AllowDomain is configured.
 func (j *Jar) domainOK(host, domain string) bool {
 	switch {
 	case domain == "":
 		return false
 	case domain == host:
-		return true // Domain=eigen host is host-only, dus altijd goed
+		return true // Domain=source host remains safe.
 	case !strings.HasSuffix(host, "."+domain):
-		return false // geen suffix op een labelgrens: nooit
+		return false // Never cross a label boundary.
 	case j.AllowDomain == nil:
-		return false // de veilige default (zie de pakketdoc)
+		return false // Safe default; see the package documentation.
 	default:
 		return j.AllowDomain(host, domain)
 	}
@@ -292,8 +267,7 @@ func hostMatch(host string, c cookie) bool {
 	return c.subdomains && strings.HasSuffix(host, "."+c.host)
 }
 
-// pathMatch is RFC 6265 §5.1.4: gelijk, of een prefix die op / eindigt (of
-// waar het volgende teken een / is).
+// pathMatch implements RFC 6265 §5.1.4: equality, or a prefix ending at `/`.
 func pathMatch(path, cookiePath string) bool {
 	switch {
 	case path == cookiePath:
@@ -316,7 +290,7 @@ func pathOf(u *url.URL) string {
 	return u.Path
 }
 
-// defaultPath is de directory van het verzoek-pad (RFC 6265 §5.1.4).
+// defaultPath returns the request path's directory (RFC 6265 §5.1.4).
 func defaultPath(u *url.URL) string {
 	p := u.Path
 	if !strings.HasPrefix(p, "/") {
@@ -329,8 +303,7 @@ func defaultPath(u *url.URL) string {
 	return p[:i]
 }
 
-// parseTime leest de drie datumvormen die servers echt sturen (RFC 1123, de
-// oude RFC 850-vorm en de asctime-vorm van RFC 2616 §3.3.1).
+// parseTime accepts the server date forms in RFC 1123 and RFC 2616 §3.3.1.
 func parseTime(v string) (time.Time, bool) {
 	for _, layout := range []string{
 		"Mon, 02 Jan 2006 15:04:05 MST",

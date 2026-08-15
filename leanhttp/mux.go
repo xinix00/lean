@@ -1,76 +1,59 @@
 package leanhttp
 
-// mux.go — routeren op methode, pad en patroon. BEWUST KLEIN: dit is níet
-// net/http's ServeMux (die belofte stond hier ooit, en elke reviewronde vond
-// de volgende afwijking van Go's formele spec — we waren de router van
-// net/http aan het herimplementeren, één bevinding per keer). Dit is de basis
-// die onze eigen routetabellen nodig hebben (geteld over hop, hopy en metal:
-// ~110 registraties), en verder niets:
+// mux.go routes by method and path. It deliberately implements only the forms
+// used by this project's route tables, not net/http's full ServeMux contract:
 //
-//	"/health"                       exact dit pad (zonder sluitende slash)
-//	"GET /v1/agents"                idem, alleen deze methode (GET bedient ook HEAD)
-//	"/logs/"                        de wortel (mét slash) en alles eronder (subtree)
-//	"/v1/agents/{id}/logs/"         {id} vangt één segment, leesbaar via PathValue
-//	"GET /app-ui/{app}/{path...}"   {path...} vangt de rest, inclusief slashes
+//	"/health"                       exact path, without a trailing slash
+//	"GET /v1/agents"                exact path and method; GET also serves HEAD
+//	"/logs/"                        slash-terminated root and its subtree
+//	"/v1/agents/{id}/logs/"         {id} captures one PathValue segment
+//	"GET /app-ui/{app}/{path...}"   {path...} captures the remaining path
 //
-// Wat er bewust NIET is (weggegooid, review 13-08, zevenentwintigste ronde):
+// Deliberate omissions:
 //
-//   - géén {$}: een vast pad (zonder slash) en een subtree (mét) dekken samen
-//     elke echte routetabel — nul {$}-registraties geteld. {$} registreren
-//     panickt met het alternatief in de melding.
-//   - géén escaped routing: een %-escape die naar "/", "." of ".." decodeert
-//     wordt bij het PARSEN al geweigerd (400, zie cleanEscapes) — weigeren in
-//     plaats van afhandelen, dezelfde stance als bij de chunk-extensies.
-//     Daardoor is r.Path gewoon het gedecodeerde, geschoonde pad, zien
-//     middleware en Mux per constructie hetzelfde, en kán een wildcardwaarde
-//     nooit een padscheiding of dot-segment dragen.
-//   - géén score en géén sortering: de winnaar is de meest specifieke match
-//     (strikte subsetrelatie), per verzoek bepaald. Een telsom liet / en
-//     /{x}/{rest...} allebei op 0 uitkomen, waarna registratievolgorde
-//     besliste.
+//   - No {$}; fixed paths and trailing-slash subtrees cover the actual tables.
+//   - No escaped routing; parsing rejects escapes that decode to "/", ".", or
+//     "..", so middleware and Mux see the same decoded canonical path.
+//   - No scores or sorting; the strict-subset relation selects the most
+//     specific match independently of registration order.
 //
-// Registratiefouten — kruisende patronen, dubbele wildcardnamen, segmenten na
-// {rest...}, %-escapes of {$} in een patroon — panicken bij HandleFunc: een
-// route die stil nooit vuurt is de slechtste manier om erachter te komen.
+// HandleFunc panics for conflicts and malformed patterns so dead routes fail at
+// startup rather than silently at dispatch.
 //
-// De Mux is IMMUTABLE ná de start: registreer alles vóór Serve — HandleFunc
-// naast lopende verzoeken is een datarace, en synchronisatie op élk verzoek
-// is de prijs niet waard voor een tabel die nooit hoort te muteren
-// (review 13-08, achtentwintigste ronde).
+// Mux is immutable after serving starts. Register every route before Serve;
+// concurrent HandleFunc calls are a data race.
 
 import (
 	"net/url"
 	"strings"
 )
 
-// Mux routeert verzoeken naar handlers. Gebruik NewServeMux.
+// Mux routes requests to handlers. Create one with NewServeMux.
 type Mux struct {
 	routes []route
 }
 
-// route is één geregistreerd patroon, voorgekauwd zodat matchen niets meer
-// hoeft te ontleden.
+// route is a pre-parsed registered pattern.
 type route struct {
-	method  string   // "" = elke methode
-	lits    []string // per segment de letterlijke tekst, of "" bij een wildcard
-	names   []string // per segment de wildcardnaam, of "" bij een letterlijk
-	rest    string   // naam van een {rest...}-wildcard, of ""
-	subtree bool     // patroon eindigde op "/": de wortel (mét slash) en alles eronder
+	method  string   // "" matches every method
+	lits    []string // literal per segment, or "" for a wildcard
+	names   []string // wildcard name per segment, or "" for a literal
+	rest    string   // {rest...} wildcard name, or ""
+	subtree bool     // pattern ended in "/": its slash root and descendants
 	h       Handler
 }
 
-// NewServeMux geeft een lege Mux.
+// NewServeMux returns an empty Mux.
 func NewServeMux() *Mux { return &Mux{} }
 
-// HandleFunc registreert h voor pattern (zie het docblok voor de vormen).
+// HandleFunc registers h for pattern; the package comment lists the forms.
 func (m *Mux) HandleFunc(pattern string, h Handler) {
 	method, p := "", pattern
 	if i := strings.IndexByte(pattern, ' '); i >= 0 {
 		method, p = pattern[:i], strings.TrimSpace(pattern[i+1:])
 	}
-	// Vroeg falen, volledig (review 13-08, dertigste ronde): een kromme
-	// methode ("GE(T"), een nil-handler of een patroon dat nooit kan vuren
-	// is een bedradingsfout die je bij de start wilt zien, niet bij dispatch.
+	// Invalid methods, nil handlers, and impossible patterns are startup wiring
+	// errors and must fail before dispatch.
 	if h == nil {
 		panic("leanhttp: pattern " + pattern + " registered with a nil handler")
 	}
@@ -78,24 +61,20 @@ func (m *Mux) HandleFunc(pattern string, h Handler) {
 		panic("leanhttp: pattern " + pattern + " has a malformed method token")
 	}
 	if !canonicalPath(p) {
-		// Hetzelfde predicaat als requestdispatch (parser 400, ServeHTTP 404):
-		// de Trim/Split hieronder — met zijn overslaan van lege segmenten —
-		// vouwde "/a//b", "//a" en "/a//" anders STIL naar een andere route,
-		// die vervolgens nooit kon vuren of (erger) een andere dekking had
-		// dan geschreven stond (review 13-08, vierendertigste ronde).
+		// Use dispatch's predicate. Otherwise Trim/Split would silently fold paths
+		// such as "/a//b" into a route with different coverage.
 		panic("leanhttp: pattern " + pattern + " is not canonical (leading slash, no empty or dot segments)")
 	}
 	rt := route{method: method, h: h, subtree: strings.HasSuffix(p, "/")}
-	seen := map[string]bool{} // wildcardnamen binnen dit patroon
+	seen := map[string]bool{} // wildcard names within this pattern
 	for _, seg := range strings.Split(strings.Trim(p, "/"), "/") {
-		// Een rest-wildcard slokt alles op: segmenten erná zouden stil nooit
-		// gematcht worden.
+		// A rest wildcard consumes everything, so later segments cannot match.
 		if rt.rest != "" {
 			panic("leanhttp: pattern " + pattern + " has segments after {" + rt.rest + "...}")
 		}
 		switch {
 		case seg == "":
-			continue // het wortelpatroon "/" heeft geen segmenten
+			continue // the root pattern "/" has no segments
 		case seg == "{$}":
 			panic("leanhttp: pattern " + pattern + " uses {$}, which this mux does not carry — " +
 				"use a fixed path (no trailing slash) or a subtree (trailing slash)")
@@ -106,7 +85,7 @@ func (m *Mux) HandleFunc(pattern string, h Handler) {
 			}
 			seen[name] = true
 			rt.rest = name
-			rt.subtree = true // de rest mag leeg zijn en mag slashes hebben
+			rt.subtree = true // rest may be empty and contain slashes
 		case len(seg) > 2 && seg[0] == '{' && seg[len(seg)-1] == '}':
 			name := seg[1 : len(seg)-1]
 			if seen[name] {
@@ -116,15 +95,13 @@ func (m *Mux) HandleFunc(pattern string, h Handler) {
 			rt.lits = append(rt.lits, "")
 			rt.names = append(rt.names, name)
 		case strings.HasPrefix(seg, "{") || strings.HasSuffix(seg, "}"):
-			// "{}", "{...}" of een half accolade-segment: stil als letterlijk
-			// segment interpreteren is een valstrik, geen tolerantie.
+			// Treating malformed wildcard syntax as a literal hides wiring errors.
 			panic("leanhttp: pattern " + pattern + " has a malformed wildcard segment " + seg)
 		default:
-			// (Dot-segmenten zijn hierboven al door canonicalPath geweigerd.)
+			// canonicalPath already rejected dot segments.
 			if strings.ContainsRune(seg, '%') {
-				// Verzoekpaden zijn bij het parsen al gedecodeerd; een escaped
-				// literal zou dus nooit matchen. Patronen zijn broncode:
-				// schrijf het teken zelf.
+				// Request paths are decoded while parsing, so escaped literals could
+				// never match. Patterns are source code; write the character itself.
 				panic("leanhttp: pattern " + pattern + " has a %-escape in a literal segment")
 			}
 			rt.lits = append(rt.lits, seg)
@@ -132,38 +109,32 @@ func (m *Mux) HandleFunc(pattern string, h Handler) {
 		}
 	}
 
-	// Conflictdetectie op dekking: twee patronen die eenzelfde verzoek kunnen
-	// matchen zijn alleen verenigbaar als de één een STRIKTE subset van de
-	// ander is — dan beslist specificiteit. Gelijk (dubbele registratie) of
-	// kruisend (GET /a/{x} vs GET /{x}/b op /a/b) is een conflict: daar zou
-	// registratievolgorde de winnaar kiezen, en dat is geen antwoord.
+	// Overlapping patterns are compatible only when one is a strict subset of
+	// the other. Equal or crossing coverage would make registration order decide.
 	for i := range m.routes {
 		if rt.conflictsWith(&m.routes[i]) {
 			panic("leanhttp: pattern " + pattern + " conflicts with " +
 				strings.TrimSpace(m.routes[i].method+" "+m.routes[i].pattern()))
 		}
 	}
-	m.routes = append(m.routes, rt) // geen sortering: ServeHTTP kiest de specifiekste
+	m.routes = append(m.routes, rt) // ServeHTTP selects the most specific route
 }
 
-// conflictsWith: overlap zonder strikte subsetrelatie (of met gelijke
-// dekking) is een conflict.
+// conflictsWith reports overlap without exactly one strict subset relation.
 func (r *route) conflictsWith(o *route) bool {
 	if !methodsOverlap(r.method, o.method) || !r.pathOverlaps(o) {
 		return false
 	}
 	rSub := methodSubset(r.method, o.method) && r.pathSubset(o)
 	oSub := methodSubset(o.method, r.method) && o.pathSubset(r)
-	// Precies één subsetrichting = specificiteit beslist; gelijk of geen van
-	// beide = conflict.
+	// Exactly one subset direction lets specificity decide.
 	return rSub == oSub
 }
 
-// De methodevelden zijn SETS, geen strings: "" dekt élke methode, en een
-// GET-route bedient ook HEAD (de terugval in ServeHTTP) — dus
-// HEAD ⊂ GET ⊂ "".
+// Method fields represent sets: "" covers all methods and GET also serves
+// HEAD, so HEAD ⊂ GET ⊂ "".
 
-// methodsOverlap: snijden de twee methode-sets?
+// methodsOverlap reports whether two method sets intersect.
 func methodsOverlap(a, b string) bool {
 	if a == "" || b == "" || a == b {
 		return true
@@ -171,29 +142,27 @@ func methodsOverlap(a, b string) bool {
 	return (a == "GET" && b == "HEAD") || (a == "HEAD" && b == "GET")
 }
 
-// methodSubset: dekt b alles wat a dekt?
+// methodSubset reports whether b covers every method covered by a.
 func methodSubset(a, b string) bool {
 	return b == "" || a == b || (a == "HEAD" && b == "GET")
 }
 
-// Het slash-model, gedeeld door pathOverlaps, pathSubset en match: een vast
-// patroon matcht exact zijn diepte zónder sluitende slash; een subtree matcht
-// zijn wortel mét slash plus alles eronder. /admin en /admin/ zijn dus
-// verschillende paden — en daarmee disjunct registreerbaar.
+// Fixed patterns match exactly without a trailing slash. Subtrees match their
+// slash-terminated root and descendants, so /admin and /admin/ are disjoint.
 
-// pathOverlaps: bestaat er een pad dat beide patronen matcht?
+// pathOverlaps reports whether any path matches both patterns.
 func (r *route) pathOverlaps(o *route) bool {
 	n := min(len(r.lits), len(o.lits))
 	for i := 0; i < n; i++ {
 		if r.lits[i] != "" && o.lits[i] != "" && r.lits[i] != o.lits[i] {
-			return false // twee verschillende literals op dezelfde plek: disjunct
+			return false // different literals at one position are disjoint
 		}
 	}
 	switch {
 	case r.subtree && o.subtree:
 		return true
 	case r.subtree:
-		return len(o.lits) > len(r.lits) // o's vaste pad moet strikt ónder r's wortel liggen
+		return len(o.lits) > len(r.lits) // o's fixed path must be below r's root
 	case o.subtree:
 		return len(r.lits) > len(o.lits)
 	default:
@@ -201,33 +170,33 @@ func (r *route) pathOverlaps(o *route) bool {
 	}
 }
 
-// pathSubset: matcht o élk pad dat r matcht?
+// pathSubset reports whether o matches every path matched by r.
 func (r *route) pathSubset(o *route) bool {
 	for i, lit := range o.lits {
 		if lit == "" {
-			continue // wildcard bij o: dekt alles op deze plek
+			continue // o's wildcard covers everything here
 		}
 		if i >= len(r.lits) || r.lits[i] != lit {
-			return false // r staat hier iets anders (of alles) toe
+			return false // r permits something else, or everything
 		}
 	}
 	if o.subtree {
 		if r.subtree {
 			return len(r.lits) >= len(o.lits)
 		}
-		return len(r.lits) > len(o.lits) // vaste paden dragen geen slash: alleen strikt eronder
+		return len(r.lits) > len(o.lits) // fixed paths lack a slash: strictly below only
 	}
 	return !r.subtree && len(r.lits) == len(o.lits)
 }
 
-// moreSpecific: is r een strikte subset van o? Dit ís de precedentieregel.
+// moreSpecific reports whether r is a strict subset of o.
 func (r *route) moreSpecific(o *route) bool {
 	rSub := methodSubset(r.method, o.method) && r.pathSubset(o)
 	oSub := methodSubset(o.method, r.method) && o.pathSubset(r)
 	return rSub && !oSub
 }
 
-// pattern bouwt de padvorm van een route terug, voor de conflict-foutmelding.
+// pattern reconstructs a route path for conflict errors.
 func (r route) pattern() string {
 	var b strings.Builder
 	for i, lit := range r.lits {
@@ -250,21 +219,15 @@ func (r route) pattern() string {
 	return b.String()
 }
 
-// Handler geeft de mux als Handler, zodat hij in middleware past.
+// Handler exposes the mux as a Handler for middleware composition.
 func (m *Mux) Handler() Handler { return m.ServeHTTP }
 
-// ServeHTTP routeert één verzoek: van alle matchende routes wint de meest
-// specifieke (strikte subset), ongeacht registratievolgorde. De matchende
-// routes vormen dankzij de conflictwacht altijd een keten, dus paarsgewijs
-// vergelijken volstaat.
+// ServeHTTP dispatches to the most specific matching route, independent of
+// registration order. Conflict detection guarantees the matches form a chain.
 func (m *Mux) ServeHTTP(w ResponseWriter, r *Request) {
-	// GEEN normalisatie: de parser is de ene plek die het pad valideert
-	// (readRequest weigert niet-canoniek met een 400), en dit is hetzelfde
-	// predicaat als daar. Zonder deze wacht liet splitPath — dat slashes
-	// trimt — een handgebouwde "api/devices" of "//api/devices" alsnog
-	// matchen: normalisatie via de achterdeur (review 13-08, tweeëndertigste
-	// ronde). Een middleware-rewrite hoort canoniek aan te leveren;
-	// niet-canoniek bestaat hier gewoon niet: 404.
+	// Do not normalize here. The parser is the one validation point, and this
+	// same predicate prevents hand-built or middleware-rewritten non-canonical
+	// paths from matching through splitPath's trimming behavior.
 	if !canonicalPath(r.Path) {
 		Error(w, "not found", StatusNotFound)
 		return
@@ -272,11 +235,9 @@ func (m *Mux) ServeHTTP(w ResponseWriter, r *Request) {
 	segs := splitPath(r.Path)
 	trailing := strings.HasSuffix(r.Path, "/")
 
-	// HEAD valt terug op GET: de handler draait als bij GET en de server
-	// slikt de body-bytes zelf in (suppressBody). De terugval doet als
-	// kandidaat gewoon mee in de specificiteitsstrijd: een expliciete
-	// HEAD-route is een striktere subset en wint vanzelf, een methode-loze
-	// route verliest vanzelf (GET ⊂ "").
+	// HEAD falls back to GET while the server suppresses body bytes. Normal
+	// specificity still makes an explicit HEAD route win and a methodless route
+	// lose to GET.
 	var pick, fb *route
 	var pickVals, fbVals map[string]string
 	var allowed map[string]bool
@@ -295,7 +256,7 @@ func (m *Mux) ServeHTTP(w ResponseWriter, r *Request) {
 				}
 				continue
 			}
-			pathMatched = true // het pad bestaat, deze methode niet
+			pathMatched = true // the path exists, but not for this method
 			if allowed == nil {
 				allowed = map[string]bool{}
 			}
@@ -304,8 +265,7 @@ func (m *Mux) ServeHTTP(w ResponseWriter, r *Request) {
 				allowList = append(allowList, rt.method)
 			}
 			if rt.method == "GET" && !allowed["HEAD"] {
-				// Een GET-route bedient per contract ook HEAD: de Allow hoort
-				// dat te zeggen (review 13-08, dertigste ronde).
+				// GET serves HEAD by contract, so Allow must advertise it.
 				allowed["HEAD"] = true
 				allowList = append(allowList, "HEAD")
 			}
@@ -324,10 +284,8 @@ func (m *Mux) ServeHTTP(w ResponseWriter, r *Request) {
 		return
 	}
 	if pathMatched {
-		// Het pad bestaat, deze methode niet. Een 404 zou de aanroeper naar
-		// zijn URL laten kijken in plaats van naar zijn werkwoord — en de
-		// Allow-header vertelt hem welke werkwoorden er wél zijn (RFC 9110
-		// §15.5.6 eist hem bij een 405; review 13-08, achtentwintigste ronde).
+		// A known path with the wrong method is 405, with the required Allow
+		// header identifying valid methods (RFC 9110 §15.5.6).
 		w.Header().Set("Allow", strings.Join(allowList, ", "))
 		Error(w, "method not allowed", StatusMethodNotAllowed)
 		return
@@ -335,20 +293,20 @@ func (m *Mux) ServeHTTP(w ResponseWriter, r *Request) {
 	Error(w, "not found", StatusNotFound)
 }
 
-// match toetst één route en geeft de wildcardwaarden terug.
+// match checks one route and returns its wildcard values.
 func (r *route) match(segs []string, trailing bool) (map[string]string, bool) {
 	if r.subtree {
-		// Dieper mag altijd; de wortel bestaat alleen mét sluitende slash.
+		// Descendants always match; the root itself requires a trailing slash.
 		if len(segs) < len(r.lits) || (len(segs) == len(r.lits) && !trailing) {
 			return nil, false
 		}
 	} else if len(segs) != len(r.lits) || trailing {
-		// Een vast patroon is exact dít pad, zonder slash.
+		// A fixed pattern matches exactly, without a trailing slash.
 		return nil, false
 	}
 	var vals map[string]string
 	for i, lit := range r.lits {
-		if lit == "" { // wildcard: één segment, inhoud vrij
+		if lit == "" { // wildcard: one unrestricted segment
 			if vals == nil {
 				vals = make(map[string]string, len(r.lits)+1)
 			}
@@ -365,30 +323,22 @@ func (r *route) match(segs []string, trailing bool) (map[string]string, bool) {
 		}
 		v := strings.Join(segs[len(r.lits):], "/")
 		if trailing && v != "" {
-			v += "/" // de sluitende slash is deel van de rest: /files/a/ vangt "a/"
+			v += "/" // the trailing slash belongs to rest: /files/a/ captures "a/"
 		}
 		vals[r.rest] = v
 	}
 	return vals, true
 }
 
-// cleanEscapes keurt een ESCAPED pad vóór het gedecodeerd wordt: een segment
-// met een %-escape moet naar iets onschuldigs decoderen. Een %2F is ná
-// decoderen niet meer van een padscheiding te onderscheiden, en een segment
-// dat naar "." of ".." decodeert omzeilt cleanPath (die ziet de escaped vorm
-// niet). Weigeren in plaats van afhandelen — daarmee bestaat de hele klasse
-// "mux en middleware interpreteren het pad verschillend" niet meer
-// (review 13-08, zevenentwintigste ronde).
+// cleanEscapes validates an escaped path before decoding. Escapes may not
+// introduce separators or dot segments, preventing Mux and middleware from
+// interpreting the same path differently.
 func cleanEscapes(escaped string) bool {
 	for _, seg := range strings.Split(escaped, "/") {
 		if seg == "." || seg == ".." {
-			// Ook de RUWE dot-segmenten worden geweigerd: cleanPath vouwde
-			// /admin/. en /admin/x/.. tot /admin, waarmee de wortel van een
-			// beveiligde /admin/-subtree bij de publieke exacte route
-			// belandde — en middleware zag consistent dezelfde, verkeerde
-			// grens. Weigeren spaart bovendien het hele
-			// remove-dot-segments-algoritme uit (review 13-08,
-			// negenentwintigste ronde).
+			// Reject raw dot segments too. Normalizing /admin/. or /admin/x/..
+			// to /admin can cross the boundary between a protected subtree and
+			// a public exact route.
 			return false
 		}
 		if !strings.ContainsRune(seg, '%') {
@@ -402,8 +352,7 @@ func cleanEscapes(escaped string) bool {
 	return true
 }
 
-// splitPath knipt een pad in segmenten. "/" en "" geven er geen, zodat het
-// wortelpatroon ze beide matcht.
+// splitPath splits a path into segments; "/" and "" produce none.
 func splitPath(p string) []string {
 	p = strings.Trim(p, "/")
 	if p == "" {
@@ -412,12 +361,9 @@ func splitPath(p string) []string {
 	return strings.Split(p, "/")
 }
 
-// canonicalPath: één spelling per pad — begint met '/', geen lege segmenten
-// (dus geen "//"), geen "."/".."-segmenten; alleen de staart mag leeg zijn (de
-// sluitende slash, die betekenis draagt: subtree-wortel). Dit is het ENE
-// predicaat dat parser (400) en Mux (404) delen; zijn voorganger cleanPath
-// NORMALISEERDE in plaats van te toetsen, en elke normalisatie is een tweede
-// interpretatiemoment van hetzelfde pad (review 13-08, tweeëndertigste ronde).
+// canonicalPath accepts one spelling per path: leading slash, no empty or dot
+// segments, and only an optional empty final segment for a subtree root. The
+// parser and Mux share this predicate to avoid a second interpretation step.
 func canonicalPath(p string) bool {
 	if p == "" || p[0] != '/' {
 		return false

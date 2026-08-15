@@ -1,9 +1,8 @@
 package leannet
 
-// frame.go — in-place views over de draadformaten: ethernet, ARP, IPv4, UDP,
-// TCP en de internet-checksum. Geen allocaties: elke view is een []byte met
-// getters/setters op vaste offsets, en elke Parse* weigert luid wat niet past.
-// De offsets komen rechtstreeks uit de RFC's (826, 791, 768, 9293).
+// frame.go provides allocation-free in-place views over Ethernet, ARP, IPv4,
+// UDP, and TCP wire formats, plus the Internet checksum. Parse functions reject
+// invalid layouts. Offsets follow RFCs 826, 791, 768, and 9293.
 
 import (
 	"encoding/binary"
@@ -19,27 +18,27 @@ var (
 	errBadTCPOff   = errors.New("leannet: TCP data offset out of range")
 )
 
-// EtherType-waarden die de stack demuxt.
+// EtherTypes demultiplexed by the stack.
 const (
 	EtherTypeIPv4 uint16 = 0x0800
 	EtherTypeARP  uint16 = 0x0806
 )
 
-// IP-protocolnummers.
+// IP protocol numbers.
 const (
 	ProtoICMP byte = 1
 	ProtoTCP  byte = 6
 	ProtoUDP  byte = 17
 )
 
-// De broadcast-adressen. bcastIP is het "limited broadcast" van RFC 919; het
-// subnet-gerichte adres hangt van de config af (zie isBroadcastIP).
+// Broadcast addresses. bcastIP is RFC 919's limited broadcast; directed
+// broadcast depends on configuration. See isBroadcastIP.
 var (
 	bcastMAC = [6]byte{0xff, 0xff, 0xff, 0xff, 0xff, 0xff}
 	bcastIP  = [4]byte{255, 255, 255, 255}
 )
 
-// Vaste headermaten (zonder opties).
+// Fixed header sizes without options.
 const (
 	sizeEth  = 14
 	sizeARP  = 28
@@ -50,10 +49,10 @@ const (
 
 // ---- Ethernet (DIX) ----
 
-// EthFrame is een view over een ethernet-frame: dst(6) src(6) ethertype(2).
+// EthFrame is a view over an Ethernet frame: dst(6), src(6), EtherType(2).
 type EthFrame []byte
 
-// ParseEth valideert de minimale lengte en geeft de view terug.
+// ParseEth validates the minimum length and returns a view.
 func ParseEth(b []byte) (EthFrame, error) {
 	if len(b) < sizeEth {
 		return nil, errShortFrame
@@ -70,19 +69,18 @@ func (f EthFrame) SetDst(mac [6]byte)     { copy(f[0:6], mac[:]) }
 func (f EthFrame) SetSrc(mac [6]byte)     { copy(f[6:12], mac[:]) }
 func (f EthFrame) SetEtherType(et uint16) { binary.BigEndian.PutUint16(f[12:14], et) }
 
-// ---- ARP (alleen ethernet/IPv4, RFC 826) ----
+// ---- ARP (Ethernet/IPv4 only, RFC 826) ----
 
-// ARP-opcodes.
+// ARP opcodes.
 const (
 	ARPRequest uint16 = 1
 	ARPReply   uint16 = 2
 )
 
-// ARPFrame is een view over de 28-byte ethernet/IPv4-ARP-payload.
+// ARPFrame is a view over the 28-byte Ethernet/IPv4 ARP payload.
 type ARPFrame []byte
 
-// ParseARP valideert lengte én dat het echt ethernet/IPv4-ARP is (htype 1,
-// ptype 0x0800, hlen 6, plen 4) — al het andere weigeren we luid.
+// ParseARP validates length and the Ethernet/IPv4 ARP layout.
 func ParseARP(b []byte) (ARPFrame, error) {
 	if len(b) < sizeARP {
 		return nil, errShortFrame
@@ -102,7 +100,7 @@ func (f ARPFrame) SenderProto() []byte { return f[14:18] }
 func (f ARPFrame) TargetHW() []byte    { return f[18:24] }
 func (f ARPFrame) TargetProto() []byte { return f[24:28] }
 
-// PutARP schrijft een compleet ARP-pakket en geeft de geschreven lengte terug.
+// PutARP writes a complete ARP packet and returns its length.
 func PutARP(b []byte, op uint16, senderHW [6]byte, senderIP [4]byte, targetHW [6]byte, targetIP [4]byte) (int, error) {
 	if len(b) < sizeARP {
 		return 0, errShortFrame
@@ -120,12 +118,11 @@ func PutARP(b []byte, op uint16, senderHW [6]byte, senderIP [4]byte, targetHW [6
 
 // ---- IPv4 (RFC 791) ----
 
-// IPv4Frame is een view over een IPv4-header zonder opties (IHL=5).
+// IPv4Frame is a view over an option-free IPv4 header (IHL=5).
 type IPv4Frame []byte
 
-// ParseIPv4 valideert versie, IHL, totale lengte en fragmentatie. Opties en
-// fragmenten doen we bewust niet (v1): weigeren met een eigen fout, zodat een
-// teller/logregel bovenin precies kan zeggen wát er geweigerd is.
+// ParseIPv4 validates version, IHL, total length, and fragmentation. V1 rejects
+// options and fragments with distinct errors for useful telemetry.
 func ParseIPv4(b []byte) (IPv4Frame, error) {
 	if len(b) < sizeIPv4 {
 		return nil, errShortFrame
@@ -140,7 +137,7 @@ func ParseIPv4(b []byte) (IPv4Frame, error) {
 	if int(f.TotalLen()) > len(b) || f.TotalLen() < sizeIPv4 {
 		return nil, errShortFrame
 	}
-	// Fragment-offset ≠ 0 of More Fragments gezet = een fragment.
+	// A nonzero fragment offset or More Fragments flag indicates a fragment.
 	if fragField := binary.BigEndian.Uint16(b[6:8]); fragField&0x3fff != 0 {
 		return nil, errFragmented
 	}
@@ -154,12 +151,10 @@ func (f IPv4Frame) Checksum() uint16 { return binary.BigEndian.Uint16(f[10:12]) 
 func (f IPv4Frame) Src() [4]byte     { return [4]byte(f[12:16]) }
 func (f IPv4Frame) Dst() [4]byte     { return [4]byte(f[16:20]) }
 
-// Payload geeft de bytes ná de header, begrensd door TotalLen — nooit de
-// padding die ethernet onder de 60-byte-minimumgrens toevoegt.
+// Payload returns bytes within TotalLen, excluding Ethernet padding.
 func (f IPv4Frame) Payload() []byte { return f[sizeIPv4:f.TotalLen()] }
 
-// PutIPv4 schrijft een complete header (IHL=5, DF gezet, geen fragmentatie)
-// inclusief checksum, en geeft de headerlengte terug.
+// PutIPv4 writes a checksummed IHL=5 header with DF set.
 func PutIPv4(b []byte, proto byte, src, dst [4]byte, payloadLen int) (int, error) {
 	if len(b) < sizeIPv4 {
 		return 0, errShortFrame
@@ -167,7 +162,7 @@ func PutIPv4(b []byte, proto byte, src, dst [4]byte, payloadLen int) (int, error
 	b[0] = 4<<4 | 5
 	b[1] = 0
 	binary.BigEndian.PutUint16(b[2:4], uint16(sizeIPv4+payloadLen))
-	binary.BigEndian.PutUint16(b[4:6], 0)      // identification: ongebruikt zonder fragmentatie
+	binary.BigEndian.PutUint16(b[4:6], 0)      // identification is unused without fragmentation
 	binary.BigEndian.PutUint16(b[6:8], 0x4000) // DF
 	b[8] = 64                                  // TTL
 	b[9] = proto
@@ -178,12 +173,12 @@ func PutIPv4(b []byte, proto byte, src, dst [4]byte, payloadLen int) (int, error
 	return sizeIPv4, nil
 }
 
-// ChecksumOK hertelt de headerchecksum.
+// ChecksumOK verifies the header checksum.
 func (f IPv4Frame) ChecksumOK() bool { return checksum(f[:sizeIPv4]) == 0 }
 
 // ---- UDP (RFC 768) ----
 
-// UDPFrame is een view over een UDP-header + payload.
+// UDPFrame is a view over a UDP header and payload.
 type UDPFrame []byte
 
 func ParseUDP(b []byte) (UDPFrame, error) {
@@ -202,8 +197,7 @@ func (f UDPFrame) DstPort() uint16 { return binary.BigEndian.Uint16(f[2:4]) }
 func (f UDPFrame) Len() uint16     { return binary.BigEndian.Uint16(f[4:6]) }
 func (f UDPFrame) Payload() []byte { return f[sizeUDP:f.Len()] }
 
-// PutUDP schrijft header + checksum over een al geplaatste payload op
-// b[sizeUDP:sizeUDP+payloadLen] en geeft de totale UDP-lengte terug.
+// PutUDP writes the header and checksum for a payload already placed after sizeUDP.
 func PutUDP(b []byte, srcPort, dstPort uint16, src, dst [4]byte, payloadLen int) (int, error) {
 	total := sizeUDP + payloadLen
 	if len(b) < total || total > 0xffff {
@@ -215,14 +209,13 @@ func PutUDP(b []byte, srcPort, dstPort uint16, src, dst [4]byte, payloadLen int)
 	binary.BigEndian.PutUint16(b[6:8], 0)
 	csum := pseudoChecksum(ProtoUDP, src, dst, b[:total])
 	if csum == 0 {
-		csum = 0xffff // RFC 768: 0 betekent "geen checksum", dus verstuur het complement
+		csum = 0xffff // RFC 768 reserves zero for an absent checksum
 	}
 	binary.BigEndian.PutUint16(b[6:8], csum)
 	return total, nil
 }
 
-// ChecksumOK verifieert de UDP-checksum over de pseudo-header. Een checksum
-// van 0 betekent "afwezig" en keuren we goed (RFC 768 staat het toe).
+// ChecksumOK verifies the UDP pseudo-header checksum. RFC 768 permits zero as absent.
 func (f UDPFrame) ChecksumOK(src, dst [4]byte) bool {
 	if f.Checksum() == 0 {
 		return true
@@ -232,9 +225,9 @@ func (f UDPFrame) ChecksumOK(src, dst [4]byte) bool {
 
 func (f UDPFrame) Checksum() uint16 { return binary.BigEndian.Uint16(f[6:8]) }
 
-// ---- TCP (RFC 9293) — alleen de header-view; de machine leeft in tcp.go ----
+// ---- TCP (RFC 9293); tcp.go contains the state machine ----
 
-// TCP-vlaggen.
+// TCP flags.
 type TCPFlags uint16
 
 const (
@@ -245,10 +238,10 @@ const (
 	FlagACK TCPFlags = 1 << 4
 )
 
-// Has rapporteert of alle vlaggen in mask gezet zijn.
+// Has reports whether every flag in mask is set.
 func (f TCPFlags) Has(mask TCPFlags) bool { return f&mask == mask }
 
-// TCPFrame is een view over een TCP-header + payload.
+// TCPFrame is a view over a TCP header and payload.
 type TCPFrame []byte
 
 func ParseTCP(b []byte) (TCPFrame, error) {
@@ -273,21 +266,19 @@ func (f TCPFrame) Checksum() uint16 { return binary.BigEndian.Uint16(f[16:18]) }
 
 func (f TCPFrame) headerLen() int { return int(f[12]>>4) * 4 }
 
-// Options geeft de rauwe optie-bytes tussen de vaste header en de payload.
+// Options returns raw bytes between the fixed header and payload.
 func (f TCPFrame) Options() []byte { return f[sizeTCP:f.headerLen()] }
 
-// Payload geeft de databytes. De caller begrenst het frame op de
-// IPv4-payload (ParseIPv4.Payload), dus len(f) ís de segmentlengte.
+// Payload returns data bytes. The caller bounds the frame to the IPv4 payload.
 func (f TCPFrame) Payload() []byte { return f[f.headerLen():] }
 
-// ChecksumOK verifieert de TCP-checksum over de pseudo-header.
+// ChecksumOK verifies the TCP pseudo-header checksum.
 func (f TCPFrame) ChecksumOK(src, dst [4]byte) bool {
 	return pseudoChecksum(ProtoTCP, src, dst, f) == 0
 }
 
-// PutTCP schrijft een TCP-header met opties en checksum over een al geplaatste
-// payload op b[sizeTCP+len(opts):] en geeft de totale segmentlengte terug.
-// opts moet een veelvoud van 4 lang zijn (de caller padt met NOP/EOL).
+// PutTCP writes a header, options, and checksum for an already-placed payload.
+// opts must be a multiple of four bytes; the caller supplies NOP/EOL padding.
 func PutTCP(b []byte, srcPort, dstPort uint16, seq, ack uint32, flags TCPFlags, wnd uint16, opts []byte, src, dst [4]byte, payloadLen int) (int, error) {
 	if len(opts)%4 != 0 || len(opts) > 40 {
 		return 0, errBadTCPOff
@@ -304,7 +295,7 @@ func PutTCP(b []byte, srcPort, dstPort uint16, seq, ack uint32, flags TCPFlags, 
 	binary.BigEndian.PutUint16(b[12:14], uint16(hdr/4)<<12|uint16(flags))
 	binary.BigEndian.PutUint16(b[14:16], wnd)
 	binary.BigEndian.PutUint16(b[16:18], 0)
-	binary.BigEndian.PutUint16(b[18:20], 0) // urgent pointer: ongebruikt
+	binary.BigEndian.PutUint16(b[18:20], 0) // urgent pointer is unused
 	copy(b[sizeTCP:hdr], opts)
 	binary.BigEndian.PutUint16(b[16:18], pseudoChecksum(ProtoTCP, src, dst, b[:total]))
 	return total, nil
@@ -312,14 +303,12 @@ func PutTCP(b []byte, srcPort, dstPort uint16, seq, ack uint32, flags TCPFlags, 
 
 // ---- Internet-checksum (RFC 1071) ----
 
-// checksum vouwt de one's-complement-som van b en geeft het complement.
-// Over een blok mét geldige checksum is de uitkomst 0.
+// checksum folds and complements b's one's-complement sum. Valid data yields zero.
 func checksum(b []byte) uint16 {
 	return foldChecksum(sumBytes(0, b))
 }
 
-// pseudoChecksum berekent de TCP/UDP-checksum inclusief de IPv4-pseudo-header
-// (src, dst, protocol, lengte) over segment.
+// pseudoChecksum includes the IPv4 source, destination, protocol, and length.
 func pseudoChecksum(proto byte, src, dst [4]byte, segment []byte) uint16 {
 	var ph [12]byte
 	copy(ph[0:4], src[:])
@@ -329,8 +318,8 @@ func pseudoChecksum(proto byte, src, dst [4]byte, segment []byte) uint16 {
 	return foldChecksum(sumBytes(sumBytes(0, ph[:]), segment))
 }
 
-// sumBytes accumuleert 16-bit big-endian woorden in een 32-bit som; een
-// oneven staartbyte telt als hoog byte van een laatste woord (RFC 1071).
+// sumBytes accumulates big-endian 16-bit words. An odd tail is the high byte of
+// the final word (RFC 1071).
 func sumBytes(sum uint32, b []byte) uint32 {
 	n := len(b) &^ 1
 	for i := 0; i < n; i += 2 {

@@ -10,7 +10,6 @@ import (
 	"time"
 )
 
-// bound is een verkregen lease van een uur, met de timers die een router stuurt.
 func bound() Lease {
 	return Lease{
 		IP:        [4]byte{192, 168, 1, 33},
@@ -25,9 +24,6 @@ func bound() Lease {
 	}
 }
 
-// proefKeeper geeft een keeper waarvan alle tijd en al het verkeer door de test
-// loopt: geen sockets, geen wachten. slept houdt bij hoeveel er "geslapen" is,
-// log wat er gemeld is.
 type proefKeeper struct {
 	*keeper
 	slept   []time.Duration
@@ -47,7 +43,6 @@ func newProefKeeper(l Lease) *proefKeeper {
 	return p
 }
 
-// totaal is alle geslapen tijd bij elkaar.
 func (p *proefKeeper) totaal() time.Duration {
 	var t time.Duration
 	for _, d := range p.slept {
@@ -56,9 +51,6 @@ func (p *proefKeeper) totaal() time.Duration {
 	return t
 }
 
-// TestTimers: de drie momenten van een lease, inclusief de getallen die servers
-// in het veld echt sturen. Een server die T1 = T2 = lease stuurt mag de
-// staatmachine niet laten ontsporen — dan gelden de RFC-verhoudingen.
 func TestTimers(t *testing.T) {
 	for _, tc := range []struct {
 		naam        string
@@ -103,16 +95,14 @@ func TestTimers(t *testing.T) {
 	}
 }
 
-// TestRetryAfter: halveren, met de RFC-vloer van 60s, maar nooit voorbij de
-// fasegrens — anders begint de rebind te laat.
 func TestRetryAfter(t *testing.T) {
 	for _, tc := range []struct{ left, want time.Duration }{
 		{time.Hour, 30 * time.Minute},
 		{4 * time.Minute, 2 * time.Minute},
 		{3 * time.Minute, 90 * time.Second},
-		{100 * time.Second, retryFloor}, // helft (50s) is onder de vloer
+		{100 * time.Second, retryFloor},
 		{90 * time.Second, retryFloor},
-		{30 * time.Second, 30 * time.Second}, // vloer zou de grens voorbij slapen
+		{30 * time.Second, 30 * time.Second},
 		{time.Second, time.Second},
 	} {
 		if got := retryAfter(tc.left); got != tc.want {
@@ -121,14 +111,12 @@ func TestRetryAfter(t *testing.T) {
 	}
 }
 
-// TestKeeperRenewtOpT1: de gewone dag. Slapen tot T1, unicast-renew, en daarna
-// weer tot T1 van de nieuwe lease — geen rebind in zicht.
 func TestKeeperRenewtOpT1(t *testing.T) {
 	p := newProefKeeper(bound())
 	p.renew = func(l Lease, mac [6]byte, timeout time.Duration) (Lease, error) {
 		p.renews++
 		if p.renews == 3 {
-			l.LeaseSecs = 0xFFFFFFFF // oneindig: de keeper is klaar
+			l.LeaseSecs = 0xFFFFFFFF
 			return l, nil
 		}
 		return l, nil
@@ -152,11 +140,6 @@ func TestKeeperRenewtOpT1(t *testing.T) {
 	}
 }
 
-// TestKeeperRebindtOpT2 is het gat dat deze ronde dicht ging: de lessor is weg
-// (verhuisde router, nieuwe DHCP-server) en de unicast-renew kan per definitie
-// niet meer slagen. Vóór de splitsing bleef het daar zes pogingen op hangen en
-// verloor de node zijn adres; nu stapt hij op T2 over op broadcast, en dát is
-// precies de storing waar REBINDING voor bestaat.
 func TestKeeperRebindtOpT2(t *testing.T) {
 	p := newProefKeeper(bound())
 	weg := errors.New("no ACK within 10s")
@@ -166,7 +149,7 @@ func TestKeeperRebindtOpT2(t *testing.T) {
 	}
 	p.rebind = func(l Lease, _ [6]byte, _ time.Duration) (Lease, error) {
 		p.rebinds++
-		l.LeaseSecs = 0xFFFFFFFF // gelukt: klaar
+		l.LeaseSecs = 0xFFFFFFFF
 		return l, nil
 	}
 	p.run()
@@ -177,8 +160,7 @@ func TestKeeperRebindtOpT2(t *testing.T) {
 	if p.rebinds != 1 {
 		t.Fatalf("%d rebinds, want 1 — de rebind-fase werd niet bereikt", p.rebinds)
 	}
-	// Het overstappen hoort op T2 te gebeuren, niet eerder en niet later: alle
-	// renew-pogingen samen (slaap + timeout per poging) vallen binnen T2.
+
 	t1, t2, _ := bound().timers()
 	besteed := p.totaal() + time.Duration(p.renews)*requestTimeout
 	if besteed < t2 {
@@ -195,10 +177,6 @@ func TestKeeperRebindtOpT2(t *testing.T) {
 	}
 }
 
-// TestKeeperVerlooptEnZwijgtNiet: antwoordt niemand, dan is het adres op de
-// lease-tijd niet meer van ons. Dat moet luid gemeld worden (de node hangt er
-// dan aan een watchdog-reboot), en de machine mag NIET langer dan de lease-tijd
-// blijven proberen — dan zou hij een adres verdedigen dat al vergeven is.
 func TestKeeperVerlooptEnZwijgtNiet(t *testing.T) {
 	p := newProefKeeper(bound())
 	stil := errors.New("no ACK within 10s")
@@ -223,13 +201,9 @@ func TestKeeperVerlooptEnZwijgtNiet(t *testing.T) {
 	}
 }
 
-// TestKeeperNAKStoptMeteen: een NAK is geen "probeer later" maar een weigering.
-// Doorpraten op dat IP zou betekenen dat we een adres gebruiken dat de server
-// aan iemand anders mag geven.
 func TestKeeperNAKStoptMeteen(t *testing.T) {
 	p := newProefKeeper(bound())
-	// De fout is ingepakt (zoals request hem teruggeeft), dus de machine moet op
-	// de foutWAARDE kijken en niet op tekst.
+
 	p.renew = func(Lease, [6]byte, time.Duration) (Lease, error) {
 		p.renews++
 		return Lease{}, fmt.Errorf("dhcp renewing: %w", errRefused)
@@ -248,10 +222,6 @@ func TestKeeperNAKStoptMeteen(t *testing.T) {
 	}
 }
 
-// TestKeeperAnderAdresStopt: een rebind mag bij een andere server uitkomen en
-// die mag een ander adres geven. Toepassen kan niet (de stack staat op één IP),
-// dus is stoppen-met-uitleg het enige eerlijke antwoord. Stil doorgaan zou
-// betekenen dat de server ons oude adres straks aan iemand anders geeft.
 func TestKeeperAnderAdresStopt(t *testing.T) {
 	p := newProefKeeper(bound())
 	p.renew = func(l Lease, _ [6]byte, _ time.Duration) (Lease, error) {
@@ -273,8 +243,6 @@ func TestKeeperAnderAdresStopt(t *testing.T) {
 	}
 }
 
-// TestKeeperOneindigeLease: niets te timen, dus ook niets te doen — en zeker
-// geen lus die elke tick wakker wordt.
 func TestKeeperOneindigeLease(t *testing.T) {
 	l := bound()
 	l.LeaseSecs, l.T1Secs, l.T2Secs = 0xFFFFFFFF, 0, 0
@@ -289,8 +257,6 @@ func TestKeeperOneindigeLease(t *testing.T) {
 	}
 }
 
-// TestKeepAliveZonderLease: een board met statische config heeft geen lease, en
-// dan hoort hier niets te draaien.
 func TestKeepAliveZonderLease(t *testing.T) {
 	klaar := make(chan struct{})
 	go func() { KeepAlive([6]byte{}, Lease{}); close(klaar) }()
@@ -301,12 +267,9 @@ func TestKeepAliveZonderLease(t *testing.T) {
 	}
 }
 
-// TestMergeDraagtDoor: een ACK op een renew herhaalt de opties vaak niet. Wat
-// ontbreekt komt uit de oude lease — inclusief de lease-tijden, want zonder die
-// zou timers() nul teruggeven en zou het onderhoud stilzwijgend stoppen.
 func TestMergeDraagtDoor(t *testing.T) {
 	oud := bound()
-	kaal := Lease{IP: oud.IP} // een server die alleen yiaddr terugstuurt
+	kaal := Lease{IP: oud.IP}
 	got := merge(oud, kaal)
 	if got != oud {
 		t.Errorf("merge = %+v, want alles uit de oude lease (%+v)", got, oud)
@@ -315,7 +278,6 @@ func TestMergeDraagtDoor(t *testing.T) {
 		t.Error("Acquired is niet gezet")
 	}
 
-	// Wat de server wél stuurt, wint.
 	nieuw := Lease{IP: oud.IP, LeaseSecs: 7200, T1Secs: 3600, T2Secs: 6300, DNS: [4]byte{9, 9, 9, 9}}
 	got = merge(oud, nieuw)
 	if got.LeaseSecs != 7200 || got.T1Secs != 3600 || got.T2Secs != 6300 {
@@ -329,8 +291,6 @@ func TestMergeDraagtDoor(t *testing.T) {
 	}
 }
 
-// TestStateString: de staatnamen komen in de console-log terecht, dus ze mogen
-// niet stil "%!v(uint8=2)" worden.
 func TestStateString(t *testing.T) {
 	for s, want := range map[State]string{
 		StateBound: "bound", StateRenewing: "renewing",
@@ -342,12 +302,6 @@ func TestStateString(t *testing.T) {
 	}
 }
 
-// TestRenewRequestVorm: een REQUEST in de renew-fase heeft een ándere vorm dan
-// de REQUEST van de handshake (RFC 2131 §4.3.2). ciaddr draagt het IP, en optie
-// 50/54 horen er JUIST niet in te staan — sommige servers antwoorden op zo'n
-// mengvorm met een NAK, en dan verlies je de lease terwijl alles in orde was.
-// De broadcast-flag blijft uit: we hebben een geldig adres en kunnen unicast
-// ontvangen, en dat moet ook, want onze eigen ingress negeert broadcast-IP's.
 func TestRenewRequestVorm(t *testing.T) {
 	l := bound()
 	mac := [6]byte{2, 0, 0, 0, 0, 1}
@@ -366,8 +320,7 @@ func TestRenewRequestVorm(t *testing.T) {
 	if string(bp[28:34]) != string(mac[:]) {
 		t.Error("chaddr is niet ons MAC")
 	}
-	// Frame-loos, dus de optie-zoeker van de andere test wil een frame-offset:
-	// bouw er een nepframe om.
+
 	frame := append(make([]byte, 42), bp...)
 	for _, code := range []byte{50, 54} {
 		if hasOptionCode(frame, code) {
@@ -379,7 +332,6 @@ func TestRenewRequestVorm(t *testing.T) {
 	}
 }
 
-// hasOptionCode zoekt of een optiecode voorkomt, ongeacht de waarde.
 func hasOptionCode(frame []byte, code byte) bool {
 	opts := frame[42+240:]
 	for i := 0; i+1 < len(opts); {
@@ -398,20 +350,15 @@ func hasOptionCode(frame []byte, code byte) bool {
 	return false
 }
 
-// proefConn speelt de socket: sentTo bewaart waar we heen schreven, en het
-// antwoord wordt gebouwd op de xid die de client zélf net schreef — dat is de
-// eenvoudigste manier om server te zijn zonder de xid-teller na te bouwen.
-// Poort 68 is geprivilegieerd, dus een echte bind kan hier niet.
 type proefConn struct {
 	sentTo []*net.UDPAddr
 	sent   [][]byte
 	closed bool
 
-	// Het antwoord op elke write: msgtype 0 = niets terugsturen (stille server).
 	msgtype byte
 	yiaddr  [4]byte
 	extra   []byte
-	vooraf  [][]byte // verkeer dat vóór ons antwoord uit de socket komt
+	vooraf  [][]byte
 
 	pending [][]byte
 }
@@ -428,7 +375,7 @@ func (c *proefConn) WriteToUDP(b []byte, addr *net.UDPAddr) (int, error) {
 
 func (c *proefConn) ReadFromUDP(b []byte) (int, *net.UDPAddr, error) {
 	if len(c.pending) == 0 {
-		return 0, nil, os.ErrDeadlineExceeded // de leesdeadline verstreek
+		return 0, nil, os.ErrDeadlineExceeded
 	}
 	f := c.pending[0]
 	c.pending = c.pending[1:]
@@ -438,7 +385,6 @@ func (c *proefConn) ReadFromUDP(b []byte) (int, *net.UDPAddr, error) {
 func (c *proefConn) SetReadDeadline(time.Time) error { return nil }
 func (c *proefConn) Close() error                    { c.closed = true; return nil }
 
-// metConn laat request over c lopen in plaats van over een echte socket.
 func metConn(t *testing.T, c leaseConn) {
 	t.Helper()
 	oud := listenLease
@@ -446,24 +392,20 @@ func metConn(t *testing.T, c leaseConn) {
 	t.Cleanup(func() { listenLease = oud })
 }
 
-// bootpReply bouwt het antwoord van een server op de UDP-payload die wij
-// verstuurden — los van een frame, zoals het uit de socket komt.
 func bootpReply(req []byte, msgtype byte, yiaddr [4]byte, extra []byte) []byte {
 	bp := make([]byte, 300)
-	bp[0], bp[1], bp[2] = 2, 1, 6 // BOOTREPLY
-	copy(bp[4:8], req[4:8])       // dezelfde xid
-	copy(bp[28:34], req[28:34])   // dezelfde chaddr
+	bp[0], bp[1], bp[2] = 2, 1, 6
+	copy(bp[4:8], req[4:8])
+	copy(bp[28:34], req[28:34])
 	copy(bp[16:20], yiaddr[:])
 	copy(bp[236:240], []byte{99, 130, 83, 99})
 	copy(bp[240:], append(append([]byte{53, 1, msgtype}, extra...), 255))
 	return bp
 }
 
-// TestRenewGaatNaarDeLessor: unicast naar de server uit optie 54, en de socket
-// gaat daarna dicht (anders houdt elke poging poort 68 bezet).
 func TestRenewGaatNaarDeLessor(t *testing.T) {
 	l := bound()
-	c := &proefConn{} // stille server
+	c := &proefConn{}
 	metConn(t, c)
 
 	if _, err := Renew(l, [6]byte{2, 0, 0, 0, 0, 1}, time.Second); err == nil {
@@ -477,10 +419,6 @@ func TestRenewGaatNaarDeLessor(t *testing.T) {
 	}
 }
 
-// TestRebindGaatBroadcast is de kern van de rebind-fase: níet naar de lessor
-// (die is juist stil) maar naar 255.255.255.255, zodat elke server op het
-// segment mag antwoorden. ciaddr moet mee, anders weet die server niet welk
-// adres we willen HOUDEN en geeft hij ons een nieuw.
 func TestRebindGaatBroadcast(t *testing.T) {
 	l := bound()
 	c := &proefConn{}
@@ -501,11 +439,9 @@ func TestRebindGaatBroadcast(t *testing.T) {
 	}
 }
 
-// TestRequestACK: de gewone uitkomst. Een karige ACK (alleen yiaddr en een
-// nieuwe lease-tijd) mag de rest van de lease niet wissen.
 func TestRequestACK(t *testing.T) {
 	l := bound()
-	c := &proefConn{msgtype: msgACK, yiaddr: l.IP, extra: []byte{51, 4, 0, 0, 0x1c, 0x20}} // 7200s
+	c := &proefConn{msgtype: msgACK, yiaddr: l.IP, extra: []byte{51, 4, 0, 0, 0x1c, 0x20}}
 	metConn(t, c)
 
 	got, err := Renew(l, [6]byte{2, 0, 0, 0, 0, 1}, time.Second)
@@ -523,8 +459,6 @@ func TestRequestACK(t *testing.T) {
 	}
 }
 
-// TestRequestNAK: een NAK draagt errRefused — dat is precies wat de staatmachine
-// nodig heeft om te stoppen in plaats van door te blijven vragen.
 func TestRequestNAK(t *testing.T) {
 	l := bound()
 	metConn(t, &proefConn{msgtype: msgNAK, yiaddr: l.IP})
@@ -537,18 +471,15 @@ func TestRequestNAK(t *testing.T) {
 	}
 }
 
-// TestRequestSlaatVreemdVerkeerOver: op poort 68 komt ook ander verkeer langs
-// (een laat antwoord, een broadcast voor een andere client). Dat mag de lease
-// niet in de weg zitten: doorlezen tot de deadline.
 func TestRequestSlaatVreemdVerkeerOver(t *testing.T) {
 	l := bound()
 	andere := make([]byte, 300)
-	andere[0] = 2    // BOOTREPLY, maar
-	andere[4] = 0xff // een andere xid
+	andere[0] = 2
+	andere[4] = 0xff
 	metConn(t, &proefConn{msgtype: msgACK, yiaddr: l.IP, vooraf: [][]byte{
-		make([]byte, 10),  // te kort voor BOOTP
-		make([]byte, 300), // geen BOOTREPLY
-		andere,            // andermans transactie
+		make([]byte, 10),
+		make([]byte, 300),
+		andere,
 	}})
 
 	got, err := Renew(l, [6]byte{2, 0, 0, 0, 0, 1}, time.Second)
@@ -560,9 +491,6 @@ func TestRequestSlaatVreemdVerkeerOver(t *testing.T) {
 	}
 }
 
-// TestSleepChunked: de kloksprong-les. Kort slapen mag geen lus worden, en de
-// som van de plakken is de gevraagde tijd (dat laatste is per constructie zo;
-// wat hier telt is dat de randen — 0 en negatief — meteen terugkomen).
 func TestSleepChunked(t *testing.T) {
 	for _, d := range []time.Duration{-time.Hour, 0, 5 * time.Millisecond} {
 		start := time.Now()

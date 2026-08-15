@@ -14,9 +14,6 @@ import (
 	"time"
 )
 
-// countingListener telt hoeveel TCP-verbindingen er echt geopend worden — dat
-// is de enige manier om keep-alive te meten die niet naar de implementatie
-// kijkt maar naar het gedrag.
 type countingListener struct {
 	net.Listener
 	n atomic.Int64
@@ -44,8 +41,6 @@ func servedBy(t *testing.T, h http.Handler) (addr string, conns *countingListene
 	return strings.TrimPrefix(srv.URL, "http://"), cl
 }
 
-// TestKeepAliveHergebruikt: tien verzoeken over één verbinding. Zonder pool
-// zouden dat tien TCP-handshakes zijn (en over TLS tien sleuteluitwisselingen).
 func TestKeepAliveHergebruikt(t *testing.T) {
 	addr, conns := servedBy(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprint(w, "hallo")
@@ -69,9 +64,6 @@ func TestKeepAliveHergebruikt(t *testing.T) {
 	}
 }
 
-// TestKeepAliveNietBijHalveBody is de veiligheidsregel: een body die niet tot
-// het einde gelezen is mag NOOIT terug in de pool. Zou dat gebeuren, dan leest
-// het volgende verzoek de staart van dit antwoord als zijn statusregel.
 func TestKeepAliveNietBijHalveBody(t *testing.T) {
 	addr, conns := servedBy(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprint(w, strings.Repeat("x", 4096))
@@ -84,13 +76,13 @@ func TestKeepAliveNietBijHalveBody(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		io.CopyN(io.Discard, resp.Body, 10) // bewust maar 10 van 4096 bytes
+		io.CopyN(io.Discard, resp.Body, 10)
 		resp.Body.Close()
 	}
 	if got := conns.n.Load(); got != 3 {
 		t.Errorf("%d verbindingen, want 3 — een half gelezen body werd hergebruikt", got)
 	}
-	// En het volgende volledige verzoek moet nog kloppen (geen desync).
+
 	resp, err := cl.Do(Call{URL: "http://" + addr + "/x"})
 	if err != nil {
 		t.Fatal(err)
@@ -102,8 +94,6 @@ func TestKeepAliveNietBijHalveBody(t *testing.T) {
 	}
 }
 
-// TestKeepAliveServerSluit: zegt de server "Connection: close", dan houden we
-// hem niet vast (en het volgende verzoek moet gewoon werken).
 func TestKeepAliveServerSluit(t *testing.T) {
 	addr, conns := servedBy(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Connection", "close")
@@ -124,8 +114,6 @@ func TestKeepAliveServerSluit(t *testing.T) {
 	}
 }
 
-// TestKeepAliveIdleTimeout: een verbinding die te lang stilstaat wordt niet
-// hergebruikt (de server heeft hem dan vaak al opgeruimd).
 func TestKeepAliveIdleTimeout(t *testing.T) {
 	addr, conns := servedBy(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprint(w, "ok")
@@ -136,14 +124,13 @@ func TestKeepAliveIdleTimeout(t *testing.T) {
 		resp, _ := cl.Get("http://" + addr + "/x")
 		io.ReadAll(resp.Body)
 		resp.Body.Close()
-		time.Sleep(40 * time.Millisecond) // langer dan de idle-timeout
+		time.Sleep(40 * time.Millisecond)
 	}
 	if got := conns.n.Load(); got != 2 {
 		t.Errorf("%d verbindingen, want 2 — een verlopen verbinding werd hergebruikt", got)
 	}
 }
 
-// TestKeepAliveMaxIdle: de pool houdt niet meer vast dan is toegestaan.
 func TestKeepAliveMaxIdle(t *testing.T) {
 	addr, _ := servedBy(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprint(w, "ok")
@@ -151,7 +138,6 @@ func TestKeepAliveMaxIdle(t *testing.T) {
 	cl := &Client{MaxIdlePerHost: 1}
 	defer cl.CloseIdle()
 
-	// Twee tegelijk open, dan beide teruggeven: één past, één moet dicht.
 	r1, err := cl.Get("http://" + addr + "/a")
 	if err != nil {
 		t.Fatal(err)
@@ -172,9 +158,6 @@ func TestKeepAliveMaxIdle(t *testing.T) {
 	}
 }
 
-// TestGzipDoorlaat: het pakket pakt niets uit, maar laat het wél toe — de
-// aanroeper zet de header en leest Response.Encoding. Zo blijft compress/gzip
-// buiten dit pakket.
 func TestGzipDoorlaat(t *testing.T) {
 	addr, _ := servedBy(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Accept-Encoding") != "gzip" {
@@ -182,7 +165,7 @@ func TestGzipDoorlaat(t *testing.T) {
 		}
 		w.Header().Set("Content-Encoding", "gzip")
 		w.Header().Set("Content-Length", "3")
-		w.Write([]byte("abc")) // doet alsof; de test gaat over de doorgifte
+		w.Write([]byte("abc"))
 	}))
 	resp, err := Do(Call{URL: "http://" + addr + "/x", Header: Header{"Accept-Encoding": "gzip"}})
 	if err != nil {
@@ -194,8 +177,6 @@ func TestGzipDoorlaat(t *testing.T) {
 	}
 }
 
-// TestDefaultBlijftIdentity: wie niets zegt, vraagt niets — anders zou een
-// bestaande gebruiker plots gecomprimeerde bytes krijgen die hij niet uitpakt.
 func TestDefaultBlijftIdentity(t *testing.T) {
 	addr, _ := servedBy(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if got := r.Header.Get("Accept-Encoding"); got != "identity" {
@@ -210,11 +191,6 @@ func TestDefaultBlijftIdentity(t *testing.T) {
 	resp.Body.Close()
 }
 
-// TestSetCookieNietGevouwen: twee Set-Cookie-regels moeten twee blijven. Dit is
-// de uitzondering van de HTTP-spec — een cookie-waarde en een Expires-datum
-// bevatten zelf komma's, dus gevouwen is de lijst niet meer te splitsen. Vouwen
-// betekent hier: één cookie lezen waar er twee stonden (login weg, en niemand
-// merkt het).
 func TestSetCookieNietGevouwen(t *testing.T) {
 	addr, _ := servedBy(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Add("Set-Cookie", "sid=abc; Path=/; Expires=Mon, 02 Jan 2027 15:04:05 GMT")
@@ -235,23 +211,12 @@ func TestSetCookieNietGevouwen(t *testing.T) {
 	if resp.SetCookie[1] != "theme=dark; Path=/" {
 		t.Errorf("tweede cookie = %q", resp.SetCookie[1])
 	}
-	// En ze staan NIET in Header, want daar zouden ze gevouwen zijn.
+
 	if got := resp.Header.Get("Set-Cookie"); got != "" {
 		t.Errorf("Set-Cookie staat óók in Header (%q) — daar kan hij alleen gevouwen staan", got)
 	}
 }
 
-// TestPoolNegeertHTTP10 is de derde bug uit dezelfde familie, en de duurste om
-// te vinden: HTTP/1.0 heeft de OMGEKEERDE default. Daar sluit de server tenzij
-// hij expliciet keep-alive zegt (RFC 9112 §9.3), terwijl 1.1 openhoudt tenzij hij
-// close zegt.
-//
-// GEMETEN 12-08 op een echte node: Python's http.server — waar half de wereld
-// zijn artifacts mee serveert — spreekt 1.0 en stuurt een nette Content-Length
-// zonder Connection-header. Dat zag er hier uit als een herbruikbare verbinding,
-// dus ging hij de pool in, en élke tweede download viel om met
-// "read status line: EOF". Op de server bleven verbindingen staan die niemand
-// meer las.
 func TestPoolNegeertHTTP10(t *testing.T) {
 	for _, tc := range []struct {
 		naam       string
@@ -282,7 +247,7 @@ func TestPoolNegeertHTTP10(t *testing.T) {
 					defer c.Close()
 					br := bufio.NewReader(c)
 					for {
-						// Kop wegnemen tot de lege regel.
+
 						for {
 							line, err := br.ReadString('\n')
 							if err != nil {
@@ -293,8 +258,7 @@ func TestPoolNegeertHTTP10(t *testing.T) {
 							}
 						}
 						fmt.Fprintf(c, "%s\r\nContent-Length: 2\r\n%s\r\nok", tc.statusLijn, tc.extra)
-						// Een 1.0-server zonder keep-alive doet hierna wat 1.0
-						// voorschrijft: dicht.
+
 						if tc.wantConns > 1 {
 							return
 						}
@@ -327,17 +291,6 @@ func TestPoolNegeertHTTP10(t *testing.T) {
 	}
 }
 
-// TestPoolRuimtElkeHostOp — een verlopen verbinding naar host A moet ook
-// verdwijnen als het volgende verzoek naar host B gaat. Eerst gebeurde dat alleen
-// in get(addr): wie host A nooit meer belde, hield die verbinding voor altijd.
-//
-// Op een gewone machine is dat een slapende socket die niemand mist. Op een node
-// is het een stuk van de netstack-pot — leannet houdt de buffers van een open
-// verbinding gereserveerd en die groeien mee met wat er door ging, dus een
-// afgeronde download van 5MB laat een dikke verbinding achter. GEMETEN 12-08 op
-// een LicheeRV: na een reeks app-images was er zo weinig pot over dat élke nieuwe
-// verbinding "buffer budget exhausted" kreeg, en omdat de watchdog voor zijn
-// levensteken juist een VERSE verbinding eist, resette de node zichzelf.
 func TestPoolRuimtElkeHostOp(t *testing.T) {
 	hello := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprint(w, "ok")
@@ -358,7 +311,7 @@ func TestPoolRuimtElkeHostOp(t *testing.T) {
 		t.Fatalf("pool draagt %d verbindingen na host A, wil 1", n)
 	}
 
-	time.Sleep(40 * time.Millisecond) // langer dan de idle-timeout
+	time.Sleep(40 * time.Millisecond)
 
 	resp, err = cl.Get("http://" + hostB + "/")
 	if err != nil {
@@ -367,7 +320,6 @@ func TestPoolRuimtElkeHostOp(t *testing.T) {
 	io.ReadAll(resp.Body)
 	resp.Body.Close()
 
-	// Alleen host B mag er nog staan; die van A is verlopen en hoort gesloten.
 	if n := cl.idleCount(); n != 1 {
 		t.Fatalf("pool draagt %d verbindingen, wil 1 (alleen host B) — een verlopen "+
 			"verbinding naar een host die je niet meer belt blijft dus staan", n)
@@ -377,12 +329,6 @@ func TestPoolRuimtElkeHostOp(t *testing.T) {
 	}
 }
 
-// TestPoolRuimtOpVoorDeDial — de sweep moet vóór het verzoek gebeuren, niet
-// alleen erná (in put). De volgorde van het gemeten faalscenario: de pot van de
-// netstack is op dóór verlopen gepoolde verbindingen → de dial faalt → er komt
-// geen put → een sweep-in-put draait nooit. De toestand die de sweep moet
-// opruimen maakt hem dan onbereikbaar (review 13-08). Hier nagebootst met een
-// verzoek dat faalt: ook dán moet de verlopen verbinding weg zijn.
 func TestPoolRuimtOpVoorDeDial(t *testing.T) {
 	hostA, _ := servedBy(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprint(w, "ok")
@@ -399,9 +345,8 @@ func TestPoolRuimtOpVoorDeDial(t *testing.T) {
 	if cl.idleCount() != 1 {
 		t.Fatal("verbinding naar host A kwam niet in de pool")
 	}
-	time.Sleep(40 * time.Millisecond) // laat hem verlopen
+	time.Sleep(40 * time.Millisecond)
 
-	// Een adres dat gegarandeerd weigert: een net gesloten listener.
 	l, err := net.Listen("tcp4", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)

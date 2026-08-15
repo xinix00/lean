@@ -1,6 +1,3 @@
-// Host-tests voor de handgerolde HTTP-parser. Dit pad leest netwerkdata van een
-// server die wij niet schreven, dus het is precies het soort code dat tests
-// verdient: elk faalpad moet luid falen i.p.v. een half antwoord door te geven.
 package leanhttp
 
 import (
@@ -17,7 +14,6 @@ import (
 	"time"
 )
 
-// lees haalt de hele body op en sluit hem.
 func lees(t *testing.T, r *Response) []byte {
 	t.Helper()
 	defer r.Body.Close()
@@ -52,14 +48,10 @@ func TestGewoneGET(t *testing.T) {
 	}
 }
 
-// De regressie die ik bijna shipte: de header-begrenzing mag de BODY niet
-// afknijpen. Een image is megabytes groot, dus een payload ruim boven bufSize
-// (8KB) én boven maxHeaderBytes (64KB) moet compleet doorkomen.
 func TestGroteBodyWordtNietAfgekapt(t *testing.T) {
-	want := bytes.Repeat([]byte("0123456789abcdef"), 20_000) // 320KB
+	want := bytes.Repeat([]byte("0123456789abcdef"), 20_000)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Expliciet, anders schakelt Go's server op deze omvang naar chunked —
-		// en dat weigert deze client bewust (zie TestChunkedWeigert).
+
 		w.Header().Set("Content-Length", fmt.Sprint(len(want)))
 		w.Write(want)
 	}))
@@ -82,9 +74,9 @@ func TestRedirectWordtGevolgd(t *testing.T) {
 	doel = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/een":
-			http.Redirect(w, r, doel.URL+"/twee", http.StatusFound) // absoluut
+			http.Redirect(w, r, doel.URL+"/twee", http.StatusFound)
 		case "/twee":
-			http.Redirect(w, r, "/drie", http.StatusMovedPermanently) // relatief
+			http.Redirect(w, r, "/drie", http.StatusMovedPermanently)
 		case "/drie":
 			w.Write([]byte("aangekomen"))
 		default:
@@ -113,10 +105,6 @@ func TestRedirectLusStopt(t *testing.T) {
 	}
 }
 
-// De kern van het pakket: https ZONDER dialer moet luid weigeren, want er is
-// geen TLS gelinkt. Stil doorgaan zou een onbegrijpelijke verbindingsfout
-// geven — en een fout die niet zegt wat te doen kost een zoektocht, dus de
-// melding noemt beide uitwegen.
 func TestHTTPSWeigertLuid(t *testing.T) {
 	_, err := Get("https://example.com/app.elf")
 	if err == nil {
@@ -129,10 +117,6 @@ func TestHTTPSWeigertLuid(t *testing.T) {
 	}
 }
 
-// De dialer-naad is ALGEMEEN, niet TLS-specifiek: hier stuurt hij een
-// https-URL naar een gewone testserver. Daarmee is bewezen dat het mechanisme
-// werkt zonder dat deze test (of dit pakket) TLS aanraakt — precies waarom de
-// naad zo mag bestaan.
 func TestDialHookStuurtOm(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Host != "artifacts.example" {
@@ -146,7 +130,7 @@ func TestDialHookStuurtOm(t *testing.T) {
 	resp, err := Do(Call{
 		URL: "https://artifacts.example/app.elf",
 		DialContext: func(_ context.Context, network, addr string) (net.Conn, error) {
-			dialedTo = addr // moet de hostnaam + 443 zijn, niet een IP
+			dialedTo = addr
 			return net.Dial(network, strings.TrimPrefix(srv.URL, "http://"))
 		},
 	})
@@ -163,8 +147,6 @@ func TestDialHookStuurtOm(t *testing.T) {
 	}
 }
 
-// Een dialer die niets teruggeeft (en ook geen fout) mag geen nil-pointer
-// verderop worden.
 func TestDialHookNilConn(t *testing.T) {
 	_, err := Do(Call{
 		URL:         "https://x.example/y",
@@ -176,8 +158,7 @@ func TestDialHookNilConn(t *testing.T) {
 }
 
 func TestChunkedWeigert(t *testing.T) {
-	// Handmatig antwoorden: httptest's ResponseWriter zet zelf Content-Length
-	// op kleine bodies, dus chunked moet op de draad geforceerd worden.
+
 	srv := rauweServer(t, "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhallo\r\n0\r\n\r\n")
 	if _, err := Get(srv); err == nil || !strings.Contains(err.Error(), "chunked") {
 		t.Fatalf("err = %v, wil een chunked-fout", err)
@@ -191,7 +172,6 @@ func TestZonderContentLengthWeigert(t *testing.T) {
 	}
 }
 
-// Twee verschillende lengtes is een smokkel-signaal, geen laatste-wint-geval.
 func TestDubbeleContentLengthWeigert(t *testing.T) {
 	srv := rauweServer(t, "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nContent-Length: 9\r\n\r\nhallo")
 	if _, err := Get(srv); err == nil || !strings.Contains(err.Error(), "duplicate Content-Length") {
@@ -217,7 +197,6 @@ func TestKromgeStatusregelWeigert(t *testing.T) {
 	}
 }
 
-// Eén absurd lange headerregel mag geen ongebonden buffergroei geven.
 func TestTeLangeHeaderregelWeigert(t *testing.T) {
 	srv := rauweServer(t, "HTTP/1.1 200 OK\r\nX-Groot: "+strings.Repeat("A", bufSize+1)+"\r\nContent-Length: 1\r\n\r\nx")
 	if _, err := Get(srv); err == nil || !strings.Contains(err.Error(), "header line exceeds") {
@@ -225,8 +204,6 @@ func TestTeLangeHeaderregelWeigert(t *testing.T) {
 	}
 }
 
-// Veel kleine regels passen elk in de buffer maar mogen samen niet ongebonden
-// groeien — de cumulatieve grens (maxHeaderBytes).
 func TestTeVeelHeaderbytesWeigert(t *testing.T) {
 	var b strings.Builder
 	b.WriteString("HTTP/1.1 200 OK\r\n")
@@ -245,8 +222,6 @@ func TestGeenHostWeigert(t *testing.T) {
 	}
 }
 
-// Do is de algemene weg: methode, headers, body — en een foutstatus is géén
-// transportfout, want de aanroeper wil de body ervan lezen.
 func TestDoPOST(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
@@ -282,8 +257,6 @@ func TestDoPOST(t *testing.T) {
 	}
 }
 
-// De reden dat chunked erin zit: een Go-server die streamt kent zijn lengte
-// niet en chunkt dus altijd. Zonder dit is elke SSE-staart onleesbaar.
 func TestDoLeestChunked(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		f := w.(http.Flusher)
@@ -307,8 +280,6 @@ func TestDoLeestChunked(t *testing.T) {
 	}
 }
 
-// Een blijvende stream leest regel voor regel door en breekt af op Close —
-// niet op een timeout, want een logstaart hoort open te blijven.
 func TestDoStreamStoptOpClose(t *testing.T) {
 	los := make(chan struct{})
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -320,7 +291,7 @@ func TestDoStreamStoptOpClose(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	resp, err := Do(Call{URL: srv.URL}) // Timeout 0: geen totaaltermijn
+	resp, err := Do(Call{URL: srv.URL})
 	if err != nil {
 		t.Fatalf("Do: %v", err)
 	}
@@ -338,7 +309,7 @@ func TestDoStreamStoptOpClose(t *testing.T) {
 
 func TestDoTimeout(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		<-r.Context().Done() // antwoordt nooit
+		<-r.Context().Done()
 	}))
 	defer srv.Close()
 
@@ -351,8 +322,6 @@ func TestDoTimeout(t *testing.T) {
 	}
 }
 
-// Headers die het pakket zelf zet mag een aanroeper niet stil overschrijven, en
-// een CRLF in een waarde zou een tweede verzoek smokkelen.
 func TestDoWeigertGesmokkeldeHeaders(t *testing.T) {
 	for naam, h := range map[string]Header{
 		"eigen Host":     {"Host": "elders"},
@@ -365,8 +334,6 @@ func TestDoWeigertGesmokkeldeHeaders(t *testing.T) {
 	}
 }
 
-// rauweServer antwoordt op elke verbinding met exact deze bytes en geeft zijn
-// URL — nodig waar net/http's server het antwoord te netjes zou maken.
 func rauweServer(t *testing.T, antwoord string) string {
 	t.Helper()
 	ln, err := net.Listen("tcp4", "127.0.0.1:0")
@@ -382,8 +349,7 @@ func rauweServer(t *testing.T, antwoord string) string {
 			}
 			go func() {
 				defer c.Close()
-				// Het verzoek eerst wegslikken tot de lege regel, zodat de
-				// client zijn write kwijt kan.
+
 				buf := make([]byte, 4096)
 				c.Read(buf)
 				io.WriteString(c, antwoord)
@@ -393,10 +359,6 @@ func rauweServer(t *testing.T, antwoord string) string {
 	return "http://" + ln.Addr().String()
 }
 
-// TestResponseURLNaRedirect: de URL waar het antwoord vandaan komt, niet de URL
-// die je vroeg. Zonder dit lost een browser elke relatieve link op een verhuisde
-// pagina tegen het oude pad op — en verhuizen doet het halve web (http→https,
-// /pad→/pad/).
 func TestResponseURLNaRedirect(t *testing.T) {
 	var srv *httptest.Server
 	srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -419,9 +381,6 @@ func TestResponseURLNaRedirect(t *testing.T) {
 	}
 }
 
-// TestNoFollowGeeftDe3xx: wie een cookie-jar heeft moet de keten zelf aflopen,
-// want op elke stap kan een Set-Cookie staan die de volgende stap nodig heeft.
-// Do kan die stap niet zetten, dus moet hij de 3xx kunnen teruggeven.
 func TestNoFollowGeeftDe3xx(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/start" {
@@ -452,10 +411,6 @@ func TestNoFollowGeeftDe3xx(t *testing.T) {
 	}
 }
 
-// TestBodyReaderStreamt: een upload gaat als stroom de deur uit, met de
-// Content-Length die de aanroeper belooft. Dit is de vorm die een
-// object-store-upload nodig heeft: een app-image door []byte duwen betekent hem
-// in het geheugen hebben op een node die 64MB heeft.
 func TestBodyReaderStreamt(t *testing.T) {
 	const payload = "dit-zijn-de-bytes-van-een-artifact"
 	var gotLen string
@@ -488,9 +443,6 @@ func TestBodyReaderStreamt(t *testing.T) {
 	}
 }
 
-// TestBodyReaderTeKort: een reader die minder levert dan de Content-Length
-// belooft, laat de server op de rest wachten en de verbinding hangen. Dat is
-// hier een fout, geen korte upload.
 func TestBodyReaderTeKort(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		io.Copy(io.Discard, r.Body)
@@ -511,8 +463,6 @@ func TestBodyReaderTeKort(t *testing.T) {
 	}
 }
 
-// TestBodyReaderEnBodySamen: twee bodies is een programmeerfout, en die hoort
-// luid te falen in plaats van er stil één te kiezen.
 func TestBodyReaderEnBodySamen(t *testing.T) {
 	_, err := Do(Call{
 		Method:     "PUT",
@@ -526,9 +476,6 @@ func TestBodyReaderEnBodySamen(t *testing.T) {
 	}
 }
 
-// TestBodyReaderVolgtGeenRedirect: een stroom is niet opnieuw te versturen, dus
-// de 3xx komt bij de aanroeper terecht in plaats van dat Do hem stil volgt met
-// een lege body.
 func TestBodyReaderVolgtGeenRedirect(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/oud" {
@@ -554,17 +501,12 @@ func TestBodyReaderVolgtGeenRedirect(t *testing.T) {
 	}
 }
 
-// TestHeaderTimeoutRaaktBodyNiet: een download wil géén totaaltermijn (die kapt
-// een groot bestand af) maar ook niet oneindig wachten op een server die de
-// verbinding aanneemt en dan zwijgt. Dat zijn twee deadlines, en de tweede mag
-// de eerste niet opeten.
 func TestHeaderTimeoutRaaktBodyNiet(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Length", "4")
 		w.WriteHeader(http.StatusOK)
 		w.(http.Flusher).Flush()
-		// De kop is er ruim binnen de grens; de body komt láng daarna. Zonder
-		// het terugzetten van de deadline zou dit de download doden.
+
 		time.Sleep(400 * time.Millisecond)
 		w.Write([]byte("data"))
 	}))
@@ -584,8 +526,6 @@ func TestHeaderTimeoutRaaktBodyNiet(t *testing.T) {
 	}
 }
 
-// TestHeaderTimeoutSlaatToe: een server die aanneemt en zwijgt loopt op de
-// kop-grens vast in plaats van eeuwig te hangen.
 func TestHeaderTimeoutSlaatToe(t *testing.T) {
 	l, err := net.Listen("tcp4", "127.0.0.1:0")
 	if err != nil {
@@ -598,7 +538,7 @@ func TestHeaderTimeoutSlaatToe(t *testing.T) {
 			return
 		}
 		defer c.Close()
-		time.Sleep(5 * time.Second) // aannemen en zwijgen
+		time.Sleep(5 * time.Second)
 	}()
 
 	start := time.Now()
@@ -611,16 +551,9 @@ func TestHeaderTimeoutSlaatToe(t *testing.T) {
 	}
 }
 
-// TestBodylessStatusBlokkeertNiet is de regel van RFC 9112 §6.3 aan de
-// CLIENTkant: 204 en 304 hebben geen body, ook niet als de server een lengte of
-// een Transfer-Encoding meestuurt. Zonder die regel valt zo'n antwoord in het
-// "tot EOF"-geval, en op een keep-alive-verbinding komt dat EOF pas als de
-// server zijn idle-timeout haalt — dus bleef élke DELETE staan (gevonden door
-// leans3: S3 én hoplockserver antwoorden met 204).
 func TestBodylessStatusBlokkeertNiet(t *testing.T) {
 	for _, code := range []int{StatusNoContent, 304} {
-		// Een server die de verbinding OPENHOUDT: valt de client terug op
-		// "lees tot EOF", dan hangt hij hier tot de test omvalt.
+
 		l, err := net.Listen("tcp4", "127.0.0.1:0")
 		if err != nil {
 			t.Fatal(err)
@@ -631,9 +564,9 @@ func TestBodylessStatusBlokkeertNiet(t *testing.T) {
 				return
 			}
 			defer c.Close()
-			bufio.NewReader(c).ReadString('\n') // verzoekregel wegnemen
+			bufio.NewReader(c).ReadString('\n')
 			fmt.Fprintf(c, "HTTP/1.1 %d Geen\r\nConnection: keep-alive\r\n\r\n", code)
-			time.Sleep(3 * time.Second) // openhouden
+			time.Sleep(3 * time.Second)
 		}()
 
 		done := make(chan error, 1)
@@ -657,10 +590,7 @@ func TestBodylessStatusBlokkeertNiet(t *testing.T) {
 				done <- fmt.Errorf("body = %q, want leeg", b)
 				return
 			}
-			// Zonder Content-Length is de lengte onbekend: een 204 wordt 0
-			// (draagt per definitie niets), een 304 blijft -1 — de informatieve
-			// lengte is van de server, niet van ons (review 13-08,
-			// vijfentwintigste ronde).
+
 			want := int64(-1)
 			if code == StatusNoContent {
 				want = 0

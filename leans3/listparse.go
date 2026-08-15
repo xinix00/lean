@@ -8,47 +8,32 @@ import (
 	"unicode/utf8"
 )
 
-// Het antwoord op een ListObjectsV2 is XML, en dit pakket leest er drie velden
-// uit. Daarvoor stond hier encoding/xml: 39.344 bytes symbolen in de HopOS-kern
-// (gemeten 12-08-2026, arm64) voor een reflectie-gedreven decoder met
-// namespaces, naamruimte-prefixen en een compleet tokenmodel, om drie
-// elementnamen te herkennen in een document dat S3 zelf genereert.
+// ListObjectsV2 returns XML, but this package reads only three fields.
+// encoding/xml added 39,344 symbol bytes to the HopOS arm64 kernel
+// (2026-08-12) for a reflective general-purpose decoder.
 //
-// Dus doet dit bestand precies dat: één keer over de bytes, elementnamen op
-// hun lokale naam, tekst met de vijf XML-entiteiten (plus numerieke) eruit
-// gehaald. Wat het níet kan, weigert het luid — met één uitzondering die
-// bewust géén fout is: een element dat we niet zoeken wordt overgeslagen,
-// inclusief zijn inhoud. Dat is wat een lijst-antwoord uitbreidbaar maakt.
-//
-// De gevaarlijke fout in zulke code is een afgekapt antwoord dat op een
-// compleet antwoord lijkt: minder keys, IsTruncated afwezig, en de aanroeper
-// die denkt dat de listing op is. Daarom eist de parser een document dat
-// sluit: elke open tag dicht, en de wortel afgesloten. Een halve stream is een
-// fout, net als bij encoding/xml.
+// This parser makes one pass, matches local element names, and decodes the five
+// predefined plus numeric entities. Unknown elements are skipped for forward
+// compatibility; unsupported syntax fails loudly. It requires every opened tag
+// and the root to close so a truncated page can never masquerade as a complete
+// listing with fewer keys.
 
-// maxDepth begrenst de nesting. Een ListBucketResult komt tot drie diep
-// (wortel → Contents → Key); dit is ruim, en het maakt van een document dat
-// alleen uit open tags bestaat een fout in plaats van een groeiende slice.
+// maxDepth bounds nesting. Valid pages need depth three; this headroom turns
+// malicious open-tag streams into errors rather than unbounded slices.
 const maxDepth = 32
 
-// parseListPage leest de drie velden die [Client.List] nodig heeft uit een
-// ListObjectsV2-antwoord.
-//
-// Matchen gaat op lokale naam (de namespace-prefix van een element telt niet
-// mee) en op positie: IsTruncated en NextContinuationToken direct onder de
-// wortel, Key direct onder Contents. Zo kan een veld met dezelfde naam ergens
-// diep in een uitbreiding nooit stil het antwoord veranderen.
+// parseListPage reads the fields needed by [Client.List]. It matches local name
+// and position: IsTruncated and NextContinuationToken under the root, and Key
+// under Contents. Same-named extension fields cannot alter the result.
 func parseListPage(b []byte) (*listBucketResult, error) {
 	var (
 		out   listBucketResult
 		stack = make([]string, 0, 8)
-		// text verzamelt de tekens van het element waar we in staan, maar
-		// alleen als het een veld is dat we willen: al het andere gooien we
-		// meteen weg.
+		// Collect text only for wanted fields; discard extension content eagerly.
 		text  []byte
 		wil   bool
-		zag   bool // wortel geopend
-		klaar bool // wortel gesloten
+		zag   bool // root opened
+		klaar bool // root closed
 	)
 
 	i := 0
@@ -141,8 +126,7 @@ func parseListPage(b []byte) (*listBucketResult, error) {
 			}
 			stack = append(stack, naam)
 			if zelfsluitend {
-				// <IsTruncated/> is een leeg element: de waarde is de lege
-				// string, en die moet door dezelfde toets als een echte.
+				// Treat a self-closing wanted field as an empty value.
 				if wilVeld(stack) {
 					if err := zet(&out, stack, ""); err != nil {
 						return nil, err
@@ -169,9 +153,8 @@ func parseListPage(b []byte) (*listBucketResult, error) {
 	return &out, nil
 }
 
-// wilVeld zegt of het pad in stack een veld is dat we lezen. Twee niveaus
-// onder de wortel, of Key onder Contents — de wortelnaam zelf laten we vrij,
-// want niet elke S3-implementatie noemt hem ListBucketResult.
+// wilVeld reports whether stack identifies a wanted field. The root name stays
+// unrestricted because not every S3 implementation uses ListBucketResult.
 func wilVeld(stack []string) bool {
 	switch len(stack) {
 	case 2:
@@ -182,8 +165,8 @@ func wilVeld(stack []string) bool {
 	return false
 }
 
-// zet legt de gelezen waarde op zijn plek. Een IsTruncated die geen boolean is
-// is een fout: "misschien is de listing op" is geen antwoord.
+// zet stores a parsed field. Invalid IsTruncated is an error because uncertain
+// pagination cannot be treated as complete.
 func zet(out *listBucketResult, stack []string, waarde string) error {
 	switch {
 	case len(stack) == 2 && stack[1] == "IsTruncated":
@@ -203,9 +186,8 @@ func zet(out *listBucketResult, stack []string, waarde string) error {
 	return nil
 }
 
-// startTag leest <naam attr="..."> en geeft de lokale naam, de index ná de tag
-// en of hij zichzelf sluit. Attributen worden overgeslagen met respect voor
-// aanhalingstekens: een '>' binnen een waarde sluit de tag niet.
+// startTag reads a start tag and returns its local name, end index, and
+// self-closing flag. Quoted `>` bytes do not end attributes.
 func startTag(b []byte, i int) (naam string, eind int, zelfsluitend bool, err error) {
 	naam, j, err := tagNaamOpen(b, i+1)
 	if err != nil {
@@ -234,7 +216,7 @@ func startTag(b []byte, i int) (naam string, eind int, zelfsluitend bool, err er
 	return "", 0, false, fmt.Errorf("leans3: unterminated tag <%s", naam)
 }
 
-// tagNaam leest de naam van een sluit-tag en geeft de index ná de '>'.
+// tagNaam reads a closing-tag name and returns the index after `>`.
 func tagNaam(b []byte, i int) (naam string, eind int, err error) {
 	naam, j, err := tagNaamOpen(b, i)
 	if err != nil {
@@ -252,9 +234,8 @@ func tagNaam(b []byte, i int) (naam string, eind int, err error) {
 	return naam, j + 1, nil
 }
 
-// tagNaamOpen leest een elementnaam en geeft de lokale naam terug: alles ná de
-// laatste ':' (een namespace-prefix zegt niets over wélk veld dit is, en S3's
-// documenten hebben er één op de wortel).
+// tagNaamOpen reads an element name and returns the local part after the final
+// namespace colon.
 func tagNaamOpen(b []byte, i int) (naam string, eind int, err error) {
 	start := i
 	for i < len(b) && !ruimte(b[i]) && b[i] != '>' && b[i] != '/' {
@@ -273,13 +254,11 @@ func tagNaamOpen(b []byte, i int) (naam string, eind int, err error) {
 	return string(n), i, nil
 }
 
-// unescape vervangt de vijf voorgedefinieerde entiteiten en numerieke
-// referenties. Een entiteit die we niet kennen is een fout: een key waarin
-// "&foo;" blijft staan is geen key, en een stille doorgifte zou pas opvallen
-// als iemand het object niet kan vinden.
+// unescape decodes the five predefined entities and numeric references. Unknown
+// entities fail instead of silently corrupting object keys.
 func unescape(b []byte) (string, error) {
 	if indexByteFrom(b, 0, '&') < 0 {
-		return string(b), nil // het gewone geval: geen entiteit, geen werk
+		return string(b), nil // Common case: no entity work.
 	}
 	out := make([]byte, 0, len(b))
 	for i := 0; i < len(b); {
@@ -289,7 +268,7 @@ func unescape(b []byte) (string, error) {
 			continue
 		}
 		e := indexByteFrom(b, i, ';')
-		if e < 0 || e-i > 12 { // "&#x10FFFF;" is de langste die wij kennen
+		if e < 0 || e-i > 12 { // "&#x10FFFF;" is the longest supported form.
 			return "", errors.New("leans3: unterminated XML entity")
 		}
 		ent := string(b[i+1 : e])
@@ -329,13 +308,12 @@ func unescape(b []byte) (string, error) {
 
 func ruimte(c byte) bool { return c == ' ' || c == '\t' || c == '\n' || c == '\r' }
 
-// heeft zegt of b op i met s begint.
+// Reports whether s begins at b[i].
 func heeft(b []byte, i int, s string) bool {
 	return len(b)-i >= len(s) && string(b[i:i+len(s)]) == s
 }
 
-// index geeft de index van s in b vanaf i, of -1. Eigen versie omdat
-// strings.Index een string wil en dat hier een kopie van het antwoord zou zijn.
+// index finds s in b from i without converting the full response to a string.
 func index(b []byte, i int, s string) int {
 	for ; i+len(s) <= len(b); i++ {
 		if string(b[i:i+len(s)]) == s {

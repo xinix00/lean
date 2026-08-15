@@ -1,8 +1,5 @@
 package leannet
 
-// udp_test.go — de poorttabel: bind/close/herbind, roundtrip mét afzender,
-// vol=drop+teller, budget-boekhouding, en de heilige datagram-grenzen.
-
 import (
 	"bytes"
 	"testing"
@@ -10,8 +7,6 @@ import (
 
 var udpTestSrc = [4]byte{10, 0, 0, 9}
 
-// TestUDPBindCloseRebind: dubbel binden weigert luid, close maakt de poort
-// weer vrij.
 func TestUDPBindCloseRebind(t *testing.T) {
 	tab := newUDPTable()
 	pot := &budget{total: 4096}
@@ -34,7 +29,6 @@ func TestUDPBindCloseRebind(t *testing.T) {
 	}
 	u2.close()
 
-	// Onbruikbare parameters weigeren luid.
 	if _, err := tab.bind(0, 1024, pot); err != errUDPPortZero {
 		t.Fatalf("bind port 0 error = %v, want %v", err, errUDPPortZero)
 	}
@@ -43,8 +37,6 @@ func TestUDPBindCloseRebind(t *testing.T) {
 	}
 }
 
-// TestUDPDeliverRecvRoundtrip: deliver → recvFrom mét afzender; lege wachtrij
-// en ongebonden poort geven false (plus teller).
 func TestUDPDeliverRecvRoundtrip(t *testing.T) {
 	tab := newUDPTable()
 	pot := &budget{total: 4096}
@@ -67,12 +59,10 @@ func TestUDPDeliverRecvRoundtrip(t *testing.T) {
 		t.Fatalf("recvFrom src = %v:%d, want %v:5678", src, srcPort, udpTestSrc)
 	}
 
-	// Leeg: non-blocking false, het wachten is de zorg van de socket-laag.
 	if _, _, _, ok := u.recvFrom(buf); ok {
 		t.Fatal("recvFrom on empty queue returned ok")
 	}
 
-	// Ongebonden poort: weg + teller.
 	if tab.deliver(9999, udpTestSrc, 1, payload) {
 		t.Fatal("deliver to unbound port succeeded")
 	}
@@ -82,12 +72,10 @@ func TestUDPDeliverRecvRoundtrip(t *testing.T) {
 	u.close()
 }
 
-// TestUDPQueueFullDrop: een volle wachtrij dropt het datagram (UDP mag dat)
-// mét teller; wat er al lag blijft intact en recv maakt weer ruimte.
 func TestUDPQueueFullDrop(t *testing.T) {
 	tab := newUDPTable()
 	pot := &budget{total: 4096}
-	// Cap: één datagram van 16 bytes past (overhead+16), twee niet.
+
 	u, err := tab.bind(7, udpDGramOverhead+16+8, pot)
 	if err != nil {
 		t.Fatal(err)
@@ -110,16 +98,13 @@ func TestUDPQueueFullDrop(t *testing.T) {
 	if !ok || srcPort != 1 || !bytes.Equal(buf[:n], first) {
 		t.Fatal("surviving datagram corrupted by the dropped one")
 	}
-	// De pop gaf de bytes terug aan de wachtrij: er past weer één.
+
 	if !tab.deliver(7, udpTestSrc, 3, second) {
 		t.Fatal("deliver after recv failed; queue accounting broken")
 	}
 	u.close()
 }
 
-// TestUDPBudget: bind reserveert queueCap uit de pot (de enige vooraf-claim),
-// een pot die het niet draagt weigert luid, en close stort integraal terug —
-// precies één keer, ook bij dubbel sluiten.
 func TestUDPBudget(t *testing.T) {
 	tab := newUDPTable()
 	pot := &budget{total: 100}
@@ -147,15 +132,13 @@ func TestUDPBudget(t *testing.T) {
 	if got := pot.free(); got != 100 {
 		t.Fatalf("pot.free() = %d after close, want 100", got)
 	}
-	// Idempotent: dubbel sluiten stort niet dubbel terug (en panict niet).
+
 	a.close()
 	if got := pot.free(); got != 100 {
 		t.Fatalf("pot.free() = %d after double close, want 100", got)
 	}
 }
 
-// TestUDPDatagramBoundaries: twee delivers zijn twee recvs — grenzen blijven,
-// niets plakt samen, en de payload is een eigen kopie.
 func TestUDPDatagramBoundaries(t *testing.T) {
 	tab := newUDPTable()
 	pot := &budget{total: 4096}
@@ -168,7 +151,7 @@ func TestUDPDatagramBoundaries(t *testing.T) {
 	two := []byte("bbbb")
 	tab.deliver(53, udpTestSrc, 1, one)
 	tab.deliver(53, udpTestSrc, 2, two)
-	one[0] = 'X' // de wachtrij moet een eigen kopie dragen
+	one[0] = 'X'
 
 	buf := make([]byte, 64)
 	n, _, srcPort, ok := u.recvFrom(buf)
@@ -182,8 +165,6 @@ func TestUDPDatagramBoundaries(t *testing.T) {
 	u.close()
 }
 
-// TestUDPTruncation: past een datagram niet in de leesbuffer, dan is de rest
-// weg maar blijft de grens staan — en de wachtrij-boekhouding klopt.
 func TestUDPTruncation(t *testing.T) {
 	tab := newUDPTable()
 	pot := &budget{total: 4096}
@@ -200,11 +181,11 @@ func TestUDPTruncation(t *testing.T) {
 	if !ok || n != 4 || !bytes.Equal(small, []byte("0123")) {
 		t.Fatalf("truncated recv = %q (n=%d), want \"0123\"", small[:n], n)
 	}
-	// De rest van het datagram is weg, geen tweede lees-beurt.
+
 	if _, _, _, ok := u.recvFrom(small); ok {
 		t.Fatal("truncated remainder still readable")
 	}
-	// En de vólledige kosten zijn vrijgegeven: een cap-vullend datagram past.
+
 	if !tab.deliver(9, udpTestSrc, 2, bytes.Repeat([]byte{1}, 16)) {
 		t.Fatal("queue accounting leaked after truncation")
 	}

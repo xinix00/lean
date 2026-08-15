@@ -1,21 +1,14 @@
 package leannet
 
-// udp.go — de UDP-poorttabel: bind reserveert een wachtrij (in bytes, uit de
-// budget-pot), deliver legt binnengekomen datagrammen erin, recvFrom haalt ze
-// er non-blocking uit — het blocken en de deadlines doet de socket-laag
-// later. De reservering bij bind is de enige vooraf-claim in heel leannet, en
-// hij is klein en expliciet: de aanroeper kiest hem per poort en close stort
-// hem integraal terug.
+// udp.go implements the UDP port table. bind reserves a byte-sized queue from
+// the budget, deliver enqueues datagrams, and recvFrom polls it; the socket
+// layer handles blocking and deadlines. This small explicit queue is leannet's
+// only up-front reservation and close returns it in full.
 //
-// Datagram-grenzen zijn heilig: elk datagram is een eigen record met een
-// eigen payload-kopie (KISS wint hier van zero-alloc). Twee delivers zijn
-// twee recvs, nooit één samengeplakte stroom.
+// Datagram boundaries are preserved with a private payload copy per record.
 //
-// Verzenden is geen machine-werk: een uitgaand datagram heeft geen staat, dus
-// de stack-laag bouwt hem direct met PutUDP (frame.go) en stuurt hem weg.
-//
-// De tabel is niet zelf-vergrendeld: de stack-laag houdt één lock over
-// bind/deliver/recvFrom/close (zelfde regime als de rest van het package).
+// Outgoing datagrams have no state and are built directly with PutUDP. The
+// table is not internally locked; the stack lock covers all operations.
 
 import "errors"
 
@@ -26,36 +19,29 @@ var (
 	errUDPBudget    = errors.New("leannet: udp bind exceeds budget")
 )
 
-// udpDGramOverhead is wat één datagram naast zijn payload écht kost in de
-// wachtrij: de udpDatagram-descriptor zelf is op 64-bit al ~40 bytes (slice-
-// header 24 + bron-IP/poort + padding) plus de allocatie-afronding van de
-// gekopieerde payload. De oude 8 (sizeUDP — de dráádoverhead, niet de heap-)
-// maakte van het budget geen werkelijke heapgrens (review 13-08,
-// achtentwintigste ronde).
+// udpDGramOverhead approximates the actual 64-bit heap cost of the descriptor
+// and allocation rounding. Wire overhead would undercount memory use.
 const udpDGramOverhead = 48
 
-// udpDatagram is één ontvangen datagram, afzender en grenzen inbegrepen.
+// udpDatagram stores one received datagram and its sender.
 type udpDatagram struct {
 	src     [4]byte
 	srcPort uint16
-	payload []byte // eigen kopie: het RX-frame is allang hergebruikt
+	payload []byte // private copy; the RX frame is reused
 }
 
-// udpTable wijst poorten toe en demuxt binnenkomende datagrammen.
+// udpTable assigns ports and demultiplexes incoming datagrams.
 type udpTable struct {
 	ports map[uint16]*udpPort
 
-	// cntNoPort telt datagrammen voor een ongebonden poort — voer voor een
-	// latere ICMP port-unreachable en voor telemetrie.
+	// cntNoPort supports telemetry and a future ICMP port-unreachable reply.
 	cntNoPort int
 }
 
 func newUDPTable() *udpTable { return &udpTable{ports: make(map[uint16]*udpPort)} }
 
-// bind claimt een poort met een wachtrij van queueCap BYTES, gereserveerd uit
-// pot. Bezette poort, onbruikbare capaciteit of een pot die het niet draagt:
-// luid weigeren. Het kiezen van een vrije (ephemerale) poort is de zorg van
-// de stack-laag; poort 0 is hier geen jokerteken.
+// bind reserves queueCap bytes for a nonzero port. The stack layer chooses
+// ephemeral ports; port zero is not a wildcard here.
 func (t *udpTable) bind(port uint16, queueCap int, pot *budget) (*udpPort, error) {
 	if port == 0 {
 		return nil, errUDPPortZero
@@ -74,15 +60,13 @@ func (t *udpTable) bind(port uint16, queueCap int, pot *budget) (*udpPort, error
 	return u, nil
 }
 
-// bound rapporteert of een poort in gebruik is (voor de efemere kiezer).
+// bound reports whether the ephemeral-port chooser may use a port.
 func (t *udpTable) bound(port uint16) bool {
 	_, taken := t.ports[port]
 	return taken
 }
 
-// deliver legt een binnengekomen datagram in de wachtrij van dstPort.
-// false = weg: poort niet gebonden, of wachtrij vol. UDP mág droppen — maar
-// het telt, zodat de stack-laag het kan zien.
+// deliver queues an incoming datagram. False means no bound port or a full queue.
 func (t *udpTable) deliver(dstPort uint16, src [4]byte, srcPort uint16, payload []byte) bool {
 	u, bound := t.ports[dstPort]
 	if !bound {
@@ -90,10 +74,8 @@ func (t *udpTable) deliver(dstPort uint16, src [4]byte, srcPort uint16, payload 
 		return false
 	}
 	if u.connected && (src != u.peer || srcPort != u.peerPort) {
-		// Vreemde afzenders op een connected socket vallen hiér al af: het
-		// filter zat eerst pas in ReadFrom, dus kon een spoofer de hele
-		// wachtrij vullen en de echte peer verdringen (review 13-08,
-		// vijfentwintigste ronde).
+		// Filter connected sockets before enqueueing so spoofed senders cannot
+		// fill the queue and displace the real peer.
 		u.cntDrop++
 		return false
 	}
@@ -111,45 +93,42 @@ func (t *udpTable) deliver(dstPort uint16, src [4]byte, srcPort uint16, payload 
 	return true
 }
 
-// udpPort is één gebonden poort met zijn wachtrij.
+// udpPort is one bound port and its receive queue.
 type udpPort struct {
 	table *udpTable
 	pot   *budget
 	port  uint16
-	cap   int // wachtrijcapaciteit in bytes, gereserveerd uit de pot
+	cap   int // queue capacity reserved from the budget
 
-	// connected-filter (zie deliver): gezet door DialUDP, onder het stack-slot.
+	// DialUDP configures this connected filter while holding the stack lock.
 	connected bool
 	peer      [4]byte
 	peerPort  uint16
-	used      int // bezette bytes (overhead + payloads)
+	used      int // occupied bytes, including overhead
 	q         []udpDatagram
 
-	cntDrop int // datagrammen gedropt omdat de wachtrij vol was
+	cntDrop int // datagrams dropped because the queue was full
 	closed  bool
 }
 
-// recvFrom popt het oudste datagram, non-blocking: ok=false is "niets", het
-// wachten doet de socket-laag. Past het datagram niet in p, dan is n de
-// afgekapte lengte en is de rest weg — UDP-semantiek: de grens blijft
-// bestaan, de bytes niet.
+// recvFrom pops the oldest datagram without blocking. If p is too small, UDP
+// semantics discard the remainder while preserving the record boundary.
 func (u *udpPort) recvFrom(p []byte) (n int, src [4]byte, srcPort uint16, ok bool) {
 	if len(u.q) == 0 {
 		return 0, src, 0, false
 	}
 	d := u.q[0]
-	u.q[0] = udpDatagram{} // payload-referentie wissen voor de GC
+	u.q[0] = udpDatagram{} // clear the payload reference for GC
 	u.q = u.q[1:]
 	if len(u.q) == 0 {
-		u.q = nil // drager loslaten: een lege wachtrij kost niets
+		u.q = nil // release the empty queue's backing storage
 	}
 	u.used -= udpDGramOverhead + len(d.payload)
 	n = copy(p, d.payload)
 	return n, d.src, d.srcPort, true
 }
 
-// close geeft de poort vrij en stort de volledige wachtrijcapaciteit terug in
-// de pot. Idempotent: dubbel sluiten is geen fout en stort niet dubbel terug.
+// close releases the port and returns its entire queue reservation. It is idempotent.
 func (u *udpPort) close() {
 	if u.closed {
 		return

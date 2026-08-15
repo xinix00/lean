@@ -21,18 +21,6 @@ import (
 	"github.com/xinix00/lean/leantls/x509verify"
 )
 
-// De echte toets van dit pakket: onze client tegen crypto/tls als server.
-//
-// Waarom dat meer bewijst dan losse unit-tests. Een handshake slaagt alleen als
-// ÉLK onderdeel klopt — de key schedule, elk transcript-moment, de
-// AEAD-nonces, de recordnummering, het DER-veld waar de sleutel in staat en de
-// twee bewijzen (handtekening en Finished). Eén byte verkeerd en de Finished
-// verifieert niet. De tegenpartij is hier een implementatie die de wereld al
-// een decennium aanvalt, dus wat hier groen is, is niet groen omdat wij het
-// zelf hebben opgeschreven.
-
-// testServer zet een crypto/tls-server op met een self-signed Ed25519-cert en
-// geeft zijn adres plus de publieke sleutel (de pin) terug.
 func testServer(t *testing.T, min, max uint16, handler func(net.Conn)) (string, ed25519.PublicKey) {
 	t.Helper()
 	pub, priv, err := ed25519.GenerateKey(rand.Reader)
@@ -79,7 +67,6 @@ func selfSigned(t *testing.T, pub, priv any) []byte {
 	return der
 }
 
-// echo stuurt terug wat het krijgt, tot het einde.
 func echo(c net.Conn) {
 	defer c.Close()
 	io.Copy(c, c)
@@ -107,8 +94,6 @@ func TestClientAgainstStdlibServer(t *testing.T) {
 	}
 }
 
-// Zonder SNI moet het net zo goed werken: de pin doet het vertrouwen, niet de
-// naam.
 func TestClientWithoutSNI(t *testing.T) {
 	addr, pin := testServer(t, tls.VersionTLS13, tls.VersionTLS13, echo)
 	conn, err := Dial("tcp", addr, &Config{PeerKey: pin})
@@ -118,8 +103,6 @@ func TestClientWithoutSNI(t *testing.T) {
 	conn.Close()
 }
 
-// Meer dan één record: dit dekt de fragmentatie op 2^14 én de recordnummering,
-// want vanaf record twee is elke nonce anders.
 func TestLargeTransfer(t *testing.T) {
 	addr, pin := testServer(t, tls.VersionTLS13, tls.VersionTLS13, echo)
 	conn, err := Dial("tcp", addr, &Config{PeerKey: pin})
@@ -128,7 +111,7 @@ func TestLargeTransfer(t *testing.T) {
 	}
 	defer conn.Close()
 
-	const n = 300 << 10 // ~19 records heen en terug
+	const n = 300 << 10
 	send := make([]byte, n)
 	if _, err := rand.Read(send); err != nil {
 		t.Fatal(err)
@@ -152,8 +135,6 @@ func TestLargeTransfer(t *testing.T) {
 	}
 }
 
-// De pin is het hele vertrouwensmodel, dus een verkeerde sleutel MOET de
-// handshake breken — en met een melding die zegt wat er mis is.
 func TestWrongPinRefused(t *testing.T) {
 	addr, _ := testServer(t, tls.VersionTLS13, tls.VersionTLS13, echo)
 	other, _, err := ed25519.GenerateKey(rand.Reader)
@@ -169,7 +150,6 @@ func TestWrongPinRefused(t *testing.T) {
 	}
 }
 
-// Geen pin is geen "vertrouw alles" maar een weigering (lean-regel 2).
 func TestNoPinRefused(t *testing.T) {
 	for _, cfg := range []*Config{nil, {}, {PeerKey: make([]byte, 5)}} {
 		if _, err := Client(nil, cfg); err == nil {
@@ -178,23 +158,19 @@ func TestNoPinRefused(t *testing.T) {
 	}
 }
 
-// Een server die alleen TLS 1.2 kan, moet luid falen en niet stil terugvallen.
 func TestTLS12ServerRefused(t *testing.T) {
 	addr, pin := testServer(t, tls.VersionTLS12, tls.VersionTLS12, echo)
 	_, err := Dial("tcp", addr, &Config{PeerKey: pin})
 	if err == nil {
 		t.Fatal("een TLS 1.2-server werd geaccepteerd")
 	}
-	// Go's server weigert zelf al (wij bieden alleen 1.3 aan), dus we toetsen
-	// alleen dát het faalt en dat de melding niet leeg is.
+
 	if err.Error() == "" {
 		t.Error("lege foutmelding")
 	}
 	t.Logf("TLS 1.2-server: %v", err)
 }
 
-// Een certificaat met een andere sleutelsoort hoort te vertellen wát er niet
-// kan, niet te stranden in een parse-fout.
 func TestNonEd25519CertRefused(t *testing.T) {
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
@@ -210,8 +186,6 @@ func TestNonEd25519CertRefused(t *testing.T) {
 	}
 }
 
-// De sleutel uit een echt certificaat halen, zonder crypto/x509 — vergeleken
-// met wat crypto/x509 er zelf uit haalt.
 func TestPeerKeyFromCert(t *testing.T) {
 	pub, priv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
@@ -227,7 +201,6 @@ func TestPeerKeyFromCert(t *testing.T) {
 		t.Errorf("sleutel wijkt af:\n got %x\nwant %x", got, pub)
 	}
 
-	// En de scheidsrechter: crypto/x509 moet dezelfde sleutel zien.
 	parsed, err := x509.ParseCertificate(der)
 	if err != nil {
 		t.Fatal(err)
@@ -237,7 +210,6 @@ func TestPeerKeyFromCert(t *testing.T) {
 	}
 }
 
-// Afgekapte DER mag nooit paniekeren — dit is netwerkdata van een tegenpartij.
 func TestTruncatedCertNeverPanics(t *testing.T) {
 	pub, priv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
@@ -251,8 +223,6 @@ func TestTruncatedCertNeverPanics(t *testing.T) {
 	}
 }
 
-// close_notify: de andere kant moet het verschil zien tussen "klaar" en
-// "weggevallen".
 func TestCloseSendsCloseNotify(t *testing.T) {
 	saw := make(chan error, 1)
 	addr, pin := testServer(t, tls.VersionTLS13, tls.VersionTLS13, func(c net.Conn) {
@@ -272,8 +242,7 @@ func TestCloseSendsCloseNotify(t *testing.T) {
 	}
 	select {
 	case err := <-saw:
-		// Een nette afsluiting geeft de server een schone EOF (io.Copy geeft
-		// dan nil); een weggevallen verbinding zou hier een fout geven.
+
 		if err != nil && !errors.Is(err, io.EOF) {
 			t.Errorf("server zag geen nette afsluiting: %v", err)
 		}
@@ -282,11 +251,6 @@ func TestCloseSendsCloseNotify(t *testing.T) {
 	}
 }
 
-// net.Conn mag door meerdere goroutines tegelijk gebruikt worden, en aan de
-// zendkant is dat geen comfort-eis: twee Writes zonder slot kunnen twee records
-// met hetzelfde recordnummer opleveren, en dat is een hergebruikte AEAD-nonce.
-// De race-detector ziet dat niet (het is geen datarace op een Go-variabele maar
-// een protocolfout), dus dit toetst het resultaat: alles komt heel aan.
 func TestConcurrentWrites(t *testing.T) {
 	addr, pin := testServer(t, tls.VersionTLS13, tls.VersionTLS13, echo)
 	conn, err := Dial("tcp", addr, &Config{PeerKey: pin})
@@ -322,9 +286,7 @@ func TestConcurrentWrites(t *testing.T) {
 	if err := <-done; err != nil {
 		t.Fatalf("read: %v", err)
 	}
-	// De volgorde tussen schrijvers is onbepaald, maar elke byte moet van een
-	// schrijver komen en het totaal moet kloppen — een hergebruikte nonce of een
-	// half record zou hier als ontsleutelfout of als ontbrekende bytes vallen.
+
 	count := map[byte]int{}
 	for _, b := range got {
 		count[b]++
@@ -336,16 +298,10 @@ func TestConcurrentWrites(t *testing.T) {
 	}
 }
 
-// De https-modus end-to-end: onze handshake, een echte crypto/tls-server, en de
-// keten door crypto/x509. Dit dekt het pad dat de gepinde modus nooit raakt —
-// een CertificateVerify met ECDSA of RSA-PSS in plaats van Ed25519.
-//
-// Twee sleutelsoorten, want dat is precies de verwisseling die in het wild
-// voorkomt: github.com serveert ECDSA, objects.githubusercontent.com RSA.
 func TestVerifyPeerModeAgainstStdlibServer(t *testing.T) {
 	for _, kind := range []string{"ecdsa", "rsa"} {
 		t.Run(kind, func(t *testing.T) {
-			// Een eigen CA, en een servercertificaat eronder.
+
 			caKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 			if err != nil {
 				t.Fatal(err)
@@ -433,8 +389,6 @@ func TestVerifyPeerModeAgainstStdlibServer(t *testing.T) {
 				t.Errorf("echo: %q", got)
 			}
 
-			// En dezelfde server met een lege pool moet worden geweigerd: dan is
-			// er geen anker, en dat is precies wat de keten hoort te breken.
 			_, err = Dial("tcp", ln.Addr().String(), &Config{
 				ServerName:          "leantls.test",
 				VerifyPeer:          x509verify.Chain(x509.NewCertPool()),
@@ -447,7 +401,6 @@ func TestVerifyPeerModeAgainstStdlibServer(t *testing.T) {
 	}
 }
 
-// De twee modi sluiten elkaar uit, en geen van beide is ook een weigering.
 func TestTrustModelRequired(t *testing.T) {
 	pub, _, _ := ed25519.GenerateKey(rand.Reader)
 	cases := []struct {
@@ -477,16 +430,10 @@ func TestTrustModelRequired(t *testing.T) {
 	}
 }
 
-// TestHandshakeRespecteertDeConnDeadline — Dial zet sinds de dertiende ronde
-// (review 13-08) een termijn op de verbinding vóór de handshake; dat werkt
-// alleen als de handshake een conn-deadline ook echt honoreert. Een zwijgende
-// peer (TCP op, handshake nooit) gijzelde anders goroutine én socket
-// voorgoed — en elke laag erboven (leanhttp's dialBounded) kan een dialer
-// alleen begrenzen als die zélf eindig is.
 func TestHandshakeRespecteertDeConnDeadline(t *testing.T) {
 	client, server := net.Pipe()
 	defer server.Close()
-	go io.Copy(io.Discard, server) // de peer slikt de ClientHello en zwijgt
+	go io.Copy(io.Discard, server)
 
 	client.SetDeadline(time.Now().Add(200 * time.Millisecond))
 	got := make(chan error, 1)

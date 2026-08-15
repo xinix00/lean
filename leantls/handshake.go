@@ -10,26 +10,23 @@ import (
 	"fmt"
 )
 
-// De client-handshake van TLS 1.3 (RFC 8446 §4), in één rechte lijn: één
-// versie, één suite, één groep, één signatuuralgoritme. Er is dus niets te
-// onderhandelen en niets te kiezen — elke afwijking van de server is een fout
-// en niet een geval om op te vangen. Dat is waarom dit bestand kort is.
+// TLS 1.3 client handshake (RFC 8446 §4) with one version, suite, group, and
+// pinned-mode signature algorithm. Unsupported server choices fail instead of
+// expanding negotiation state.
 //
-// Wat de server ons stuurt en wat we ermee doen:
+// Server flight:
 //
-//	ServerHello         → de sleutelhelft van de server, versie 1.3 toetsen
-//	EncryptedExtensions → overslaan (we vroegen niets dat een antwoord eist)
-//	Certificate         → de Ed25519-sleutel eruit, tegen de pin leggen
-//	CertificateVerify   → handtekening over het transcript, met die sleutel
-//	Finished            → HMAC over het transcript, met het handshake-secret
+//	ServerHello         → validate TLS 1.3 and the server key share
+//	EncryptedExtensions → skip; no requested extension needs a response
+//	Certificate         → establish peer identity
+//	CertificateVerify   → verify the transcript signature
+//	Finished            → verify transcript HMAC with the handshake secret
 //
-// Die laatste drie zijn samen het hele bewijs: de handtekening zegt "wie de
-// pin-sleutel heeft, praat hier", en de Finished zegt "en het is dezelfde partij
-// die deze sleuteluitwisseling deed". Zonder de Finished zou een tussenpartij de
-// sleuteluitwisseling kunnen overnemen en de handtekening doorsluizen.
+// CertificateVerify proves identity; Finished binds that identity to this key
+// exchange and prevents a middlebox forwarding only the signature.
 
 const (
-	// Handshake-berichttypes die wij tegenkomen (§4).
+	// Handshake message types encountered here (§4).
 	hsClientHello         = 1
 	hsServerHello         = 2
 	hsNewSessionTicket    = 4
@@ -40,7 +37,7 @@ const (
 	hsFinished            = 20
 	hsKeyUpdate           = 24
 
-	// Extensies.
+	// Extensions.
 	extServerName        = 0
 	extSupportedGroups   = 10
 	extSignatureAlgs     = 13
@@ -48,8 +45,8 @@ const (
 	extKeyShare          = 51
 
 	versionTLS13 = 0x0304
-	// legacyVersion is wat er in het version-veld van ClientHello/ServerHello
-	// staat sinds 1.3: altijd 1.2, en de echte versie zit in een extensie.
+	// TLS 1.3 puts 1.2 in legacy version fields and negotiates the real version
+	// through an extension.
 	legacyVersion = 0x0303
 
 	groupX25519    = 0x001d
@@ -57,17 +54,14 @@ const (
 	suiteAES128GCM = 0x1301
 )
 
-// helloRetryRandom is de vaste ServerHello.random waarmee een server zegt "doe
-// het opnieuw met een andere groep" (§4.1.3). Wij bieden alleen X25519 aan, dus
-// als dit langskomt vraagt de server iets dat we niet hebben — dan is stoppen
-// met een duidelijke melding het enige eerlijke antwoord.
+// helloRetryRandom is the fixed ServerHello.random requesting another group
+// (§4.1.3). Because only X25519 is offered, receiving it fails clearly.
 var helloRetryRandom = []byte{
 	0xCF, 0x21, 0xAD, 0x74, 0xE5, 0x9A, 0x61, 0x11, 0xBE, 0x1D, 0x8C, 0x02, 0x1E, 0x65, 0xB8, 0x91,
 	0xC2, 0xA2, 0x11, 0x16, 0x7A, 0xBB, 0x8C, 0x5E, 0x07, 0x9E, 0x09, 0xE2, 0xC8, 0xA8, 0x33, 0x9C,
 }
 
-// handshake voert de volledige clientkant uit. Bij terugkeer staan de
-// applicatiesleutels en is de verbinding bruikbaar.
+// handshake completes the client side and installs application traffic keys.
 func (c *Conn) handshake() error {
 	priv, err := ecdh.X25519().GenerateKey(rand.Reader)
 	if err != nil {
@@ -103,7 +97,7 @@ func (c *Conn) handshake() error {
 		return err
 	}
 
-	// --- sleutels ----------------------------------------------------------
+	// --- Keys ---------------------------------------------------------------
 	peer, err := ecdh.X25519().NewPublicKey(serverShare)
 	if err != nil {
 		return fmt.Errorf("leantls: server key share: %w", err)
@@ -119,7 +113,7 @@ func (c *Conn) handshake() error {
 	c.setRead(sHS)
 	c.setWrite(cHS)
 
-	// --- de versleutelde vlucht van de server ------------------------------
+	// --- Encrypted server flight -------------------------------------------
 	if err := c.expect(hsEncryptedExtensions); err != nil {
 		return err
 	}
@@ -139,13 +133,10 @@ func (c *Conn) handshake() error {
 	if err != nil {
 		return err
 	}
-	// HIER wordt de tegenpartij vertrouwd of niet, en het is de enige plek. Twee
-	// vormen, en welke het is heeft Client al vastgesteld:
+	// This is the sole trust decision. Client already selected one mode:
 	//
-	//   - een gepinde sleutel: één vergelijking, geen keten, geen namen, geen
-	//     datums. Wat er niet is, kan ook niet fout gaan.
-	//   - een haak van de aanroeper: die krijgt de keten zoals hij op de draad
-	//     stond en geeft terug hoe de handtekening getoetst wordt.
+	//   - compare a pinned key without chain, names, or dates;
+	//   - let the caller validate the wire chain and return a signature verifier.
 	var verify SignatureVerifier
 	if len(c.cfg.PeerKey) > 0 {
 		certKey, err := peerKeyFromCert(chain[0])
@@ -166,8 +157,8 @@ func (c *Conn) handshake() error {
 		}
 	}
 
-	// CertificateVerify gaat over het transcript TOT EN MET Certificate, dus de
-	// hash moet vóór het lezen van het volgende bericht genomen worden.
+	// CertificateVerify covers the transcript through Certificate, so snapshot
+	// before reading the next message.
 	beforeCV := c.hash()
 	typ, body, err = c.readHandshakeMsg()
 	if err != nil {
@@ -193,16 +184,12 @@ func (c *Conn) handshake() error {
 			"the key exchange was tampered with, or we disagree about the transcript")
 	}
 
-	// --- onze kant afsluiten ----------------------------------------------
-	// De applicatiesleutels komen uit het transcript tot en met de Finished van
-	// de server; onze eigen Finished zit er dus NIET in.
+	// --- Complete our side --------------------------------------------------
+	// Application keys cover through server Finished, excluding our Finished.
 	afterFin := c.hash()
 
-	// change_cipher_spec: betekent niets in 1.3, maar er staat nog genoeg
-	// middleware op de wereld die een handshake zonder dit record laat vallen.
-	// Zes bytes, en hij gaat plaintext (§5) — dus vóór we onze sleutels zetten
-	// zou het ook mogen, maar de wAEAD-check in writeRecord doet dat niet, dus
-	// sturen we hem hier expliciet als plaintext-record.
+	// Middleboxes still expect change_cipher_spec. TLS 1.3 sends these six bytes
+	// as plaintext even after write keys exist, so use the dedicated writer.
 	if err := c.writeCCS(); err != nil {
 		return err
 	}
@@ -215,16 +202,13 @@ func (c *Conn) handshake() error {
 
 	c.setRead(keysFrom(deriveSecret(sec.master, "s ap traffic", afterFin)))
 	c.setWrite(keysFrom(deriveSecret(sec.master, "c ap traffic", afterFin)))
-	// Het transcript is klaar met zijn werk; niet laten liggen (het bevat het
-	// certificaat en groeit met elke post-handshake boodschap).
+	// Drop the completed transcript, including certificates.
 	c.transcript = nil
 	return nil
 }
 
-// sigAlgs geeft de algoritmes die we aanbieden: wat de config zegt, of alleen
-// Ed25519 als hij niets zegt. Die default hoort bij de gepinde modus en is
-// bewust smal — een lijst die breder is dan wat je kunt toetsen, levert een
-// handshake die pas bij de handtekening omvalt.
+// sigAlgs returns configured algorithms or pinned-mode Ed25519 only. Never offer
+// more than the active verifier can check.
 func (c *Conn) sigAlgs() []uint16 {
 	if len(c.cfg.SignatureAlgorithms) > 0 {
 		return c.cfg.SignatureAlgorithms
@@ -232,8 +216,7 @@ func (c *Conn) sigAlgs() []uint16 {
 	return []uint16{sigEd25519}
 }
 
-// clientHello bouwt het bericht. De inhoud is volledig vast op de drie random
-// velden na, dus dit is een opsomming en geen keuze.
+// clientHello builds the fixed message around its three random fields.
 func (c *Conn) clientHello(random, sessionID, share []byte) []byte {
 	b := &builder{}
 	b.u8(hsClientHello)
@@ -242,7 +225,7 @@ func (c *Conn) clientHello(random, sessionID, share []byte) []byte {
 		b.bytes(random)
 		b.u8len(func() { b.bytes(sessionID) })
 		b.u16len(func() { b.u16(suiteAES128GCM) })
-		b.u8len(func() { b.u8(0) }) // compressie: alleen "geen"
+		b.u8len(func() { b.u8(0) }) // Compression: none only.
 		b.u16len(func() {
 			if c.cfg.ServerName != "" {
 				b.u16(extServerName)
@@ -280,10 +263,10 @@ func (c *Conn) clientHello(random, sessionID, share []byte) []byte {
 	return b.buf
 }
 
-// parseServerHello toetst wat er te toetsen valt en geeft de key share terug.
+// parseServerHello validates supported choices and returns the key share.
 func (c *Conn) parseServerHello(body, sessionID []byte) ([]byte, error) {
 	r := reader{buf: body}
-	if _, err := r.u16(); err != nil { // legacy_version, niet leidend
+	if _, err := r.u16(); err != nil { // legacy_version is not authoritative.
 		return nil, err
 	}
 	random, err := r.take(32)
@@ -298,8 +281,7 @@ func (c *Conn) parseServerHello(body, sessionID []byte) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	// De echo moet kloppen: hij is er tegen middleboxes, maar een server die
-	// hem verzint praat niet tegen ons ClientHello.
+	// The compatibility session ID must echo our ClientHello.
 	if !bytes.Equal(echo.buf, sessionID) {
 		return nil, fmt.Errorf("leantls: the server echoed a different session id")
 	}
@@ -311,9 +293,7 @@ func (c *Conn) parseServerHello(body, sessionID []byte) ([]byte, error) {
 		return nil, fmt.Errorf("leantls: the server chose cipher suite %#04x; this package only has "+
 			"TLS_AES_128_GCM_SHA256 (%#04x)", suite, suiteAES128GCM)
 	}
-	// legacy_compression_method moet nul zijn: compressie bestaat niet in 1.3, en
-	// compressie in TLS is historisch een lek (CRIME). Een server die hier iets
-	// anders zet, praat een ander protocol dan wij.
+	// TLS 1.3 has no compression; accepting it would also reintroduce CRIME.
 	if comp, err := r.u8(); err != nil {
 		return nil, err
 	} else if comp != 0 {
@@ -356,9 +336,7 @@ func (c *Conn) parseServerHello(body, sessionID []byte) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	// Zonder supported_versions is dit géén TLS 1.3-server maar een 1.2-server
-	// die ons ClientHello aannam. Luid stoppen: dit pakket kan 1.2 niet, en
-	// stil doorgaan zou betekenen dat we met de verkeerde sleutels verder gaan.
+	// Without supported_versions this is a TLS 1.2 server, not a valid downgrade.
 	if !sawVersion {
 		return nil, fmt.Errorf("leantls: the server did not select TLS 1.3 " +
 			"(no supported_versions in ServerHello) — this package speaks TLS 1.3 only")
@@ -369,9 +347,7 @@ func (c *Conn) parseServerHello(body, sessionID []byte) ([]byte, error) {
 	return share, nil
 }
 
-// expect leest één handshake-bericht en eist het type. Voor berichten waarvan we
-// de inhoud niet nodig hebben (EncryptedExtensions): ze moeten in het transcript,
-// en dat regelt readHandshakeMsg.
+// expect reads and records one handshake message of the required type.
 func (c *Conn) expect(want byte) error {
 	typ, _, err := c.readHandshakeMsg()
 	if err != nil {
@@ -383,9 +359,8 @@ func (c *Conn) expect(want byte) error {
 	return nil
 }
 
-// parseCertificateList geeft de keten in DER, leaf eerst — precies zoals de
-// server hem stuurde. Ook de gepinde modus loopt hierlangs en pakt er alleen
-// het eerste certificaat uit: één plek die het draadformaat kent.
+// parseCertificateList returns the wire DER chain leaf first. Pinned mode uses
+// only the leaf but shares this one wire parser.
 func parseCertificateList(body []byte) ([][]byte, error) {
 	r := reader{buf: body}
 	if _, err := r.vec8(); err != nil { // certificate_request_context
@@ -405,8 +380,7 @@ func parseCertificateList(body []byte) ([][]byte, error) {
 			return nil, errors.New("leantls: the server sent an empty certificate in its chain")
 		}
 		out = append(out, bytes.Clone(entry.buf))
-		// Per-certificaat extensies (OCSP-stapling, SCT's): overslaan, ze spelen
-		// geen rol in wie de tegenpartij is.
+		// Skip per-certificate OCSP/SCT extensions; they do not establish identity.
 		if _, err := list.vec16(); err != nil {
 			return nil, err
 		}
@@ -417,8 +391,7 @@ func parseCertificateList(body []byte) ([][]byte, error) {
 	return out, nil
 }
 
-// ed25519Verifier is de verifier van de gepinde modus: één algoritme, en de
-// sleutel staat vast.
+// ed25519Verifier checks pinned-mode signatures with the fixed key and algorithm.
 func ed25519Verifier(key ed25519.PublicKey) SignatureVerifier {
 	return func(alg uint16, signed, sig []byte) error {
 		if alg != sigEd25519 {
@@ -432,14 +405,9 @@ func ed25519Verifier(key ed25519.PublicKey) SignatureVerifier {
 	}
 }
 
-// verifyCertificateVerify laat de verifier de handtekening toetsen.
-// transcriptHash is de Transcript-Hash tot en met Certificate — dus al gehasht;
-// er gaat hier geen tweede hash over (dat is een fout die geen enkele test
-// zonder echte tegenpartij zou vinden).
-//
-// Wat er precies ondertekend is, rekent dit pakket uit en niet de verifier: die
-// 64 spaties plus contextstring (§4.4.3) zijn de domain separation, en die hoort
-// niet bij de aanroeper te liggen.
+// verifyCertificateVerify invokes the verifier with the already-hashed
+// transcript through Certificate. This package constructs §4.4.3 domain-
+// separated signed content rather than delegating protocol framing.
 func verifyCertificateVerify(body []byte, verify SignatureVerifier, transcriptHash []byte) error {
 	r := reader{buf: body}
 	alg, err := r.u16()

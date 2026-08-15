@@ -1,34 +1,26 @@
-// Package leannet is een kleine TCP/IP-stack voor bare-metal Go (tamago):
-// ethernet, ARP, IPv4, ICMP-echo, UDP en TCP, plus een socket-laag die
-// net.Conn/net.Listener/net.PacketConn levert voor net.SocketFunc. Stdlib-only.
+// Package leannet is a small TCP/IP stack for bare-metal Go (TamaGo): Ethernet,
+// ARP, IPv4, ICMP echo, UDP, and TCP, plus a socket layer that supplies
+// net.Conn, net.Listener, and net.PacketConn to net.SocketFunc. It uses only the
+// standard library.
 //
-// Het gemeten probleem (2026-08-11, HopOS op een 64MB-raam): de vorige stack
-// (lneto + go-net, ~13k regels via twee forks) claimde geheugen naar
-// CONFIGURATIE in plaats van naar gebruik — 2MB per listener vooraf plus 256KB
-// per uitgaande dial uit één TCPBufferSize-knop. Dat was op QEMU reproduceerbaar
-// een OOM binnen 151 seconden download-last. Dezelfde review (29 bevindingen,
-// BEVINDINGEN.md in onze lneto-clone) bewees dat een verloren kale FIN daar
-// nooit hergezonden wordt: verbindingen die tijdens het sluiten één frame
-// verliezen wedgen stil, en acht daarvan maakten een 8-slots listener blijvend
-// doof — op ijzer gezien als de dode console-poort van 11-08.
+// The previous stack allocated by configuration rather than use: 2 MiB per
+// listener up front and 256 KiB per outgoing dial. On a 64 MiB HopOS target this
+// reproducibly caused an OOM after 151 seconds of download load. It also failed
+// to retransmit a lost FIN, allowing eight wedged closes to permanently fill an
+// eight-slot listener.
 //
-// leannet draait dat om. Er is één totale pot, Config.Budget: "hier heb je 2MB
-// (klein board) of 40MB (server), deel het zelf in." MaxBufPerConn is alleen
-// een optionele klem op het aandeel van één verbinding, geen tweede pot. Niets
-// wordt vooraf geclaimd; elke verbinding start met 16 KiB ontvangst- en 4 KiB
-// zendruimte en groeit op gemeten druk (een volle ontvangstring, of een Write
-// die niet past terwijl de peer meer venster biedt), standaard geklemd op
-// Budget/4 per verbinding en op wat de pot vrij heeft. Past zelfs de floor niet,
-// dan weigert de stack luid in plaats van stil te verhongeren.
+// leannet instead uses one total pool, Config.Budget. MaxBufPerConn only caps one
+// connection's share. Connections start with 16 KiB receive and 4 KiB transmit
+// buffers and grow under measured pressure, capped by Budget/4 by default and
+// by available capacity. If even the floor does not fit, the stack fails loudly.
 //
-// Retransmissie werkt op sequence-ruimte, niet op "data": SYN en FIN doen
-// gewoon mee en worden dus hergezonden. De klok in alle timer-contracten is
-// monotoon. Out-of-order ontvangst wordt in v1 niet gereassembleerd maar
-// gedropt met een directe dup-ACK, zodat de peer fast-retransmit kan doen.
+// Retransmission operates on sequence space, so SYN and FIN participate. All
+// timer contracts use a monotonic clock. V1 drops out-of-order data and sends an
+// immediate duplicate ACK so the peer can fast-retransmit.
 //
-// De motivering staat in het [ontwerpdossier]. De bevroren,
-// package-overstijgende scope en release-gate staan in de [KAM].
+// The rationale is in the [design document]. The frozen cross-package scope and
+// release gate are in the [KAM].
 //
-// [ontwerpdossier]: https://github.com/xinix00/lean/blob/main/leannet/DESIGN.md
+// [design document]: https://github.com/xinix00/lean/blob/main/leannet/DESIGN.md
 // [KAM]: https://github.com/xinix00/lean/blob/main/KAM.md
 package leannet

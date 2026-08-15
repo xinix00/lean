@@ -8,19 +8,11 @@ import (
 	"hash"
 )
 
-// De key schedule van TLS 1.3 (RFC 8446 §7.1). Dit is het hart van de
-// handshake en tegelijk het deel dat het makkelijkst stil fout gaat: één
-// verkeerd label of één transcript-hash op het verkeerde moment levert geen
-// foutmelding maar een sleutel die niet klopt, en dan faalt pas de Finished —
-// vier stappen verderop.
-//
-// Daarom staat het hier apart en wordt het los getoetst tegen de uitgewerkte
-// handshake van RFC 8448 (schedule_test.go). Alles hieronder is één-op-één de
-// tekst van de RFC; de commentaren noemen de paragraaf zodat je het naast
-// elkaar kunt leggen.
-//
-// Eén hash (SHA-256) en één AEAD (AES-128-GCM), dus alle maten zijn constant:
-// 32 bytes secret, 16 bytes sleutel, 12 bytes IV.
+// TLS 1.3 key schedule (RFC 8446 §7.1), isolated and tested against the worked
+// RFC 8448 handshake. A wrong label or transcript checkpoint silently derives
+// bad keys and surfaces only at Finished, so each step mirrors the RFC.
+// SHA-256 and AES-128-GCM fix sizes at a 32-byte secret, 16-byte key, and
+// 12-byte IV.
 
 const (
 	hashLen = sha256.Size // 32
@@ -30,13 +22,12 @@ const (
 
 func newHash() hash.Hash { return sha256.New() }
 
-// expandLabel is HKDF-Expand-Label uit §7.1:
+// expandLabel implements HKDF-Expand-Label from §7.1:
 //
 //	HkdfLabel = { uint16 length; opaque label<7..255>; opaque context<0..255> }
 //
-// met "tls13 " vóór elk label. De lengte zit ZOWEL in de info als in het
-// gevraagde aantal bytes; dat is geen redundantie in de RFC maar domain
-// separation, dus beide moeten kloppen.
+// with "tls13 " before each label. Length appears in both info and output size
+// for domain separation.
 func expandLabel(secret []byte, label string, ctx []byte, n int) []byte {
 	var b builder
 	b.u16(uint16(n))
@@ -44,21 +35,19 @@ func expandLabel(secret []byte, label string, ctx []byte, n int) []byte {
 	b.u8len(func() { b.bytes(ctx) })
 	out, err := hkdf.Expand(newHash, secret, string(b.buf), n)
 	if err != nil {
-		// Kan alleen bij een onmogelijke lengte (n > 255*hashLen) of een lege
-		// secret, en beide zijn hier programmeerfouten en geen netwerkdata.
+		// Only impossible lengths or empty secrets reach this programmer error.
 		panic("leantls: HKDF-Expand: " + err.Error())
 	}
 	return out
 }
 
-// deriveSecret is Derive-Secret uit §7.1: expandLabel over een transcript-hash.
+// deriveSecret implements §7.1 Derive-Secret over a transcript hash.
 func deriveSecret(secret []byte, label string, transcript []byte) []byte {
 	return expandLabel(secret, label, transcript, hashLen)
 }
 
-// extract is HKDF-Extract met de argumentvolgorde van de RFC-tekening (salt
-// boven, IKM van links). Go's hkdf.Extract neemt ze omgekeerd, en dat is
-// precies het soort verwisseling dat een sleutel stil verkeerd maakt.
+// extract preserves the RFC diagram's salt, IKM argument order while adapting
+// Go's reversed hkdf.Extract signature.
 func extract(salt, ikm []byte) []byte {
 	out, err := hkdf.Extract(newHash, ikm, salt)
 	if err != nil {
@@ -67,17 +56,17 @@ func extract(salt, ikm []byte) []byte {
 	return out
 }
 
-// secrets houdt de takken van de schedule vast die we nog nodig hebben.
+// secrets retains the schedule branches used later.
 type secrets struct {
 	handshake []byte // Handshake Secret
 	master    []byte // Master Secret
 }
 
-// zeros is de all-zero IKM/salt die de schedule op twee plekken voorschrijft.
+// zeros is the all-zero IKM/salt required at two schedule steps.
 var zeros = make([]byte, hashLen)
 
-// newSecrets zet de schedule op tot en met het Master Secret. shared is de
-// X25519-uitkomst; er is geen PSK, dus het Early Secret komt uit nullen.
+// newSecrets derives through Master Secret from the X25519 shared value. There
+// is no PSK, so Early Secret starts from zeros.
 //
 //	         0 -> HKDF-Extract = Early Secret
 //	Derive-Secret(., "derived", "") -> salt
@@ -91,21 +80,21 @@ func newSecrets(shared []byte) secrets {
 	return secrets{handshake: hs, master: master}
 }
 
-// emptyHash is Transcript-Hash("") — de context van de twee "derived"-stappen.
+// emptyHash is Transcript-Hash(""), used by both "derived" steps.
 func emptyHash() []byte {
 	h := newHash()
 	return h.Sum(nil)
 }
 
-// trafficKeys zijn de sleutel en de IV van één richting, plus het secret zelf
-// (dat hebben we nog nodig voor de Finished en voor een KeyUpdate).
+// trafficKeys contains one direction's key, IV, and secret retained for
+// Finished and KeyUpdate.
 type trafficKeys struct {
 	secret []byte
 	key    []byte
 	iv     []byte
 }
 
-// keysFrom leidt sleutel en IV af uit een traffic secret (§7.3).
+// keysFrom derives key and IV from a traffic secret (§7.3).
 func keysFrom(secret []byte) trafficKeys {
 	return trafficKeys{
 		secret: secret,
@@ -114,14 +103,12 @@ func keysFrom(secret []byte) trafficKeys {
 	}
 }
 
-// next is de sleutelwissel van een KeyUpdate (§7.2): het secret vernieuwt
-// zichzelf met het label "traffic upd" en daaruit komen nieuwe sleutels.
+// next applies the §7.2 KeyUpdate using the "traffic upd" label.
 func (t trafficKeys) next() trafficKeys {
 	return keysFrom(expandLabel(t.secret, "traffic upd", nil, hashLen))
 }
 
-// finishedData is de verify_data van een Finished-bericht (§4.4.4):
-// HMAC(finished_key, Transcript-Hash(alles tot en met het vorige bericht)).
+// finishedData returns §4.4.4 Finished verify_data over the prior transcript.
 func finishedData(baseSecret, transcript []byte) []byte {
 	fk := expandLabel(baseSecret, "finished", nil, hashLen)
 	m := hmac.New(newHash, fk)
@@ -129,11 +116,8 @@ func finishedData(baseSecret, transcript []byte) []byte {
 	return m.Sum(nil)
 }
 
-// certVerifyContent is wat er ONDER de handtekening van CertificateVerify zit
-// (§4.4.3): 64 spaties, een contextstring, een nulbyte, en dan de
-// transcript-hash. Die 64 spaties zijn er zodat een handtekening uit een ander
-// protocol nooit als TLS-handtekening kan gelden — dus ze zijn geen opvulling
-// en mogen niet weg.
+// certVerifyContent builds §4.4.3 CertificateVerify input. Its 64 spaces,
+// context, NUL, and transcript hash provide cross-protocol domain separation.
 func certVerifyContent(transcript []byte, server bool) []byte {
 	who := "client"
 	if server {
@@ -148,9 +132,8 @@ func certVerifyContent(transcript []byte, server bool) []byte {
 	return append(out, transcript...)
 }
 
-// nonce is de AEAD-nonce van record seq (§5.3): het 64-bits recordnummer
-// links met nullen opgevuld tot de IV-lengte, dan XOR met de IV. Het
-// recordnummer begint bij nul na élke sleutelwissel.
+// nonce derives the §5.3 AEAD nonce by zero-extending seq to IV length and
+// XORing the IV. Sequence restarts after each key update.
 func nonce(iv []byte, seq uint64) []byte {
 	out := make([]byte, len(iv))
 	binary.BigEndian.PutUint64(out[len(out)-8:], seq)

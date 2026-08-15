@@ -1,90 +1,72 @@
 package leannet
 
-// arp.go — de ARP-machine (RFC 826, alleen ethernet/IPv4). Puur zoals de rest
-// van het package: geen goroutines, geen klok — resolve/recv/emit krijgen een
-// monotone nanoseconde-tijd aangereikt. De stack-laag pompt: binnenkomende
-// ARP-payloads gaan naar recv, uitgaande pakketten komen uit emit (loop tot
-// ok=false), en een verzender pollt resolve tot hij een MAC heeft of via
-// noAnswer ziet dat de query luid is opgegeven.
+// arp.go implements the Ethernet/IPv4 ARP machine (RFC 826). It has no
+// goroutines or clock: callers pass monotonic nanoseconds to resolve, recv, and
+// emit. The stack pumps packets and polls resolve until it gets a MAC or
+// noAnswer reports an explicit failure.
 //
-// Geen callbacks, bewust. lneto's resolve-callback-vlag had een levenscyclus
-// die nergens eindigde (BEVINDINGEN #20: elke latere gratuitous reply
-// hervuurde de callback voor een adres dat niemand opnieuw vroeg). In het
-// poll-model bestaat die levenscyclus niet: er wordt geen vlag gezet, dus er
-// valt geen vlag te wissen — de vraagsteller haalt het antwoord zelf op.
+// Polling avoids callback lifecycle state; an earlier implementation repeatedly
+// fired stale callbacks on later gratuitous replies.
 //
-// De tabel is niet zelf-vergrendeld: de stack-laag houdt één lock over
-// resolve/recv/emit/seed — één mutex-regime, cache-mutaties altijd onder
-// hetzelfde slot als ingress (BEVINDINGEN #11, zelfde afspraak als ring.go).
+// The table is not internally locked; the stack lock covers every operation.
 
 import "time"
 
-// Tijd- en poging-constanten. Alle tijden zijn monotone nanoseconden.
+// Timing values use monotonic nanoseconds.
 const (
-	arpEntryTTL   = int64(120 * time.Second) // levensduur van een opgelost antwoord
-	arpRetryIval  = int64(time.Second)       // vaste tussenpoos tussen queries
-	arpQueryTries = 5                        // zoveel queries, dan luid opgeven
+	arpEntryTTL   = int64(120 * time.Second) // resolved-entry lifetime
+	arpRetryIval  = int64(time.Second)       // interval between queries
+	arpQueryTries = 5                        // attempts before explicit failure
 
-	// Een opgegeven query blijft even als "geen antwoord" staan: de wachtende
-	// verzender ziet de status (noAnswer) en een dode host wordt niet
-	// eindeloos bestookt. Daarna mag een verse resolve opnieuw beginnen.
+	// Keep a failed query briefly so waiters observe the failure and dead hosts
+	// are not queried continuously.
 	arpFailTTL = int64(5 * time.Second)
 
-	// Meer dan zoveel wachtende reply-antwoorden droppen we (met teller):
-	// een request-flood mag de tabel geen geheugen laten groeien.
+	// Bound queued replies so a request flood cannot grow memory indefinitely.
 	arpReplyQueueCap = 8
 
-	// arpCacheCap begrenst de hele tabel. Passief leren is gratis voor de
-	// afzender: een stroom frames met gespoofde bron-IP's (de transport-
-	// checksum is geen authenticatie) maakte anders per frame een entry — op
-	// een node van 64MB is een onbegrensde map een DoS (review 13-08,
-	// dertiende ronde). Een HOP-node praat met een handvol peers; 128 is daar
-	// ruim boven en kost hooguit ~15KB.
+	// Bound passive learning so spoofed source IPs cannot grow the map into a
+	// memory DoS. Real nodes use far fewer than 128 peers.
 	arpCacheCap = 128
 )
 
-// arpState — de drie levensfasen van een entry.
+// arpState represents an entry's lifecycle.
 type arpState uint8
 
 const (
-	arpPending  arpState = iota // query loopt, MAC nog onbekend
-	arpResolved                 // MAC bekend, verloopt op born+arpEntryTTL
-	arpFailed                   // luid opgegeven; negatieve cache tot born+arpFailTTL
+	arpPending  arpState = iota // query active; MAC unknown
+	arpResolved                 // MAC known until born+arpEntryTTL
+	arpFailed                   // negative cache until born+arpFailTTL
 )
 
-// arpEntry is de staat van één IP in de tabel.
+// arpEntry stores one IP's state.
 type arpEntry struct {
 	mac    [6]byte
 	state  arpState
-	static bool  // seed: verloopt nooit en wordt niet ververst
-	born   int64 // aanmaak/refresh (arpResolved) of moment van opgeven (arpFailed)
-	tries  int   // verzonden queries (arpPending)
-	due    int64 // volgende query-moment (arpPending)
+	static bool  // seeded entries never expire or refresh
+	born   int64 // resolution refresh or failure time
+	tries  int   // queries sent while pending
+	due    int64 // next query time while pending
 }
 
-// arpReply is een klaarstaand antwoord op een request voor ons IP.
+// arpReply is a queued response to a request for our IP.
 type arpReply struct {
 	hw [6]byte
 	ip [4]byte
 }
 
-// arpTable koppelt IPv4-adressen aan MAC's en drijft de query-cyclus.
+// arpTable maps IPv4 addresses to MACs and drives queries.
 type arpTable struct {
 	ourIP  [4]byte
 	ourMAC [6]byte
 
-	// Eén entry per IP, altijd: de map-sleutel ís de dedup. lneto's
-	// acquireNext maakte per racende resolver een verse entry aan en lekte
-	// de rest tot de cache vol zat (BEVINDINGEN #12); hier kán die toestand
-	// niet bestaan.
+	// The map key enforces one entry per IP, deduplicating concurrent resolvers.
 	entries map[[4]byte]*arpEntry
 
-	// Wachtende replies op requests voor ons IP; emit werkt ze af.
+	// emit drains replies to requests for our IP.
 	replies []arpReply
 
-	// Tellers voor de stack-laag (telemetrie/logregels; de machine zelf
-	// logt niet). Eén blok: Stats() kopieert hem in z'n geheel, dus een
-	// nieuwe teller reist vanzelf mee (review 13-08, achttiende ronde).
+	// Stats copies this block for telemetry; the machine itself does not log.
 	cnt ARPStats
 }
 
@@ -92,20 +74,13 @@ func newARPTable(ourIP [4]byte, ourMAC [6]byte) *arpTable {
 	return &arpTable{ourIP: ourIP, ourMAC: ourMAC, entries: make(map[[4]byte]*arpEntry)}
 }
 
-// tick werkt de tijdsafhankelijke staat van één entry bij: verlopen entries
-// (opgelost óf opgegeven) verdwijnen. false = de entry bestaat niet meer.
-// Het luide opgeven van een uitgeputte pending query zit bewust NIET hier
-// maar in emit — zie de pending-tak hieronder.
+// tick expires resolved and failed entries. Pending failure belongs exclusively
+// to emit because that pump also wakes waiters.
 func (t *arpTable) tick(ip [4]byte, e *arpEntry, now int64) bool {
 	switch e.state {
 	case arpPending:
-		// GEEN transitie hier: pending → failed doet UITSLUITEND de pomp
-		// (emit). Die transitie moet wachters wekken, en alleen drainLocked
-		// heeft daar het mechanisme voor (de GaveUp-delta-notify). tick draait
-		// óók op de losse consult-paden — resolve, noAnswer, de
-		// capaciteitssweep — en een transitie dáár viel buiten de
-		// tellerbaseline van de pomp: een deadline-loze wachter op hetzelfde
-		// IP werd dan nooit meer gewekt (review 13-08, tweeëndertigste ronde).
+		// Do not transition here: only emit runs inside drainLocked's GaveUp
+		// delta notification, which guarantees even deadline-free waiters wake.
 	case arpResolved:
 		if !e.static && now-e.born >= arpEntryTTL {
 			delete(t.entries, ip)
@@ -120,30 +95,20 @@ func (t *arpTable) tick(ip [4]byte, e *arpEntry, now int64) bool {
 	return true
 }
 
-// resolve geeft het MAC voor ip (ok=true) of zet een query in gang (ok=false);
-// emit verstuurt hem. Loopt er al een query voor ip, dan dedupt de aanroep
-// daarop: er komt géén tweede entry en géén extra pakket op de draad
-// (BEVINDINGEN #12). Na luid opgeven blijft resolve ok=false geven zónder een
-// nieuwe query te starten (negatieve cache); de wachtende verzender leest die
-// status via noAnswer en hoort dan te falen in plaats van eeuwig te pollen.
+// resolve returns a known MAC or starts one deduplicated query for ip. Failed
+// queries remain negative-cached briefly; waiters use noAnswer to fail.
 func (t *arpTable) resolve(ip [4]byte, now int64) (mac [6]byte, ok bool) {
 	if e, exists := t.entries[ip]; exists && t.tick(ip, e, now) {
 		if e.state == arpResolved {
 			return e.mac, true
 		}
-		return mac, false // pending of failed: geen nieuwe query
+		return mac, false // pending or failed; do not start another query
 	}
-	// Vol? Ruimte maken (sweep + verdringen tot het past): een actieve
-	// resolve (iemand wíl dit adres) gaat vóór bewaarde antwoorden die
-	// niemand vroeg. Ook dit pad is van buiten te triggeren (elke refuse-RST
-	// resolvet zijn bestemming), dus ook hier geldt de cap (review 13-08,
-	// dertiende ronde).
+	// Active resolution takes precedence over unrequested cached answers, but
+	// remains capped because external traffic can trigger it.
 	if !t.makeRoom(now) {
-		// Alles pending/statisch: er kán geen query starten. Dat is een
-		// EXPLICIETE fout, geen stille toestand: noAnswer geeft voor een IP
-		// zonder entry op een volle tabel true, zodat de wachter (dial,
-		// UDP-write) luid faalt in plaats van tot zijn deadline — of voor
-		// altijd — te slapen (review 13-08, eenendertigste ronde).
+		// A table full of pending/static entries cannot start a query. noAnswer
+		// reports this explicitly so callers do not sleep forever.
 		t.cnt.FullDrop++
 		return mac, false
 	}
@@ -151,12 +116,8 @@ func (t *arpTable) resolve(ip [4]byte, now int64) (mac [6]byte, ok bool) {
 	return mac, false
 }
 
-// makeRoom veegt en verdringt TOT er onder de cap ruimte is; false = vol met
-// onverdringbaar werk (pending/statisch). Een enkele verdringing was niet
-// genoeg zodra de tabel ooit BOVEN de cap stond (het seed-gat van de
-// vierendertigste ronde): resolve verdrong er één, bleef op de cap staan,
-// maar fullLocked zag nog een verdringbare entry en meldde dus ook geen fout
-// — geen query, geen fout, geen timer (review 13-08, vierendertigste ronde).
+// makeRoom expires and evicts entries until below the cap. It must loop because
+// seeded configurations can leave the table above the cap.
 func (t *arpTable) makeRoom(now int64) bool {
 	if len(t.entries) < arpCacheCap {
 		return true
@@ -170,21 +131,15 @@ func (t *arpTable) makeRoom(now int64) bool {
 	return true
 }
 
-// sweepExpired tikt élke entry, zodat verlopen exemplaren verdwijnen — voor
-// de cap-paden: eerst ruimte maken, dan pas verdringen of weigeren.
+// sweepExpired removes expired entries before eviction or refusal.
 func (t *arpTable) sweepExpired(now int64) {
 	for ip, e := range t.entries {
 		t.tick(ip, e, now)
 	}
 }
 
-// evictResolved verdringt een willekeurige opgeloste, niet-statische entry —
-// alleen die soort: pending draagt een lopende query van een échte vrager en
-// statisch is configuratie. Bewust niet de óudste zoeken: map-willekeur raakt
-// met een handvol echte buren op 128 plekken vrijwel zeker een spoof-entry,
-// en een echte peer die zijn plek verliest leert zichzelf bij zijn volgende
-// pakket gewoon terug (review 13-08, achttiende ronde). false = niets
-// verdringbaars.
+// evictResolved removes any non-static resolved entry. Pending work and static
+// configuration are not evictable; a real peer can be relearned on its next packet.
 func (t *arpTable) evictResolved() bool {
 	for ip, e := range t.entries {
 		if e.state == arpResolved && !e.static {
@@ -195,12 +150,8 @@ func (t *arpTable) evictResolved() bool {
 	return false
 }
 
-// peek geeft het MAC voor ip als dat al bekend is, zonder ooit een query te
-// starten. Voor best-effort-uitvoer (RST op een refuse, echo-reply): wie ons
-// net geldig aansprak is zojuist passief geleerd, dus in het legitieme geval
-// is het antwoord er altijd — en voor een gespoofde bron een actieve query
-// starten liet élke refuse-RST een echte cache-plek verdringen, tot de hele
-// tabel uit pending spoof-queries bestond (review 13-08, vijftiende ronde).
+// peek returns a known MAC without starting a query. Best-effort replies use it
+// so spoofed sources cannot turn each refused packet into a pending query.
 func (t *arpTable) peek(ip [4]byte, now int64) (mac [6]byte, ok bool) {
 	if e, exists := t.entries[ip]; exists && t.tick(ip, e, now) && e.state == arpResolved {
 		return e.mac, true
@@ -208,15 +159,10 @@ func (t *arpTable) peek(ip [4]byte, now int64) (mac [6]byte, ok bool) {
 	return mac, false
 }
 
-// noAnswer rapporteert of de query voor ip luid is opgegeven: arpQueryTries
-// pogingen zonder reply. Na arpFailTTL verdwijnt die status en mag resolve
-// opnieuw beginnen.
+// noAnswer reports query failure. The negative cache expires after arpFailTTL.
 //
-// Een IP ZONDER entry telt ook als "geen antwoord" wanneer de tabel vol staat
-// met onverdringbaar werk: resolve kon dan geen query starten (zie de cap daar)
-// en er komt dus nooit een arpFailed-entry waar deze toets op zou slaan — de
-// wachter sliep tot zijn deadline, of zonder deadline voor altijd
-// (review 13-08, eenendertigste ronde).
+// A missing entry also fails when non-evictable work fills the table, because
+// resolve could not create a query or a later arpFailed entry.
 func (t *arpTable) noAnswer(ip [4]byte, now int64) bool {
 	e, exists := t.entries[ip]
 	if !exists {
@@ -225,12 +171,8 @@ func (t *arpTable) noAnswer(ip [4]byte, now int64) bool {
 	return t.tick(ip, e, now) && e.state == arpFailed
 }
 
-// fullLocked: resolve zou géén query kunnen starten — precies makeRooms
-// mislukking, gespiegeld: na de sweep moet het aantal ONverdringbare entries
-// (pending/statisch) de cap vullen. Alleen "is er iets verdringbaars" toetsen
-// was te zwak zodra de tabel boven de cap stond: één verdringbare entry op
-// 129 laat resolve nog steeds vol achter (review 13-08, vierendertigste
-// ronde).
+// fullLocked mirrors makeRoom failure: after expiry, non-evictable entries fill
+// the cap. Counting matters when seeded configuration puts the table over cap.
 func (t *arpTable) fullLocked(now int64) bool {
 	if len(t.entries) < arpCacheCap {
 		return false
@@ -245,48 +187,30 @@ func (t *arpTable) fullLocked(now int64) bool {
 	return len(t.entries)-evictable >= arpCacheCap
 }
 
-// seed zet een statische entry: lost meteen op en verloopt nooit. Eén entry
-// per IP blijft gelden — een bestaande entry (pending, opgelost of opgegeven)
-// wordt vervangen. wokePending=true zegt dat er een PENDING query verving:
-// de wachter daarop moet gewekt worden (stack-laag: notify), want de query —
-// en daarmee zijn timer in nextDeadline — bestaat nu niet meer en niemand
-// anders wekt hem ooit nog (review 13-08, vierendertigste ronde).
+// seed installs a static, non-expiring entry, replacing any previous state.
+// wokePending tells the stack to wake waiters whose query and timer vanished.
 //
-// LET OP (BEVINDINGEN #21): de subnet-check is de zorg van de stack-laag.
-// Deze tabel kent geen subnet en accepteert élk IP. Wie hier een seed buiten
-// het eigen subnet in zet terwijl de routelaag zulke adressen nooit via ARP
-// oplost, krijgt lneto's halve werking terug: de seed lijkt te bestaan maar
-// wordt nooit geraadpleegd. De stack-laag hoort buiten-subnet-seeds te
-// weigeren, luid.
+// The stack must reject off-subnet seeds; this table does not know the subnet.
 func (t *arpTable) seed(ip [4]byte, mac [6]byte) (wokePending bool) {
 	old, exists := t.entries[ip]
 	t.entries[ip] = &arpEntry{mac: mac, state: arpResolved, static: true}
 	return exists && old.state == arpPending
 }
 
-// learn is het passieve pad: de stack-laag meldt (src-IP, src-MAC) van
-// unicast-IPv4-frames die aan óns gericht waren. Zonder dit kent een listener
-// zijn same-subnet-bellers alleen via een extra ARP-rondje (go-net loste dat
-// met PassivePeers op). Strikter dan lneto's learnPassive: passief leren mag
-// een entry AANMAKEN en zijn TTL verversen, maar nooit het MAC van een
-// bestaande entry wijzigen — een MAC-wissel vergt een echte ARP-uitwisseling
-// (recv). Zo kan een gespoofd data-frame nooit een gevestigde (gateway-)entry
-// omleiden.
+// learn passively records unicast IPv4 sources addressed to us. It may create
+// or refresh an entry but never change an existing MAC; that requires ARP recv,
+// preventing spoofed data frames from redirecting an established gateway entry.
 //
-// wokePending=true: een PENDING query is zojuist passief opgelost — de
-// stack-laag moet dan notify'en, want het pakket zelf kan hierna nog op een
-// early-return-pad sterven (UDP zonder poort) en dan wekte niets de wachter
-// op deze route meer (review 13-08, vierendertigste ronde).
+// wokePending tells the stack to notify a waiter even if later packet handling
+// returns early.
 func (t *arpTable) learn(ip [4]byte, mac [6]byte, now int64) (wokePending bool) {
 	if ip == t.ourIP {
 		return false
 	}
 	e, exists := t.entries[ip]
 	if !exists || !t.tick(ip, e, now) {
-		// Passief leren verdringt níets: vol is vol (na een sweep), en de
-		// weigering telt. Een échte peer verliest daar alleen de gratis
-		// cache-plek — zijn verkeer werkt gewoon, via de ARP-molen
-		// (review 13-08, dertiende ronde).
+		// Passive learning never evicts. A real peer merely loses the shortcut
+		// and can still resolve through ARP.
 		if len(t.entries) >= arpCacheCap {
 			t.sweepExpired(now)
 			if len(t.entries) >= arpCacheCap {
@@ -299,24 +223,20 @@ func (t *arpTable) learn(ip [4]byte, mac [6]byte, now int64) (wokePending bool) 
 	}
 	switch {
 	case e.state == arpPending:
-		// Het antwoord kwam als dataverkeer vóór (of in plaats van) de reply.
+		// Data traffic arrived before or instead of the ARP reply.
 		e.state = arpResolved
 		e.mac = mac
 		e.born = now
 		return true
 	case e.state == arpResolved && !e.static && e.mac == mac:
-		e.born = now // zelfde MAC: alleen de TTL verversen
+		e.born = now // same MAC: refresh only the TTL
 	}
 	return false
 }
 
-// recv verwerkt één binnengekomen ARP-payload (al gevalideerd door ParseARP).
-// De harde regel (BEVINDINGEN #8): nieuwe entries ontstaan UITSLUITEND uit
-// een aan ons gerichte reply op een eigen, nog-pending query. Al het andere —
-// requests, gratuitous announcements, andermans verkeer — ververst hoogstens
-// een bestáánde opgeloste entry. Een broadcast-reply kan hier dus nooit een
-// cache-plek veroveren; lneto accepteerde die onvoorwaardelijk en dat is
-// klassieke ARP-poisoning op de gateway-entry.
+// recv processes a validated ARP payload. Only a reply addressed to us for a
+// pending query may create resolution state. Requests, gratuitous announcements,
+// and third-party traffic can only refresh an existing resolved entry.
 func (t *arpTable) recv(f ARPFrame, now int64) {
 	sender := [4]byte(f.SenderProto())
 	target := [4]byte(f.TargetProto())
@@ -325,7 +245,7 @@ func (t *arpTable) recv(f ARPFrame, now int64) {
 
 	switch f.Op() {
 	case ARPRequest:
-		// Vraagt de peer óns adres? Reply klaarzetten; emit verstuurt hem.
+		// Queue a response when the peer asks for our address.
 		if target == t.ourIP && sender != t.ourIP {
 			if len(t.replies) >= arpReplyQueueCap {
 				t.cnt.ReplyDrop++
@@ -333,16 +253,13 @@ func (t *arpTable) recv(f ARPFrame, now int64) {
 				t.replies = append(t.replies, arpReply{hw: senderHW, ip: sender})
 			}
 		}
-		// Sender-info uit een request (ook een gratuitous request) ververst
-		// hoogstens een bestaande entry; een pending query lost er bewust
-		// niet mee op — dat doet alleen een aan ons gerichte reply.
+		// Request sender data may only refresh an existing entry; it cannot
+		// resolve a pending query.
 		t.refresh(sender, senderHW, now)
 	case ARPReply:
 		switch {
 		case target == t.ourIP:
-			// Aan ons gericht: lost onze pending query op, of ververst een
-			// bestaande entry. Zonder pending query en zonder entry doet
-			// zelfs een aan ons gerichte reply niets (#8).
+			// A reply to us resolves a pending query or refreshes an entry.
 			if e, exists := t.entries[sender]; exists && t.tick(sender, e, now) && e.state == arpPending {
 				e.state = arpResolved
 				e.mac = senderHW
@@ -351,21 +268,18 @@ func (t *arpTable) recv(f ARPFrame, now int64) {
 			}
 			t.refresh(sender, senderHW, now)
 		case target == sender:
-			// Gratuitous: een host kondigt zijn eigen adres aan. Alleen
-			// verversen, nooit aanmaken (#8); een MAC-wissel telt mee zodat
-			// de stack-laag er een logregel aan kan hangen.
+			// Gratuitous replies refresh but never create entries. Count MAC
+			// changes for stack-level logging.
 			t.refresh(sender, senderHW, now)
 		default:
-			// Niet aan ons gericht en niet gratuitous: negeren. Dit is de
-			// poisoning-vorm — een (broadcast-)reply voor andermans gesprek.
+			// Ignore replies for someone else's exchange; accepting them enables
+			// broadcast ARP poisoning.
 			t.cnt.Ignored++
 		}
 	}
 }
 
-// refresh zet een nieuw MAC en een verse TTL op een bestaande, opgeloste
-// entry. Onbekende IP's maken hier bewust niets aan (#8) en statische seeds
-// blijven staan.
+// refresh updates an existing non-static resolved entry; it never creates one.
 func (t *arpTable) refresh(ip [4]byte, mac [6]byte, now int64) {
 	e, exists := t.entries[ip]
 	if !exists || !t.tick(ip, e, now) || e.state != arpResolved || e.static {
@@ -378,12 +292,9 @@ func (t *arpTable) refresh(ip [4]byte, mac [6]byte, now int64) {
 	e.born = now
 }
 
-// emit schrijft één uitgaand ARP-pakket in buf: eerst wachtende replies, dan
-// pending queries die aan een (re)try toe zijn. De aanroeper loopt tot
-// ok=false en wikkelt elk pakket zelf in ethernet: op=ARPReply gaat unicast
-// naar het TargetHW-veld, op=ARPRequest gaat broadcast. buf moet minstens
-// sizeARP bytes dragen; korter is een aanroeperfout en panict, zoals elke
-// boekhoudfout in dit package.
+// emit writes one queued reply or due query. The caller loops until false and
+// wraps replies in unicast Ethernet and requests in broadcast Ethernet. A short
+// buffer is a caller-accounting bug and panics.
 func (t *arpTable) emit(buf []byte, now int64) (n int, ok bool) {
 	if len(t.replies) > 0 {
 		r := t.replies[0]
@@ -396,9 +307,7 @@ func (t *arpTable) emit(buf []byte, now int64) (n int, ok bool) {
 			continue
 		}
 		if e.tries >= arpQueryTries {
-			// Luid opgeven — de ENE plek (zie tick): dit loopt altijd binnen
-			// de tellerbaseline van drainLocked, dus de GaveUp-delta wekt
-			// gegarandeerd álle wachters op dit IP.
+			// Fail only here so drainLocked's GaveUp delta wakes every waiter.
 			e.state = arpFailed
 			e.born = now
 			t.cnt.GaveUp++
@@ -411,7 +320,7 @@ func (t *arpTable) emit(buf []byte, now int64) (n int, ok bool) {
 	return 0, false
 }
 
-// putARP is de gedeelde schrijver: de sender is altijd wijzelf.
+// putARP writes a packet whose sender is always this host.
 func (t *arpTable) putARP(buf []byte, op uint16, targetHW [6]byte, targetIP [4]byte) (int, bool) {
 	n, err := PutARP(buf, op, t.ourMAC, t.ourIP, targetHW, targetIP)
 	if err != nil {

@@ -1,281 +1,255 @@
 # TODO — lean
 
-Wat er nog moet, per pakket. De regel voor nieuwe pakketten staat in
-[README.md](README.md); de regel voor nieuwe features in een bestaand pakket is
-dezelfde: een meting die aantoont dat de afwezigheid iets kost.
+Outstanding work by package. [README.md](README.md) defines the rule for new
+packages; new features in existing packages follow the same rule: a measurement
+must show that their absence has a cost.
 
-## leannet — af, maar niet op ijzer geweest
+## leannet — complete, but not tested on hardware
 
-Gebouwd 11/12-08-2026 als vervanger van lneto+go-net in HopOS. Ontwerp,
-afwegingen en de lijst met bewust-niet-gebouwd:
-[leannet/DESIGN.md](leannet/DESIGN.md).
+Built on 2026-08-11/12 to replace lneto+go-net in HopOS. See
+[leannet/DESIGN.md](leannet/DESIGN.md) for the design, trade-offs, and deliberate
+omissions.
 
-Stand: de volledige tests en `-race` zijn groen; de stack compileert onder de
-tamago-toolchain (riscv64 + arm64). HopOS draait er volledig op in QEMU (agent
-+ leader, SNTP, DNS, TLS-download van GitHub, slot-demo 20/20 markers, 200×
-verbindings-churn schoon, 8 vastgehouden verbindingen + verse = 200).
+Status: the full test suite, including `-race`, passes; the stack compiles with
+the tamago toolchain for riscv64 and arm64. HopOS runs entirely on it in QEMU
+(agent + leader, SNTP, DNS, a TLS download from GitHub, 20/20 slot-demo markers,
+200 clean connection churn cycles, and 8 held connections plus a fresh one 200
+times).
 
-**Flaky test GEFIXT 12-08.** `TestStackBudgetRecovery` viel één keer om in een
-volledige `-race`-run (assertie, géén DATA RACE). Oorzaak: de server sloot zijn
-verbinding meteen na Accept, dus "is het slot nog bezet?" hing aan de vraag of
-TIME-WAIT (~1s) al verstreken was vóór de tweede dial — onder de race-detector
-is alles langzamer. De server houdt de verbinding nu vast tot de test hem
-vrijgeeft: geen tijdafhankelijkheid meer. 6× `-race` in isolatie en 2× de hele
-suite met `-race` groen.
+**Flaky test fixed on 2026-08-12.** `TestStackBudgetRecovery` failed once during
+a full `-race` run (an assertion, not a data race). The server closed immediately
+after Accept, so whether the slot was still occupied depended on TIME-WAIT
+(~1 s) expiring before the second dial. The race detector made that timing more
+likely. The server now holds the connection until the test releases it. Six
+isolated `-race` runs and two full `-race` runs passed.
 
-**Na v0.2.0 gebouwd (12-08) — twee gaten die het ijzer vond:**
+**Built after v0.2.0 (2026-08-12) — two gaps found by hardware:**
 
-- [x] **Zelf-verkeer (loopback).** Een wereld kon niet bij zichzelf: een dial
-      naar het eigen IP vroeg op de draad "who has mijzelf", en dat antwoordt
-      niemand (een switch floodt naar iedereen BEHALVE de bron), dus kwam er na
-      vijf pogingen `no route to host`. Op ijzer stond cloudflared na een
-      rolling update op het slot-IP dat zijn eigen config als origin noemde en
-      wees die fout vijf lagen weg van de oorzaak. Nu: `routeLocked` geeft voor
-      het eigen adres de eigen MAC, `sendEthLocked` legt zulke frames in een
-      loopback-wachtrij, en de pomp voert ze door dezelfde ingress-demux
-      (`ingressLocked`). Werkt voor TCP en UDP; drie regressietests.
-- [x] **RST voor een dichte poort** (RFC 9293 §3.10.7.1). Die ontbrak
-      volledig: élke dial naar een poort waar niets luistert zat zijn deadline
-      uit in plaats van meteen "connection refused" te krijgen — voor een
-      health-check of een net verhuisd origin is dat het verschil tussen zoeken
-      en weten. Een RST lokt nooit een RST uit (storm-test).
+- [x] **Self-traffic (loopback).** A world could not reach itself. Dialing its
+      own IP sent an ARP request for itself, but a switch floods to every port
+      except the source, so five attempts ended in `no route to host`. On
+      hardware, cloudflared used the slot IP as its own origin after a rolling
+      update, hiding the cause five layers away. `routeLocked` now returns the
+      local MAC for the local IP, `sendEthLocked` queues those frames for
+      loopback, and the pump passes them through the normal ingress demux
+      (`ingressLocked`). Covered for TCP and UDP by three regression tests.
+- [x] **RST for a closed port** (RFC 9293 §3.10.7.1). Previously every dial to
+      an unused port waited for its deadline instead of returning
+      `connection refused`. An RST never elicits another RST; the storm case is
+      tested.
 
-**Na v0.3.0 gebouwd (12-08):**
+**Built after v0.3.0 (2026-08-12):**
 
-- [x] **Broadcast de deur uit.** De routelaag deed er iets stils-fouts mee:
-      255.255.255.255 valt buiten élk subnet, dus ging het als *unicast* naar de
-      gateway (die het terecht negeert), en een subnet-gericht adres (x.x.x.255)
-      ging de ARP-molen in naar een adres dat niemand bezit — vijf pogingen, dan
-      "no route to host". Nu gaan beide naar `ff:ff:ff:ff:ff:ff` zonder ARP. De
-      klant is de DHCP-rebind hieronder; zonder deze regel bestond die fase
-      alleen op papier. Inkomende broadcast blijft dicht, met de reden in
-      DESIGN.md.
+- [x] **Outbound broadcast.** Limited broadcast (`255.255.255.255`) used to go
+      to the gateway as unicast, while subnet-directed broadcast entered ARP
+      for an address no host owns. Both now use `ff:ff:ff:ff:ff:ff` without
+      ARP. DHCP rebinding needs this path. Inbound broadcast remains disabled;
+      DESIGN.md explains why.
 
-**Eerst, en het is de enige echte open vraag:**
+**First, and the only material open question:**
 
-- [ ] **Op ijzer verifiëren.** LicheeRV Nano (RISC-V, 100Mbit dwmac) en Radxa
-      Zero 3E. De lat, gemeten met de vorige stack: RX ≥ 8,84 MB/s zonder
-      drops, en voorbij de 250s-grens blijven leven. QEMU kan dit niet
-      beantwoorden: slirp termineert TCP op de host, dus de guest-RTT is altijd
-      microseconden — venstergedrag en de echte DMA-keten meet je alleen daar.
-- [ ] **netmeter-A/B**: dezelfde bank die de vorige twee wissels beoordeelde
-      (hop-os `metal/cmd/netmeter`). Cijfers naast de lneto-getallen leggen:
-      RX/TX-plafond, allocaties per fase, GC-druk.
-- [ ] **De OOM-reproductie moet overleven**: HOP-raam van 64MB + SSE-last op
-      `/v1/events`. Dat scenario doodde de vorige stack binnen 151s door
-      buffer-preallocatie; het budgetmodel hoort er onverstoorbaar door te
-      komen. Daarna kan de GOGC-25-pleister in HopOS' `cpu/memlimit` mogelijk
-      terug naar Go's ~10%-richtlijn — óók meten.
+- [ ] **Verify on hardware.** Test a LicheeRV Nano (RISC-V, 100 Mbit dwmac) and
+      Radxa Zero 3E. The previous stack set the bar at RX ≥ 8.84 MB/s without
+      drops and survival past 250 seconds. QEMU cannot answer this: slirp
+      terminates TCP on the host, giving the guest microsecond RTTs and hiding
+      real window and DMA-chain behavior.
+- [ ] **Run a netmeter A/B** using the bench that judged the previous two stack
+      changes (`hop-os/metal/cmd/netmeter`). Compare RX/TX ceilings,
+      allocations per phase, and GC pressure with lneto.
+- [ ] **Survive the OOM reproducer:** a 64 MB HOP window plus SSE load on
+      `/v1/events`. Buffer preallocation killed the previous stack within 151 s;
+      the budget model should remain stable. Then measure whether HopOS
+      `cpu/memlimit` can move from its GOGC-25 workaround toward Go's ~10%
+      guidance.
 
-**Daarna, in deze volgorde:**
+**Then, in order:**
 
-- [ ] Doorvoer-profiel per laag op ijzer: waar gaat de tijd heen (checksum,
-      kopie, demux)? De bank heeft de tellers al; leannet mag er tellers bij
-      krijgen als ze buiten het datapad blijven.
-- [ ] Opwarmcurve meten op een echt WAN-pad: verdubbelen-per-vol kost
-      `log2(cap/floor)` RTT's. Als een download daardoor meetbaar later op
-      volle snelheid komt, is gVisors RTT-schatter de verfijning (de naad is
-      er: beide groeibeslissingen lopen door één `growRing`).
-- [ ] `TIME-WAIT` is nu 1s en een constante. Configureerbaar maken zodra een
-      omgeving het vraagt (2MSL van 4 minuten past niet op een embedded node,
-      maar 1s is een keuze zonder meting).
-- [x] `Stats()` geeft de tellers als structkopie onder het stack-slot terug;
-      callers hoeven exported velden niet racegevoelig mee te lezen.
+- [ ] Profile throughput by layer on hardware: checksum, copies, and demux. The
+      bench already has counters; leannet may add more if they stay off the data
+      path.
+- [ ] Measure warm-up on a real WAN path. Doubling whenever full costs
+      `log2(cap/floor)` RTTs. If this measurably delays full throughput, refine
+      it with gVisor's RTT estimator; both growth decisions already pass through
+      `growRing`.
+- [ ] Make the current 1 s `TIME-WAIT` constant configurable when an environment
+      requires it. A four-minute 2MSL does not fit an embedded node, but 1 s is
+      still an unmeasured choice.
+- [x] `Stats()` returns a struct copy while holding the stack lock, avoiding
+      racy reads of exported counters.
 
-**Bewust niet op deze lijst** (zie DESIGN.md voor de reden per punt):
-congestion control, out-of-order reassembly/SACK, IPv6/NDP,
-IPv4-fragmentatie, TCP timestamps/PAWS, Nagle, SYN-cookies, logging in de
-stack, een tweede globale bufferpot.
+**Deliberately absent** (see DESIGN.md): congestion control, out-of-order
+reassembly/SACK, IPv6/NDP, IPv4 fragmentation, TCP timestamps/PAWS, Nagle,
+SYN cookies, stack logging, and a second global buffer pool.
 
-## leanhttp — uitgebreid 12-08 zodat een browser hem kan gebruiken
+## leanhttp — extended on 2026-08-12 for browser basics
 
-Dereks vraag: kunnen de basis-delen die een browser nodig heeft er wél in, in
-plaats van dat de volgende gebruiker naar net/http grijpt (en 3,2 MB betaalt)?
-Ja, en het legde onderweg een echte bug bloot.
+The question was whether the browser basics belong here, so the next caller
+does not have to import net/http and pay 3.2 MB. They do, and adding them exposed
+a real bug.
 
-- [x] **Call.DialContext** — één algemene, annuleerbare dialer-naad (proxy,
-      unix-socket, testdubbel, TLS). Zonder deze naad is https onmogelijk
-      zonder TLS in dit pakket te linken; mét de naad blijft het pakket
-      TLS-vrij en knoopt de aanroeper de twee (leanhttps doet dat).
-- [x] **Client met keep-alive** — een pool per host. De veiligheidsregel is
-      één: een verbinding gaat alleen terug als de body TOT HET EINDE gelezen
-      is, want anders leest het volgende verzoek de staart van dit antwoord als
-      zijn statusregel. Getest met een verbindingsteller (10 verzoeken → 1
-      verbinding; halve bodies → 3 verbindingen, geen desync).
-- [x] **gzip doorlaatbaar** — Accept-Encoding is nu van de aanroeper (default
-      blijft identity) en Response.Encoding zegt wat er terugkwam. compress/gzip
-      blijft dus buiten dit pakket: wie het wil, wikkelt Body zelf.
-- [x] **Response.SetCookie, ongevouwen — dit was een BUG.** Herhaalde headers
-      werden tot één komma-lijst gevouwen (RFC 9110 §5.3, correct), maar
-      Set-Cookie is dé uitzondering: cookie-waarden en Expires-datums bevatten
-      zelf komma's, dus gevouwen is de lijst niet meer te splitsen. Wie cookies
-      las kreeg er één waar er twee stonden — en dat merk je pas als een login
-      niet blijft plakken. Nu apart en per regel.
-- [x] **GetCall** — Get met de rest van de Call erbij (headers, termijn,
-      DialContext), zoals Do dat voor Get al was.
-- [x] **De clientkant kent de bodyless-regel voor 204/304.** Gevonden door
-      leans3: een S3-DELETE en een hoplockserver-DELETE bleven zonder die regel
-      op een keep-alive-verbinding wachten op een body die nooit kon komen.
-      `leanhttp` behandelt beide nu centraal als bodyloos; een 304 behoudt zijn
-      eventuele informatieve Content-Length.
+- [x] **`Call.DialContext`** — one general, cancellable dialer seam for proxies,
+      Unix sockets, test doubles, and TLS. This keeps TLS out of the package;
+      callers such as leanhttps compose the two.
+- [x] **Keep-alive client** — one pool per host. A connection returns to the
+      pool only after its body is read to EOF; otherwise the next request would
+      parse the previous response tail as its status line. Tests cover ten
+      requests over one connection and partial bodies without desynchronizing.
+- [x] **Transparent gzip** — callers control `Accept-Encoding` (default:
+      `identity`), and `Response.Encoding` reports the result. `compress/gzip`
+      stays outside; callers can wrap `Body` themselves.
+- [x] **Unfolded `Response.SetCookie` — bug fix.** Repeated headers normally
+      fold into a comma-separated list (RFC 9110 §5.3), but Set-Cookie is the
+      exception because cookie values and Expires dates can contain commas. It
+      is now preserved one value per field line.
+- [x] **`GetCall`** — Get plus the remaining `Call` controls: headers, deadline,
+      and `DialContext`, matching what `Do` already provided.
+- [x] **Bodyless 204/304 client handling.** An S3 DELETE and a hoplockserver
+      DELETE exposed clients waiting on a keep-alive connection for a body that
+      cannot arrive. `leanhttp` handles both centrally; 304 retains an optional
+      informational Content-Length.
 
-## leans3 (nieuw 12-08)
+## leans3 (new on 2026-08-12)
 
-Verhuisd uit hoplock/s3, en de reden was een dubbeling: er stonden twee eigen
-SigV4's in één stapel (`hoplock/s3/sigv4.go` volledig, `hop
-internal/runner/download_s3.go` alleen-GET en zonder URI-escaping). De
-signeercode zelf is niet nieuw — hij heeft tegen AWS, R2, MinIO en Hetzner/Ceph
-RGW gelopen — maar hij staat hier voor het eerst als blok.
+Moved from hoplock/s3 because one stack contained two custom SigV4
+implementations: complete `hoplock/s3/sigv4.go` and GET-only,
+non-URI-escaping `hop/internal/runner/download_s3.go`. The signer already ran
+against AWS, R2, MinIO, and Hetzner/Ceph RGW; this is its first standalone home.
 
-- [ ] **hop's tweede signeerder opruimen.** `internal/runner/download_s3.go` kan
-      `leans3` gebruiken (of alleen zijn signeerder): dat haalt de zwakkere kopie
-      weg, en daarmee de klasse fouten die hij nu heeft — een key met een spatie
-      of een '+' signeert fout, geen sessietoken, alleen virtual-hosted. Alleen
-      vastgesteld, nog niet gedaan.
-- [ ] **De meting staat, maar op een HOST.** 5,68 → 3,95 MB voor dezelfde
-      getekende https-GET (darwin/arm64, `-ldflags=-w`); wat het in een
-      tamago-image doet is nog niet gemeten, want daarvoor moet er een board
-      onder de link staan. Verwachting: hetzelfde bedrag, want het is dezelfde
-      1,73 MB die x509verify op riscv64 meet.
-- [ ] **Niet op ijzer geweest** in deze vorm. hoplock/s3 en HopOS bouwen erop en
-      de host-tests zijn groen, maar sinds de verhuizing heeft er geen echte
-      provider aan de andere kant gestaan.
-- [x] **`encoding/xml` eruit** (12-08). Het antwoord op een LIST is XML en dit
-      pakket leest er drie velden uit; die decoder kostte 39.256 bytes symbolen
-      en 85.681 bytes image (kern, arm64) voor een reflectie-gedreven tokenmodel
-      met namespaces. `listparse.go` doet het in één pas, matcht op lokale
-      elementnaam én positie (`Key` onder `Contents`, niet die in
-      `CommonPrefixes`), en kent de vijf entiteiten plus de numerieke. De testen
-      leggen elk antwoord naast `encoding/xml` — inclusief élk afkap-punt van een
-      echt MinIO-antwoord, want een afgekapte pagina die op een complete lijkt is
-      de ene fout die keys kost.
-**Bewust niet:** streaming signatures
-(STREAMING-AWS4-HMAC-SHA256-PAYLOAD), multipart upload, presigned URL's,
-sigv4a, credentials uit IMDS/IAM en HEAD/CopyObject. Voor dat laatste is
-`Client.URLFor` de naad: wie een operatie nodig heeft die hier niet in zit,
-signeert hem zelf op de juiste URL in plaats van de adresseringsstijl na te
-bouwen.
+- [ ] **Remove hop's second signer.** `internal/runner/download_s3.go` can use
+      `leans3` or only its signer. That removes the weaker copy: keys containing
+      spaces or `+` sign incorrectly, it lacks session tokens, and it only
+      supports virtual-hosted addressing. Identified, not implemented.
+- [ ] **Repeat the measurement in a tamago image.** The same signed HTTPS GET
+      shrank from 5.68 to 3.95 MB on darwin/arm64 with `-ldflags=-w`. The
+      expected hardware saving is the same 1.73 MB measured for x509verify on
+      riscv64, but linking a board-specific image is required to prove it.
+- [ ] **Exercise this form against real hardware and a provider.** hoplock/s3
+      and HopOS build on it and host tests pass, but neither has been done since
+      the move.
+- [x] **Removed `encoding/xml`** (2026-08-12). LIST responses need only three
+      fields, while that decoder added 39,256 bytes of symbols and 85,681 image
+      bytes to an arm64 kernel. `listparse.go` makes one pass, matches local
+      element name and position (`Contents/Key`, not `CommonPrefixes/Key`), and
+      supports the five named entities plus numeric entities. Tests compare it
+      with `encoding/xml`, including every truncation point in a real MinIO
+      response so an incomplete page can never look complete.
 
-## leanelf (nieuw 12-08)
+**Deliberately absent:** streaming signatures
+(`STREAMING-AWS4-HMAC-SHA256-PAYLOAD`), multipart upload, presigned URLs,
+SigV4a, IMDS/IAM credentials, HEAD, and CopyObject. `Client.URLFor` is the seam
+for callers that need another operation without reimplementing addressing.
 
-Gebouwd omdat `hop-os/metal/abi/place` de énige importeur van `debug/elf` in de
-kern was, en dat pakket `debug/dwarf` + `internal/zstd` + `compress/zlib`
-meebracht voor gecomprimeerde debug-secties die een loader nooit leest. Meting
-staat in de pakket-doc: 166.397 bytes minder image, zelfde plaatsing.
+## leanelf (new on 2026-08-12)
 
-- [x] Kruisgetest tégen `debug/elf`: de testen bouwen ELF64's en eisen dat beide
-      hetzelfde zeggen over segmenten, symbolen en machine. Wijkt het af op een
-      geldig image, dan is dit pakket fout.
-- [x] `Lookup` in plaats van een volledige symbooldump: `place` zoekt vijf namen,
-      en een app-image draagt tienduizenden symbolen. Geen enkele string wordt
-      gebouwd voor een naam die niemand vroeg.
-- [ ] **Niet op ijzer geweest.** De QEMU-gate plaatst er images mee (host-tests
-      van `abi/place` groen, kern boot), maar een echt board heeft er nog geen
-      image mee geplaatst.
-**Bewust niet:** 32-bit, big-endian, secties op naam, relocaties, DWARF en een
-volledige symbooldump. Ze worden luid geweigerd. Wie er één nodig heeft, voegt
-hem toe mét de meting die aantoont dat de afwezigheid iets kost — precies zoals
-dit pakket zelf ontstond.
+Built because `hop-os/metal/abi/place` was the kernel's only `debug/elf`
+importer, pulling in `debug/dwarf`, `internal/zstd`, and `compress/zlib` for
+compressed debug sections a loader never reads. The package docs record a
+166,397-byte image reduction with identical placement.
 
-## leanrand (nieuw 12-08)
+- [x] Cross-checked against `debug/elf`: tests build ELF64 files and require
+      identical segment, symbol, and machine results for valid inputs.
+- [x] `Lookup` replaces a complete symbol dump. `place` seeks five names in an
+      app image containing tens of thousands, so no unrequested name string is
+      allocated.
+- [ ] **Test on hardware.** The QEMU gate places images with it (passing
+      `abi/place` host tests and booting the kernel), but no real board has yet.
 
-Vervangt `github.com/google/uuid` in hop: dat kostte 3,8 KB symbolen én sleepte
-`database/sql/driver` de kern in (het implementeert `sql.Scanner`) voor twee
-aanroepen `uuid.New().String()`, waarvan één afgekapt op acht tekens.
+**Deliberately absent:** 32-bit, big-endian, sections by name, relocations,
+DWARF, and a complete symbol dump. These fail loudly. Add one only with a
+measurement showing that its absence costs something.
 
-- [x] `N` doet rejection sampling in plaats van `%`: geen bias, ook bij een
-      grens net boven 2⁶³ (getest over het hele bereik).
-- [x] `Read` heeft geen foutwaarde. `crypto/rand.Read` faalt niet meer (Go's
-      eigen doc), dus élke `if err != nil` erop is een ongeteste tak; hier is
-      het een panic, want een node zonder entropie heeft geen zinnig vervolg.
-- [x] `Jitter` erbij omdat hop's herstart-backoff exact 1, 2, 4, 8 seconden
-      wachtte: honderd nodes proberen dan precies gelijk opnieuw.
-**Bewust niet:** een eigen generator, een seed, een reproduceerbare stroom voor
-testen (die hoort in de test), en een UUID-formaat — 36 tekens om 16 bytes te
-schrijven, waarvan wij de structuur nergens lezen.
+## leanrand (new on 2026-08-12)
 
-## leancookie (nieuw 12-08)
+Replaces `github.com/google/uuid` in hop. Two calls to `uuid.New().String()`,
+one truncated to eight characters, cost 3.8 KB of symbols and pulled
+`database/sql/driver` into the kernel because UUID implements `sql.Scanner`.
 
-Geen open punten. **Bewust niet:** een public-suffix-lijst (honderden KB's,
-maandelijks anders — dus host-only als default, met een AllowDomain-hook voor
-wie het zelf kan weten), SameSite (navigatiebeleid van een browser, geen
-jar-beleid) en __Host-/__Secure-voorvoegsels.
+- [x] `N` uses rejection sampling instead of `%`, avoiding bias even for bounds
+      just above 2⁶³; the full range is tested.
+- [x] `Read` has no error result. `crypto/rand.Read` can no longer fail per its
+      own documentation, so every `if err != nil` is an untested branch. This
+      package panics because a node without entropy cannot continue safely.
+- [x] `Jitter` avoids hop's exact 1, 2, 4, 8 second restart schedule, which made
+      a hundred nodes retry together.
 
-## leanhttps (nieuw 12-08, de eerste samenstelling)
+**Deliberately absent:** a custom generator, seeding, a reproducible production
+stream (tests should provide their own), and UUID formatting—36 characters for
+16 bytes whose structure we never inspect.
 
-Geen open punten. Gemeten: 3,75 MB tegen 5,77 MB voor
-net/http+crypto/tls+CA-bundel, en 2,65 MB met een gepinde peer.
+## leancookie (new on 2026-08-12)
 
-**Bewust niet:** een serverkant. Deze compositie is alleen een client; https
-serveren vraagt leantls' serverhelft en valt buiten de huidige KAM.
+No open items. **Deliberately absent:** a public suffix list (hundreds of KB and
+updated monthly, so host-only is the default with an `AllowDomain` hook),
+SameSite (browser navigation policy, not jar policy), and the `__Host-` and
+`__Secure-` prefixes.
 
-## leandhcp — beide punten gedaan 12-08, en het pakket heeft nu tests
+## leanhttps (new on 2026-08-12, the first composition)
 
-Het had er nul. Nu 30 tests, 95% coverage, `-race` groen; de hele
-DORA-handshake en de hele lease-cyclus draaien op een nep-NIC en een nep-socket,
-dus in microseconden in plaats van in uren.
+No open items. Measured at 3.75 MB versus 5.77 MB for
+net/http+crypto/tls+CA bundle, and 2.65 MB with a pinned peer.
 
-- [x] **`StateRenewing`/`StateRebinding` gescheiden.** Het gat was groter dan
-      "een RFC-punt": `KeepAlive` probeerde zes keer een unicast-renew met 30s
-      ertussen, en dat getal sloeg op niets uit de lease. Juist als de lessor
-      wég is (verhuisde router, nieuwe DHCP-server) kan die renew per definitie
-      niet slagen — en dan verloor de node zijn adres terwijl er een andere
-      server op het segment staat die de lease zou verlengen. Nu: optie 59 (T2)
-      wordt gevraagd en gelezen, `Lease.timers` geeft T1/T2/einde (met de
-      RFC-verhoudingen 0.5/0.875 als de server onzin stuurt — T1 = T2 = lease
-      bestaat in het veld), de pogingen halveren de resttijd met een vloer van
-      60s (§4.4.5) en stoppen exact op de fasegrens, en op T2 stapt hij over op
-      broadcast. Verloopt de lease alsnog, dan zegt hij dat luid
-      (`HOPOS_DHCP_EXPIRED`) in plaats van stil te stoppen.
-- [x] **Laatste tick (lneto-bevinding #16) — er zát een gat.** `await` keek naar
-      de klok vóór hij las, dus een antwoord dat al in de ring lag ging verloren
-      zodra het window dicht was. De duurste vorm: de server heeft het IP aan
-      onze MAC vergeven, wij melden "no server answered", de node boot zonder
-      net en de router houdt een binding voor een adres dat niemand gebruikt.
-      Nu wordt de klok alleen bekeken als de ring LEEG is (begrensd, want een
-      druk segment houdt de ring nooit leeg), en een REQUEST krijgt bovendien
-      een minimum-window omdat híj bindt waar een DISCOVER niets bindt. Twee
-      tests die tegen de oude code aantoonbaar falen.
-- [x] Onderweg meegekomen: een DHCPNAK werd genegeerd (nu `errRefused` → meteen
-      stoppen met `HOPOS_DHCP_NAK`, want doorpraten op een geweigerd adres is
-      actief fout), en een karige ACK kon `LeaseSecs` op nul zetten en daarmee
-      het hele onderhoud stilzwijgend uitzetten (`merge` draagt nu ook de
-      timers door).
-- [ ] Een rebind die bij een ándere server uitkomt kan een ánder adres geven, en
-      dat kunnen we niet toepassen: de stack staat sinds bring-up op één IP. Nu
-      meldt hij het luid en stopt (`HOPOS_DHCP_MOVED`) — de node hangt dan aan
-      een reboot. Netter zou zijn: de stack ter plekke herconfigureren. Dat is
-      een naad in hopnet, geen leandhcp-werk.
-- [ ] Servers die een rebind-antwoord tóch als broadcast terugsturen zien we
-      niet (leannet negeert inkomende broadcast-IP's, zie leannet/DESIGN.md).
-      RFC-conform hoeft dat niet te gebeuren zolang wij de broadcast-flag uit
-      laten, en dat doen we. Pas repareren als een echte router het doet.
+**Deliberately absent:** a server. This composition is client-only; serving
+HTTPS requires leantls's server half and is outside the current KAM.
 
-## Repo-breed
+## leandhcp — both items completed on 2026-08-12, now tested
 
-- [ ] **KAM-conformiteit: Mux-patronen niet normaliseren.** Requestpaden met
-      dubbele slashes worden al geweigerd, maar registratie vouwt `/a//b` nog
-      stil naar `/a/b`. Laat niet-canonieke patronen fail-fast panicken en voeg
-      een registratietest toe; één spelling per pad geldt ook voor bedrading.
-- [ ] **KAM-conformiteit: client-`CONNECT` luid weigeren.** De server weigert
-      CONNECT al, maar de clientserializer schrijft nu ieder geldig
-      methodetoken en heeft geen tunnel-API. Voeg vóór de volgende tag een
-      expliciete weigering plus regressietest toe; stil een origin-form CONNECT
-      sturen is geen gedragen tussenweg.
-- [ ] **KAM-releasegate: surfserve `/stream`.** Een endpoint dat
-      `Request.Done` claimt moet eerst exact zijn methode controleren en een
-      niet-lege requestbody afwijzen of volledig lezen. `serveStream` claimt
-      `Done` nu nog onvoorwaardelijk; een bodydragend verzoek kan daardoor de
-      fail-fast-wacht in `leanhttp` bereiken. Test exact `GET /stream` met een
-      niet-lege Content-Length (4xx, server daarna nog bruikbaar) én een
-      bodyloze niet-GET (405). Zie [KAM.md](KAM.md#consumerplichten).
-- [ ] **KAM-releasegate: versies standalone maken.** Lean eerst taggen, daarna
-      hoplock, hoplockserver, Hop, surfserve en metal in afhankelijkheidsvolgorde
-      verhogen en standalone verifiëren. Elke lokale-pad-`replace` — relatief
-      of absoluut — is alleen ontwikkelbedrading. De releasegate gebruikt de
-      gepinde Go 1.26.4-toolchain; de consumer-CI mag niet op Go 1.24 blijven.
+The package previously had no tests. It now has 30 tests, 95% coverage, and a
+clean `-race` run. The complete DORA handshake and lease lifecycle run against
+a fake NIC and socket in microseconds rather than hours.
 
-- [x] Tags tot en met v0.6.0 staan in deze repository.
-- [ ] **Volgende tag:** pas na de twee KAM-releasegates hierboven. Daarna de
-      consumers in afhankelijkheidsvolgorde verhogen en standalone testen;
-      tijdelijke workspace- en `replace`-bedrading telt niet als bewijs.
+- [x] **Separate `StateRenewing` and `StateRebinding`.** `KeepAlive` previously
+      tried six unicast renewals 30 seconds apart, unrelated to the lease. When
+      the lessor disappears, those cannot succeed even if another server on the
+      segment would extend the lease. The client now requests and reads option
+      59 (T2); `Lease.timers` returns T1, T2, and expiry with RFC ratios
+      0.5/0.875 when the server sends invalid values. Attempts halve the
+      remaining time with a 60 s floor (§4.4.5), stop exactly at the phase
+      boundary, and switch to broadcast at T2. Expiry fails loudly with
+      `HOPOS_DHCP_EXPIRED`.
+- [x] **Final-tick gap (lneto finding #16).** `await` checked the clock before
+      reading, discarding a response already in the ring when the window closed.
+      In the worst case, the server had assigned the IP to this MAC while the
+      node reported `no server answered` and booted offline. The clock is now
+      checked only while the bounded ring is empty. REQUEST also gets a minimum
+      window because it binds state whereas DISCOVER does not. Two tests fail
+      reliably against the old code.
+- [x] Also fixed: DHCPNAK was ignored; it now returns `errRefused` and stops with
+      `HOPOS_DHCP_NAK`. A sparse ACK could reset `LeaseSecs` to zero and silently
+      disable maintenance; `merge` now preserves timers too.
+- [ ] A rebind answered by another server may assign another address, which the
+      fixed-IP stack cannot apply. It now reports `HOPOS_DHCP_MOVED` and stops,
+      leaving recovery to reboot. Live stack reconfiguration belongs in hopnet,
+      not leandhcp.
+- [ ] We do not receive servers that broadcast rebind replies because leannet
+      ignores inbound IP broadcasts (see leannet/DESIGN.md). RFC-compliant
+      servers need not do this while the broadcast flag is clear. Fix only when
+      a real router requires it.
+
+## Repository-wide
+
+- [ ] **KAM compliance: do not normalize Mux patterns.** Request paths with
+      duplicate slashes are rejected, but registration still silently folds
+      `/a//b` into `/a/b`. Make non-canonical patterns fail fast and add a
+      registration test; wiring also needs one spelling per path.
+- [ ] **KAM compliance: reject client `CONNECT` loudly.** The server already
+      rejects CONNECT, but the client serializer accepts any valid method token
+      without exposing a tunnel API. Add an explicit rejection and regression
+      test before the next tag; silently sending origin-form CONNECT is not a
+      supported middle ground.
+- [ ] **KAM release gate: surfserve `/stream`.** An endpoint that claims
+      `Request.Done` must first require its exact method and reject or drain a
+      non-empty request body. `serveStream` currently claims `Done`
+      unconditionally, allowing a body-bearing request to reach leanhttp's
+      fail-fast check. Test `GET /stream` with a non-empty Content-Length (4xx,
+      server remains usable) and a bodyless non-GET (405). See
+      [KAM.md](KAM.md#consumer-obligations).
+- [ ] **KAM release gate: make versions standalone.** Tag lean first, then
+      update and verify hoplock, hoplockserver, Hop, surfserve, and metal in
+      dependency order. Every local-path `replace`, relative or absolute, is
+      development wiring only. Use the pinned Go 1.26.4 toolchain; consumer CI
+      must not remain on Go 1.24.
+
+- [x] This repository is tagged through v0.6.0.
+- [ ] **Next tag:** only after the two KAM release gates above. Then update and
+      test consumers standalone in dependency order; temporary workspace and
+      `replace` wiring is not evidence.

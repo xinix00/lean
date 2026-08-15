@@ -1,24 +1,20 @@
 package leannet
 
-// budget.go — de ene knop van leannet. Alle verbindingsbuffers komen uit één
-// pot van Config.Budget bytes: reserveren bij groei, terugstorten bij close.
-// Niets wordt vooraf geclaimd, dus een idle listener kost niets en het
-// geheugen schaalt met gebruik in plaats van met configuratie (het gemeten
-// probleem van 2026-08-11, zie doc.go).
+// budget.go implements leannet's single memory control. Connection buffers
+// reserve from Config.Budget as they grow and return capacity on close, so
+// memory follows use rather than configuration. See doc.go.
 
 import "sync"
 
-// budget administreert de pot. De mutex dekt alleen de telling; de bytes zelf
-// alloceert de vrager (Go's allocator is de arena, wij zijn de boekhouder).
+// budget tracks capacity; callers allocate the actual bytes.
 type budget struct {
 	mu    sync.Mutex
 	total int
 	used  int
 }
 
-// reserve probeert n bytes uit de pot te claimen. false = past niet — de
-// aanroeper kiest dan zelf tussen kleiner vragen of luid weigeren; stil
-// wachten op geheugen doen we nooit.
+// reserve claims n bytes if available. Callers may retry smaller or fail, but
+// never wait silently for memory.
 func (b *budget) reserve(n int) bool {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -29,9 +25,8 @@ func (b *budget) reserve(n int) bool {
 	return true
 }
 
-// release stort n bytes terug. Meer terugstorten dan geclaimd is een
-// boekhoudfout van de aanroeper en panict: stil krimpend gebruik zou élke
-// budget-garantie waardeloos maken.
+// release returns n bytes. Releasing more than reserved panics because it would
+// invalidate the budget guarantee.
 func (b *budget) release(n int) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -41,8 +36,7 @@ func (b *budget) release(n int) {
 	b.used -= n
 }
 
-// free geeft de vrije ruimte — een momentopname, alleen voor tuning-besluiten
-// en telemetrie (de enige harde waarheid is wat reserve teruggeeft).
+// free returns a snapshot for tuning and telemetry; reserve is authoritative.
 func (b *budget) free() int {
 	b.mu.Lock()
 	defer b.mu.Unlock()

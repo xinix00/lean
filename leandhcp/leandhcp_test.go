@@ -8,16 +8,13 @@ import (
 	"time"
 )
 
-// testNIC is een nep-NIC met een DHCP-server erachter: wat de client verstuurt
-// gaat door onTX, en wat die in rx legt leest de client terug. Zo draait de hele
-// handshake in microseconden, zonder ijzer en zonder segment.
 type testNIC struct {
 	mu    sync.Mutex
 	rx    [][]byte
 	tx    [][]byte
-	rxErr error // wat Receive naast de frames meldt (een kapotte driver)
+	rxErr error
 	txErr error
-	flood []byte // niet-nil: Receive levert dit frame eindeloos (druk segment)
+	flood []byte
 
 	onTX func(n *testNIC, frame []byte)
 }
@@ -63,8 +60,6 @@ func (n *testNIC) sent() [][]byte {
 	return append([][]byte(nil), n.tx...)
 }
 
-// reply bouwt het antwoord van een DHCP-server op een verzoek-frame: dezelfde
-// xid en chaddr terug, op = BOOTREPLY, UDP 67→68.
 func reply(req []byte, msgtype byte, yiaddr [4]byte, extra []byte) []byte {
 	bp := req[42:]
 	xid := be32(bp[4:8])
@@ -73,7 +68,7 @@ func reply(req []byte, msgtype byte, yiaddr [4]byte, extra []byte) []byte {
 
 	f := make([]byte, 14+20+8+300)
 	copy(f[0:6], mac[:])
-	copy(f[6:12], []byte{2, 0, 0, 0, 0, 9}) // de server
+	copy(f[6:12], []byte{2, 0, 0, 0, 0, 9})
 	f[12], f[13] = 0x08, 0x00
 
 	ip := f[14:34]
@@ -86,33 +81,30 @@ func reply(req []byte, msgtype byte, yiaddr [4]byte, extra []byte) []byte {
 	ip[10], ip[11] = byte(cs>>8), byte(cs)
 
 	udp := f[34:42]
-	udp[1], udp[3] = 67, 68 // 67 → 68
+	udp[1], udp[3] = 67, 68
 	ul := tot - 20
 	udp[4], udp[5] = byte(ul>>8), byte(ul)
 
 	out := f[42:]
-	out[0], out[1], out[2] = 2, 1, 6 // BOOTREPLY
+	out[0], out[1], out[2] = 2, 1, 6
 	out[4], out[5], out[6], out[7] = byte(xid>>24), byte(xid>>16), byte(xid>>8), byte(xid)
-	copy(out[16:20], yiaddr[:]) // yiaddr
+	copy(out[16:20], yiaddr[:])
 	copy(out[28:34], mac[:])
 	copy(out[236:240], []byte{99, 130, 83, 99})
 	copy(out[240:], append(append([]byte{53, 1, msgtype}, extra...), 255))
 	return f
 }
 
-// lessor is de standaard-serveropties (masker, router, DNS, server-id, lease 1h,
-// T1 30m, T2 52m30s).
 var lessor = []byte{
 	1, 4, 255, 255, 255, 0,
 	3, 4, 192, 168, 1, 1,
 	6, 4, 192, 168, 1, 1,
 	54, 4, 192, 168, 1, 1,
-	51, 4, 0, 0, 0x0e, 0x10, // 3600
-	58, 4, 0, 0, 0x07, 0x08, // 1800
-	59, 4, 0, 0, 0x0c, 0x4e, // 3150
+	51, 4, 0, 0, 0x0e, 0x10,
+	58, 4, 0, 0, 0x07, 0x08,
+	59, 4, 0, 0, 0x0c, 0x4e,
 }
 
-// dhcpServer antwoordt zoals een router doet: OFFER op DISCOVER, ACK op REQUEST.
 func dhcpServer(yiaddr [4]byte) func(*testNIC, []byte) {
 	return func(n *testNIC, frame []byte) {
 		switch msgTypeOf(frame) {
@@ -124,7 +116,6 @@ func dhcpServer(yiaddr [4]byte) func(*testNIC, []byte) {
 	}
 }
 
-// msgTypeOf licht optie 53 uit een verzoek-frame (alleen voor de tests).
 func msgTypeOf(frame []byte) byte {
 	opts := frame[42+240:]
 	for i := 0; i+1 < len(opts); {
@@ -144,8 +135,6 @@ func msgTypeOf(frame []byte) byte {
 	return 0
 }
 
-// TestAcquireDORA: de hele handshake, en alle velden die de board-config
-// ervan overneemt.
 func TestAcquireDORA(t *testing.T) {
 	nic := &testNIC{onTX: dhcpServer([4]byte{192, 168, 1, 33})}
 	l, err := Acquire(nic, [6]byte{2, 0, 0, 0, 0, 1}, 3*time.Second)
@@ -168,7 +157,6 @@ func TestAcquireDORA(t *testing.T) {
 		t.Errorf("timers = %d/%d/%d, want 3600/1800/3150", l.LeaseSecs, l.T1Secs, l.T2Secs)
 	}
 
-	// Twee pakketten de deur uit: DISCOVER en REQUEST, met dezelfde xid.
 	tx := nic.sent()
 	if len(tx) != 2 {
 		t.Fatalf("%d pakketten verstuurd, want 2", len(tx))
@@ -179,8 +167,7 @@ func TestAcquireDORA(t *testing.T) {
 	if be32(tx[0][46:50]) != be32(tx[1][46:50]) {
 		t.Error("REQUEST gebruikte een andere xid dan de DISCOVER van dezelfde ronde")
 	}
-	// De REQUEST moet het aangeboden IP (optie 50) en de server (54) bevestigen,
-	// anders weet de lessor niet welk aanbod we aannemen.
+
 	if !hasOption(tx[1], 50, []byte{192, 168, 1, 33}) {
 		t.Error("REQUEST bevestigt het aangeboden IP niet (optie 50)")
 	}
@@ -189,7 +176,6 @@ func TestAcquireDORA(t *testing.T) {
 	}
 }
 
-// hasOption zoekt een optie met exact deze waarde in een verzoek-frame.
 func hasOption(frame []byte, code byte, want []byte) bool {
 	opts := frame[42+240:]
 	for i := 0; i+1 < len(opts); {
@@ -212,9 +198,6 @@ func hasOption(frame []byte, code byte, want []byte) bool {
 	return false
 }
 
-// TestDiscoverVorm: het frame dat als eerste de draad op gaat. Een fout hier
-// kost een boot-cyclus om te vinden, want een router antwoordt dan simpelweg
-// niet — dus staat het hier.
 func TestDiscoverVorm(t *testing.T) {
 	nic := &testNIC{}
 	Acquire(nic, [6]byte{2, 0, 0, 0, 0, 7}, 10*time.Millisecond)
@@ -253,15 +236,12 @@ func TestDiscoverVorm(t *testing.T) {
 	if string(f[42+236:42+240]) != string([]byte{99, 130, 83, 99}) {
 		t.Error("DHCP-magic ontbreekt")
 	}
-	// Optie 55 moet álles vragen wat de lease-timing nodig heeft; zonder 59 is
-	// er geen T2 en dus geen rebind-fase.
+
 	if !hasOption(f, 55, []byte{1, 3, 6, 51, 58, 59}) {
 		t.Error("parameter-request (optie 55) vraagt niet om 1/3/6/51/58/59")
 	}
 }
 
-// TestAcquireGeenServer: stilte op het segment geeft een timeout die de operator
-// naar de juiste plek stuurt, en hij duurt ongeveer wat je vroeg.
 func TestAcquireGeenServer(t *testing.T) {
 	nic := &testNIC{}
 	start := time.Now()
@@ -278,9 +258,6 @@ func TestAcquireGeenServer(t *testing.T) {
 	}
 }
 
-// TestAcquireNoemtNICFout: een driver die geen frames levert is een ándere
-// diagnose dan een segment zonder server — de eerste stuurt je naar de kabel,
-// de tweede naar de router. Die fout moet dus in het bericht staan.
 func TestAcquireNICFout(t *testing.T) {
 	boom := errors.New("rx ring desync")
 	nic := &testNIC{rxErr: boom}
@@ -293,7 +270,6 @@ func TestAcquireNICFout(t *testing.T) {
 	}
 }
 
-// TestAcquireTXFoutStoptMeteen: kan de NIC niet zenden, dan is doorpollen zinloos.
 func TestAcquireTXFout(t *testing.T) {
 	nic := &testNIC{txErr: errors.New("link down")}
 	start := time.Now()
@@ -305,10 +281,6 @@ func TestAcquireTXFout(t *testing.T) {
 	}
 }
 
-// TestAcquireLaatsteTick is lneto-bevinding #16 op ons eigen pad: de ACK komt
-// binnen ná de deadline, maar de server heeft het IP dan al aan onze MAC
-// vergeven. Rapporteren we dat als timeout, dan boot de node zonder net terwijl
-// de router een binding vasthoudt voor een adres dat niemand gebruikt.
 func TestAcquireLaatsteTick(t *testing.T) {
 	nic := &testNIC{}
 	nic.onTX = func(n *testNIC, frame []byte) {
@@ -316,7 +288,7 @@ func TestAcquireLaatsteTick(t *testing.T) {
 		case msgDiscover:
 			n.push(reply(frame, msgOffer, [4]byte{192, 168, 1, 44}, lessor))
 		case msgRequest:
-			// De ACK komt pas voorbij de deadline van 50ms.
+
 			time.Sleep(120 * time.Millisecond)
 			n.push(reply(frame, msgACK, [4]byte{192, 168, 1, 44}, lessor))
 		}
@@ -329,15 +301,12 @@ func TestAcquireLaatsteTick(t *testing.T) {
 	if l.IP != ([4]byte{192, 168, 1, 44}) {
 		t.Errorf("IP = %v", l.IP)
 	}
-	// De overschrijding moet begrensd blijven: ackGrace, geen open eind.
+
 	if d := time.Since(start); d > 50*time.Millisecond+ackGrace+time.Second {
 		t.Errorf("Acquire duurde %v — de grace hoort begrensd te zijn", d)
 	}
 }
 
-// TestAwaitLeestWatErAlLigt is dezelfde regel, chirurgisch: de klok mag alleen
-// bekeken worden als de ring LEEG is. Een antwoord dat er al ligt is een
-// antwoord, ook als het window dicht is.
 func TestAwaitLeestWatErAlLigt(t *testing.T) {
 	mac := [6]byte{2, 0, 0, 0, 0, 1}
 	req := packet(mac, 0x484F5001, msgRequest, nil)
@@ -356,12 +325,9 @@ func TestAwaitLeestWatErAlLigt(t *testing.T) {
 	}
 }
 
-// TestAwaitStormLoopt: de grace-drain mag niet oneindig zijn. Op een segment dat
-// blijft stromen is "de ring is leeg" nooit waar, en dan zou de bring-up hier
-// blijven hangen in plaats van een timeout te melden.
 func TestAwaitStormLoopt(t *testing.T) {
 	mac := [6]byte{2, 0, 0, 0, 0, 1}
-	junk := make([]byte, 300) // geen DHCP: wordt geteld en genegeerd
+	junk := make([]byte, 300)
 	nic := &testNIC{flood: junk}
 
 	done := make(chan struct{})
@@ -376,9 +342,6 @@ func TestAwaitStormLoopt(t *testing.T) {
 	}
 }
 
-// TestAcquireTweedeRonde: de eerste ronde krijgt geen antwoord, de tweede wel.
-// Een laat OFFER van de eerste ronde mag de tweede niet vergiftigen — daar is de
-// verse xid per ronde voor.
 func TestAcquireTweedeRonde(t *testing.T) {
 	nic := &testNIC{}
 	var rondes int
@@ -386,9 +349,9 @@ func TestAcquireTweedeRonde(t *testing.T) {
 		if msgTypeOf(frame) == msgDiscover {
 			rondes++
 			if rondes == 1 {
-				return // eerste ronde: stilte
+				return
 			}
-			// Nu pas antwoorden — en tegelijk het late OFFER van ronde 1 erbij.
+
 			oud := n.sent()[0]
 			n.push(reply(oud, msgOffer, [4]byte{10, 9, 9, 9}, lessor))
 			n.push(reply(frame, msgOffer, [4]byte{192, 168, 1, 55}, lessor))
@@ -408,8 +371,6 @@ func TestAcquireTweedeRonde(t *testing.T) {
 	}
 }
 
-// TestAcquireNegeertVreemdeFrames: alles wat niet ons antwoord is gaat langs de
-// deur — verkeerde xid, verkeerde MAC, verkeerd type, afgekapt, en rommel.
 func TestAcquireNegeertVreemdeFrames(t *testing.T) {
 	mac := [6]byte{2, 0, 0, 0, 0, 1}
 	nic := &testNIC{}
@@ -444,27 +405,23 @@ func TestAcquireNegeertVreemdeFrames(t *testing.T) {
 	}
 }
 
-// TestParseRommelPanicktNooit: parse en parseBootp staan aan de onvertrouwde
-// rand — dit is de eerste code die naar bytes van buiten kijkt, nog voordat er
-// een netstack is. Elke lengte en elke bytewaarde mag erin.
 func TestParseRommelPanicktNooit(t *testing.T) {
 	mac := [6]byte{2, 0, 0, 0, 0, 1}
 	base := reply(packet(mac, 7, msgRequest, nil), msgACK, [4]byte{1, 2, 3, 4}, lessor)
 
-	// Elke afkapping.
 	for n := range len(base) + 1 {
 		parse(base[:n], mac, 7, msgACK)
 		if n >= 42 {
 			parseBootp(base[42:n], mac, 7, msgACK)
 		}
 	}
-	// Eén verminkte byte op elke plek.
+
 	for i := range base {
 		f := append([]byte(nil), base...)
 		f[i] ^= 0xff
 		parse(f, mac, 7, msgACK)
 	}
-	// Optieveld vol met lengtes die over de rand wijzen.
+
 	for _, ln := range []byte{0, 1, 200, 255} {
 		f := append([]byte(nil), base...)
 		for i := 42 + 240; i+1 < len(f); i += 2 {
@@ -472,7 +429,7 @@ func TestParseRommelPanicktNooit(t *testing.T) {
 		}
 		parse(f, mac, 7, msgACK)
 	}
-	// Willekeurige rommel van elke maat.
+
 	for n := range 400 {
 		f := make([]byte, n)
 		for i := range f {
@@ -482,7 +439,6 @@ func TestParseRommelPanicktNooit(t *testing.T) {
 	}
 }
 
-// TestLeaseTekstvormen: de vormen die de board-config en de diagnose gebruiken.
 func TestLeaseTekstvormen(t *testing.T) {
 	l := Lease{
 		IP:   [4]byte{10, 0, 0, 7},

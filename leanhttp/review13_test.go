@@ -1,9 +1,5 @@
 package leanhttp
 
-// review13_test.go — de bevindingen van de review van 13-08, elk als test die
-// tegen de oude code faalt: framing die zijn einde moet bewijzen, HEAD en 1xx
-// aan de clientkant, en de strengheid van de serverparser.
-
 import (
 	"bufio"
 	"bytes"
@@ -20,16 +16,11 @@ import (
 	"time"
 )
 
-// rawServer is rauweServer (leanhttp_test.go) zonder het http://-schema: deze
-// tests bouwen hun URL zelf. Eén serverscript, geen tweede kopie die kan
-// afdrijven.
 func rawServer(t *testing.T, response string) string {
 	t.Helper()
 	return strings.TrimPrefix(rauweServer(t, response), "http://")
 }
 
-// TestBodyKorterDanContentLengthIsGeenEOF — een server die 10 belooft en na 5
-// sluit leverde vóór de fix een nette io.EOF: een half bestand als succes.
 func TestBodyKorterDanContentLengthIsGeenEOF(t *testing.T) {
 	addr := rawServer(t, "HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nhalf!")
 	resp, err := Do(Call{URL: "http://" + addr + "/"})
@@ -43,8 +34,6 @@ func TestBodyKorterDanContentLengthIsGeenEOF(t *testing.T) {
 	}
 }
 
-// TestChunkedZonderNulchunkIsGeenEOF — chunked zonder afsluitende nul-chunk is
-// een incompleet bericht (RFC 9112 §8), geen einde.
 func TestChunkedZonderNulchunkIsGeenEOF(t *testing.T) {
 	addr := rawServer(t, "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhallo\r\n")
 	resp, err := Do(Call{URL: "http://" + addr + "/"})
@@ -58,9 +47,6 @@ func TestChunkedZonderNulchunkIsGeenEOF(t *testing.T) {
 	}
 }
 
-// TestInterimAntwoordenWordenOvergeslagen — 100/103 zijn geen eindantwoord;
-// vóór de fix kreeg de aanroeper de 103 en stond het échte antwoord nog op de
-// verbinding (desync op keep-alive).
 func TestInterimAntwoordenWordenOvergeslagen(t *testing.T) {
 	addr := rawServer(t,
 		"HTTP/1.1 103 Early Hints\r\nLink: </style.css>; rel=preload\r\n\r\n"+
@@ -80,9 +66,6 @@ func TestInterimAntwoordenWordenOvergeslagen(t *testing.T) {
 	}
 }
 
-// TestHEADLeestGeenBody — het antwoord op HEAD draagt een Content-Length maar
-// géén bytes; vóór de fix wachtte de client op een body die nooit komt (en las
-// hij op keep-alive het vólgende antwoord als body).
 func TestHEADLeestGeenBody(t *testing.T) {
 	addr := rawServer(t, "HTTP/1.1 200 OK\r\nContent-Length: 1234\r\n\r\n")
 	resp, err := Do(Call{URL: "http://" + addr + "/", Method: "HEAD", Timeout: 2 * time.Second})
@@ -99,14 +82,11 @@ func TestHEADLeestGeenBody(t *testing.T) {
 	}
 }
 
-// leanServer is serveer (serve_test.go) zonder het http://-schema: deze tests
-// dialen de poort ook rauw (rawRoundTrip).
 func leanServer(t *testing.T, h Handler) string {
 	t.Helper()
 	return strings.TrimPrefix(serveer(t, h), "http://")
 }
 
-// rawRoundTrip stuurt rauwe bytes en geeft alles terug wat de server antwoordt.
 func rawRoundTrip(t *testing.T, addr, request string) string {
 	t.Helper()
 	c, err := net.Dial("tcp4", addr)
@@ -122,9 +102,6 @@ func rawRoundTrip(t *testing.T, addr, request string) string {
 	return string(out)
 }
 
-// TestServerWeigertSpatieVoorDubbelePunt — "Content-Length : 5" MOET een 400
-// zijn (RFC 9112 §5.1). Vóór de fix werd het een onbekende header en bleven de
-// vijf bodybytes staan als het begin van het volgende verzoek: desync/smuggling.
 func TestServerWeigertSpatieVoorDubbelePunt(t *testing.T) {
 	addr := leanServer(t, func(w ResponseWriter, r *Request) {
 		io.Copy(io.Discard, r.Body)
@@ -138,8 +115,6 @@ func TestServerWeigertSpatieVoorDubbelePunt(t *testing.T) {
 	}
 }
 
-// TestServerWeigertTEPlusContentLength — beide framings tegelijk is hét
-// smokkelsignaal (RFC 9112 §6.1): twee parsers kiezen elk hun eigen einde.
 func TestServerWeigertTEPlusContentLength(t *testing.T) {
 	addr := leanServer(t, func(w ResponseWriter, r *Request) {
 		io.Copy(io.Discard, r.Body)
@@ -153,8 +128,6 @@ func TestServerWeigertTEPlusContentLength(t *testing.T) {
 	}
 }
 
-// TestServerWeigertVreemdeTE — élke niet-chunked Transfer-Encoding als chunked
-// lezen legt het lichaamseinde op de verkeerde plek: 501.
 func TestServerWeigertVreemdeTE(t *testing.T) {
 	addr := leanServer(t, func(w ResponseWriter, r *Request) {
 		io.Copy(io.Discard, r.Body)
@@ -168,10 +141,6 @@ func TestServerWeigertVreemdeTE(t *testing.T) {
 	}
 }
 
-// TestServerUploadBovenLimietIsFout — een upload boven de limiet is een 413
-// aan de deur, vóór er één handlerregel draait. (Chunked uploads bestaan sinds
-// de eenendertigste ronde niet meer: een verzoekbody draagt een Content-Length,
-// dus de grens is vóór de eerste bodybyte te toetsen.)
 func TestServerUploadBovenLimietIsFout(t *testing.T) {
 	raakte := false
 	addr := leanServer(t, func(w ResponseWriter, r *Request) { raakte = true })
@@ -185,10 +154,6 @@ func TestServerUploadBovenLimietIsFout(t *testing.T) {
 	}
 }
 
-// TestDotSegmentenWordenGeweigerd — rauwe "." en ".."-segmenten worden aan de
-// deur geweigerd, net als hun escaped varianten: cleanPath vouwde /admin/. en
-// /admin/x/.. tot /admin, waarmee de wortel van een beveiligde subtree bij de
-// publieke exacte route belandde (review 13-08, negenentwintigste ronde).
 func TestDotSegmentenWordenGeweigerd(t *testing.T) {
 	m := NewServeMux()
 	m.HandleFunc("/admin", func(w ResponseWriter, r *Request) { w.Header().Set("X-Handler", "publiek") })
@@ -201,9 +166,6 @@ func TestDotSegmentenWordenGeweigerd(t *testing.T) {
 	}
 }
 
-// TestClientGetGebruiktDePoolMetEigenDial — een Client mét eigen Dial (de
-// TLS-vorm) hoort óók te poolen; vóór de fix deed elke Get een verse handshake
-// en bleven de gepoolde verbindingen ongebruikt staan (review 13-08).
 func TestClientGetGebruiktDePoolMetEigenDial(t *testing.T) {
 	addr := leanServer(t, func(w ResponseWriter, r *Request) {
 		w.Header().Set("Content-Length", "2")
@@ -228,9 +190,6 @@ func TestClientGetGebruiktDePoolMetEigenDial(t *testing.T) {
 	}
 }
 
-// TestClientWeigertHTTPSZonderTLSDialer — een zero-value Client stuurde een
-// https-URL als PLAINTEXT naar poort 443 (de pool-dialer is nooit nil, dus de
-// wacht in do() zag hem niet).
 func TestClientWeigertHTTPSZonderTLSDialer(t *testing.T) {
 	cl := &Client{}
 	if _, err := cl.Get("https://example.invalid/"); err == nil || !strings.Contains(err.Error(), "TLS") {
@@ -241,11 +200,6 @@ func TestClientWeigertHTTPSZonderTLSDialer(t *testing.T) {
 	}
 }
 
-// TestRedirectStriptAuthorizationCrossOrigin — cross-origin gaan ÁLLE
-// callerheaders eraf, niet een blocklist van drie "gevoelige": welke header een
-// geheim draagt (X-Api-Key, een eigen HMAC-naam) weet alleen de aanroeper, en
-// een blocklist die dat raadt valt pas op als het geheim al bij de CDN ligt
-// (review 13-08, eenendertigste ronde; de blocklist was de tweede).
 func TestRedirectStriptAuthorizationCrossOrigin(t *testing.T) {
 	var gotAuth, gotKey string
 	target := leanServer(t, func(w ResponseWriter, r *Request) {
@@ -253,7 +207,7 @@ func TestRedirectStriptAuthorizationCrossOrigin(t *testing.T) {
 		gotKey = r.Header.Get("X-Api-Key")
 		io.WriteString(w, "einde")
 	})
-	// 127.0.0.1 → localhost: zelfde machine, ándere hostnaam = andere origin.
+
 	host, port, _ := net.SplitHostPort(target)
 	_ = host
 	hopAddr := leanServer(t, func(w ResponseWriter, r *Request) {
@@ -271,9 +225,6 @@ func TestRedirectStriptAuthorizationCrossOrigin(t *testing.T) {
 	}
 }
 
-// TestServerUploadVanExactDeLimietIsGeldig — exact maxBodyBytes is géén
-// overtreding: de grens is "groter dan", en een off-by-one hier kapt precies
-// de maximale legitieme upload af.
 func TestServerUploadVanExactDeLimietIsGeldig(t *testing.T) {
 	got := make(chan struct {
 		n   int64
@@ -309,9 +260,6 @@ func TestServerUploadVanExactDeLimietIsGeldig(t *testing.T) {
 	}
 }
 
-// TestServerZietAfgebrokenContentLength — een client die 10 belooft en na 5
-// sluit is een afgebroken verzoek; met io.LimitReader las de handler een half
-// verzoek als compleet (review 13-08, tweede ronde).
 func TestServerZietAfgebrokenContentLength(t *testing.T) {
 	got := make(chan error, 1)
 	addr := leanServer(t, func(w ResponseWriter, r *Request) {
@@ -323,7 +271,7 @@ func TestServerZietAfgebrokenContentLength(t *testing.T) {
 		t.Fatal(err)
 	}
 	fmt.Fprintf(c, "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 10\r\n\r\nhalf!")
-	c.Close() // 5 van de 10 beloofde bytes
+	c.Close()
 	select {
 	case err := <-got:
 		if err != io.ErrUnexpectedEOF {
@@ -334,9 +282,6 @@ func TestServerZietAfgebrokenContentLength(t *testing.T) {
 	}
 }
 
-// TestServerWeigertTEIdentity — "identity" is in een verzoek geen codering
-// maar een gat: het verzoek werd bodyloos gelezen en de échte bytes werden het
-// volgende verzoek (review 13-08, tweede ronde).
 func TestServerWeigertTEIdentity(t *testing.T) {
 	addr := leanServer(t, func(w ResponseWriter, r *Request) {
 		io.Copy(io.Discard, r.Body)
@@ -350,18 +295,14 @@ func TestServerWeigertTEIdentity(t *testing.T) {
 	}
 }
 
-// TestWriterIsEigenaarVanDeFraming — een handler die zelf Transfer-Encoding
-// zet terwijl de writer op het lengte-pad zit, produceerde TE én
-// Content-Length met een ongechunkte body; en een expliciete CL bleef op een
-// 204 staan (review 13-08, tweede ronde).
 func TestWriterIsEigenaarVanDeFraming(t *testing.T) {
 	addr := leanServer(t, func(w ResponseWriter, r *Request) {
 		if r.Path == "/te" {
-			w.Header().Set("Transfer-Encoding", "chunked") // niet aan de handler
+			w.Header().Set("Transfer-Encoding", "chunked")
 			io.WriteString(w, "body")
 			return
 		}
-		w.Header().Set("Content-Length", "5") // hoort niet op een 204
+		w.Header().Set("Content-Length", "5")
 		w.WriteHeader(StatusNoContent)
 	})
 	got := rawRoundTrip(t, addr, "GET /te HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
@@ -377,9 +318,6 @@ func TestWriterIsEigenaarVanDeFraming(t *testing.T) {
 	}
 }
 
-// TestRedirectStriptOokBijAnderePoort — dezelfde hostnaam op een andere poort
-// is een ándere origin: een token dat meereist bereikt een tweede dienst op
-// dezelfde machine (review 13-08, tweede ronde).
 func TestRedirectStriptOokBijAnderePoort(t *testing.T) {
 	var gotAuth string
 	target := leanServer(t, func(w ResponseWriter, r *Request) {
@@ -388,7 +326,7 @@ func TestRedirectStriptOokBijAnderePoort(t *testing.T) {
 		io.WriteString(w, "ok")
 	})
 	hop := leanServer(t, func(w ResponseWriter, r *Request) {
-		Redirect(w, "http://"+target+"/", 302) // zelfde 127.0.0.1, andere poort
+		Redirect(w, "http://"+target+"/", 302)
 	})
 	resp, err := Do(Call{URL: "http://" + hop + "/", Header: Header{"Authorization": "Bearer geheim"}})
 	if err != nil {
@@ -401,9 +339,6 @@ func TestRedirectStriptOokBijAnderePoort(t *testing.T) {
 	}
 }
 
-// TestEigenDialBlijftBuitenDePool — een per-call transport hoort niet in de
-// gedeelde pool te belanden: een volgende Get zou een verbinding van een ánder
-// transport krijgen (review 13-08, tweede ronde).
 func TestEigenDialBlijftBuitenDePool(t *testing.T) {
 	addr := leanServer(t, func(w ResponseWriter, r *Request) {
 		w.Header().Set("Content-Length", "2")
@@ -424,8 +359,6 @@ func TestEigenDialBlijftBuitenDePool(t *testing.T) {
 	}
 }
 
-// TestConnectionAlsTokenlijst — "Connection: upgrade, close" draagt een close;
-// als hele string vergeleken werd de verbinding tóch gepoold.
 func TestConnectionAlsTokenlijst(t *testing.T) {
 	addr := rawServer(t, "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: upgrade, close\r\n\r\nok")
 	cl := &Client{}
@@ -441,8 +374,6 @@ func TestConnectionAlsTokenlijst(t *testing.T) {
 	}
 }
 
-// TestClientWeigertVreemdeTEInRespons — élke niet-chunked TE als chunked lezen
-// legt het einde op de verkeerde plek: luid falen.
 func TestClientWeigertVreemdeTEInRespons(t *testing.T) {
 	addr := rawServer(t, "HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip\r\n\r\nrommel")
 	if _, err := Do(Call{URL: "http://" + addr + "/"}); err == nil || !strings.Contains(err.Error(), "Transfer-Encoding") {
@@ -450,13 +381,9 @@ func TestClientWeigertVreemdeTEInRespons(t *testing.T) {
 	}
 }
 
-// TestRedirectNaarHTTPSGaatNooitPlaintext — een 301 van http naar https op een
-// Client zonder TLS-dialer schreef het verzoek (mét Authorization, zelfde
-// host!) plaintext naar poort 443: de schemewacht gold alleen voor de eerste
-// URL (review 13-08, derde ronde).
 func TestRedirectNaarHTTPSGaatNooitPlaintext(t *testing.T) {
 	leaked := make(chan string, 1)
-	// De "poort 443" van deze test: als hier óóit bytes aankomen, is het lek er.
+
 	l, err := net.Listen("tcp4", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -489,14 +416,11 @@ func TestRedirectNaarHTTPSGaatNooitPlaintext(t *testing.T) {
 	}
 }
 
-// TestChunkAfgekaptVoorDeCRLF — sterft de verbinding precies tussen chunkdata
-// en de afsluitende CRLF, dan gold de body als compleet en ging de dode
-// verbinding de pool in (review 13-08, derde ronde).
 func TestChunkAfgekaptVoorDeCRLF(t *testing.T) {
 	addr := rawServer(t, "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhallo")
 	cl := &Client{}
 	defer cl.CloseIdle()
-	resp, err := cl.Do(Call{URL: "http://" + addr + "/"}) // Do: Get weigert chunked per contract
+	resp, err := cl.Do(Call{URL: "http://" + addr + "/"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -510,10 +434,6 @@ func TestChunkAfgekaptVoorDeCRLF(t *testing.T) {
 	}
 }
 
-// TestPooledConnNestNiet — dial wikkelde de verbinding uit de pool in een
-// verse pooledConn en put sloeg die wrapper op: elke hergebruiksronde een laag
-// erbij, een poller van 1 req/s draagt er na een dag ~86k (review 13-08,
-// derde ronde).
 func TestPooledConnNestNiet(t *testing.T) {
 	addr := leanServer(t, func(w ResponseWriter, r *Request) {
 		w.Header().Set("Content-Length", "2")
@@ -540,9 +460,6 @@ func TestPooledConnNestNiet(t *testing.T) {
 	}
 }
 
-// TestDataPlusEOFPooltDeDodeVerbindingNiet — een verbinding die de laatste
-// body-byte en zijn EOF in één Read levert (TLS-close_notify) is compleet om
-// te lezen maar dood om te hergebruiken (review 13-08, derde ronde).
 func TestDataPlusEOFPooltDeDodeVerbindingNiet(t *testing.T) {
 	lr := &lengthReader{r: dataPlusEOF{data: []byte("hallo")}, n: 5}
 	b := &body{r: lr}
@@ -562,7 +479,6 @@ func TestDataPlusEOFPooltDeDodeVerbindingNiet(t *testing.T) {
 	}
 }
 
-// dataPlusEOF levert alles in één Read, mét io.EOF erachteraan geplakt.
 type dataPlusEOF struct{ data []byte }
 
 func (d dataPlusEOF) Read(p []byte) (int, error) {
@@ -570,9 +486,6 @@ func (d dataPlusEOF) Read(p []byte) (int, error) {
 	return n, io.EOF
 }
 
-// TestMuxDollarPanicktMetAlternatief — {$} is gesloopt (zevenentwintigste
-// ronde): een vast pad (zonder slash) en een subtree (mét) dekken samen elke
-// echte routetabel. Registreren panickt en noemt het alternatief.
 func TestMuxDollarPanicktMetAlternatief(t *testing.T) {
 	defer func() {
 		p := recover()
@@ -583,11 +496,6 @@ func TestMuxDollarPanicktMetAlternatief(t *testing.T) {
 	NewServeMux().HandleFunc("GET /logs/{$}", func(w ResponseWriter, r *Request) {})
 }
 
-// TestHandlerKanContentLengthNietOverschrijden — de surplus-bytes van een
-// handler die voorbij zijn eigen Content-Length schrijft stonden al op de
-// draad toen finish het zag: op keep-alive het begin van het volgende
-// antwoord. Nu: short-write plus fout, en exact N bytes op de draad
-// (review 13-08, vijfde ronde).
 func TestHandlerKanContentLengthNietOverschrijden(t *testing.T) {
 	sawErr := make(chan error, 1)
 	addr := leanServer(t, func(w ResponseWriter, r *Request) {
@@ -615,8 +523,6 @@ func TestHandlerKanContentLengthNietOverschrijden(t *testing.T) {
 	}
 }
 
-// TestCallMethodInjectieGeweigerd — een methode met CRLF is een tweede verzoek
-// in vermomming (review 13-08, vijfde ronde).
 func TestCallMethodInjectieGeweigerd(t *testing.T) {
 	_, err := Do(Call{URL: "http://127.0.0.1:1/", Method: "GET / HTTP/1.1\r\nX-Evil: 1\r\n\r\nGET"})
 	if err == nil || !strings.Contains(err.Error(), "invalid method") {
@@ -624,14 +530,10 @@ func TestCallMethodInjectieGeweigerd(t *testing.T) {
 	}
 }
 
-// TestContentLengthMutatieOmzeiltDeControleNiet — een handler die de lengte ná
-// zijn eerste write "bijwerkt" praatte finish om: die las de mutabele map, niet
-// de draad. De maat is w.declared; de draad beloofde 10, dus de verbinding is
-// op (review 13-08, zevende ronde).
 func TestContentLengthMutatieOmzeiltDeControleNiet(t *testing.T) {
 	addr := leanServer(t, func(w ResponseWriter, r *Request) {
 		w.Header().Set("Content-Length", "10")
-		io.WriteString(w, "12345") // de draadkop met CL=10 is nu gebouwd
+		io.WriteString(w, "12345")
 		w.Header().Set("Content-Length", "5")
 	})
 	c, err := net.Dial("tcp4", addr)
@@ -640,9 +542,7 @@ func TestContentLengthMutatieOmzeiltDeControleNiet(t *testing.T) {
 	}
 	defer c.Close()
 	c.SetDeadline(time.Now().Add(3 * time.Second))
-	// Twee verzoeken gepijplijnd: het tweede mag NOOIT beantwoord worden — de
-	// eerste response is onvolledig (5 van de beloofde 10 bytes), dus de
-	// server hoort te sluiten.
+
 	fmt.Fprintf(c, "GET / HTTP/1.1\r\nHost: x\r\n\r\nGET / HTTP/1.1\r\nHost: x\r\n\r\n")
 	all, _ := io.ReadAll(c)
 	if n := strings.Count(string(all), "HTTP/1.1 200"); n != 1 {
@@ -650,16 +550,11 @@ func TestContentLengthMutatieOmzeiltDeControleNiet(t *testing.T) {
 	}
 }
 
-// TestOverrunLaatDeVerbindingLeven — na het afkappen staat er op de draad een
-// exact kloppende response, en de kop had keep-alive al beloofd: sluiten liet
-// de client een net gepoolde verbinding op het volgende verzoek stuklopen.
-// De handlerfout en de transportstatus zijn twee verschillende dingen
-// (review 13-08, zevende ronde).
 func TestOverrunLaatDeVerbindingLeven(t *testing.T) {
 	addr := leanServer(t, func(w ResponseWriter, r *Request) {
 		w.Header().Set("Content-Length", "5")
 		io.WriteString(w, "12345")
-		io.WriteString(w, "SMOKKEL") // afgekapt + fout voor de handler
+		io.WriteString(w, "SMOKKEL")
 	})
 	c, err := net.Dial("tcp4", addr)
 	if err != nil {
@@ -677,9 +572,6 @@ func TestOverrunLaatDeVerbindingLeven(t *testing.T) {
 	}
 }
 
-// TestUitgaandeHeadernaamStrikt — ook een tab in een verzoekheadernaam is een
-// injectie; en een respons met een ongeldige headernaam wordt geweigerd
-// (dezelfde tokenwacht aan beide kanten, review 13-08, zevende ronde).
 func TestUitgaandeHeadernaamStrikt(t *testing.T) {
 	_, err := Do(Call{URL: "http://127.0.0.1:1/", Header: Header{"X-Bad\theader": "v"}})
 	if err == nil || !strings.Contains(err.Error(), "illegal header name") {
@@ -691,11 +583,6 @@ func TestUitgaandeHeadernaamStrikt(t *testing.T) {
 	}
 }
 
-// TestHeaderTimeoutLooptNietTijdensDeUpload — het contract zegt "alleen het
-// wachten op de antwoordkop", maar de termijn stond al tijdens het versturen
-// van de body aan: een trage upload sneuvelde op de header-timeout terwijl er
-// niets mis was (review 13-08, negende ronde). De server hieronder leest de
-// body bewust trager dan de header-termijn.
 func TestHeaderTimeoutLooptNietTijdensDeUpload(t *testing.T) {
 	l, err := net.Listen("tcp4", "127.0.0.1:0")
 	if err != nil {
@@ -709,29 +596,23 @@ func TestHeaderTimeoutLooptNietTijdensDeUpload(t *testing.T) {
 		}
 		defer c.Close()
 		c.SetDeadline(time.Now().Add(15 * time.Second))
-		// Meteen het oordeel geven (stilte is sinds de eenendertigste ronde
-		// een fout), dán pas traag gaan lezen: de client-write loopt vol en
-		// blokkeert — precies de fase die NIET onder de kop-termijn valt.
+
 		io.WriteString(c, "HTTP/1.1 100 Continue\r\n\r\n")
 		time.Sleep(400 * time.Millisecond)
 		io.Copy(io.Discard, io.LimitReader(c, 1<<30))
-		// io.Copy eindigt pas op EOF; een eindantwoord komt er nooit — de
-		// client hoort op zijn kop-termijn te falen, ná de upload.
+
 	}()
 
-	body := bytes.Repeat([]byte("A"), 4<<20) // 4MB: ruim voorbij elke socketbuffer
+	body := bytes.Repeat([]byte("A"), 4<<20)
 	_, err = Do(Call{
 		URL:           "http://" + l.Addr().String() + "/",
 		Method:        "PUT",
 		BodyReader:    bytes.NewReader(body),
 		BodyLen:       int64(len(body)),
-		HeaderTimeout: 150 * time.Millisecond, // korter dan de server-slaap
+		HeaderTimeout: 150 * time.Millisecond,
 		Timeout:       10 * time.Second,
 	})
-	// De kop komt nooit (de server antwoordt niet) — maar de fout mag NIET
-	// tijdens de upload vallen: met de oude volgorde faalde de body-write op
-	// de header-termijn ("stream body ... timeout"), nu wacht de kop-lezer op
-	// zijn eigen termijn ("read status line").
+
 	if err == nil {
 		t.Fatal("verwachtte een fout (de server antwoordt nooit)")
 	}
@@ -740,8 +621,6 @@ func TestHeaderTimeoutLooptNietTijdensDeUpload(t *testing.T) {
 	}
 }
 
-// TestVreemdeProtocolversieWordtGeweigerd — HTTP/9.9 accepteren betekent
-// gokken over framing en persistentie; hij kon zelfs de pool in.
 func TestVreemdeProtocolversieWordtGeweigerd(t *testing.T) {
 	addr := rawServer(t, "HTTP/9.9 200 OK\r\nContent-Length: 2\r\n\r\nok")
 	if _, err := Do(Call{URL: "http://" + addr + "/"}); err == nil || !strings.Contains(err.Error(), "unsupported protocol") {
@@ -757,10 +636,6 @@ func TestVreemdeProtocolversieWordtGeweigerd(t *testing.T) {
 	}
 }
 
-// TestMuxWeigertAmbigueRoutes — /users/{id} en /users/{name} verschillen
-// alleen in de wildcardnaam (de tweede is onbereikbaar), en kruisende patronen
-// met gelijke score werden stil door registratievolgorde beslist
-// (review 13-08, negende ronde).
 func TestMuxWeigertAmbigueRoutes(t *testing.T) {
 	expectPanic := func(name string, fn func()) {
 		t.Helper()
@@ -781,15 +656,11 @@ func TestMuxWeigertAmbigueRoutes(t *testing.T) {
 	m2.HandleFunc("GET /a/{x}", h)
 	expectPanic("kruisend met gelijke score", func() { m2.HandleFunc("GET /{y}/b", h) })
 
-	// Verschíllende score blijft toegestaan: specificiteit beslist.
 	m3 := NewServeMux()
 	m3.HandleFunc("GET /a/{x}", h)
-	m3.HandleFunc("GET /a/b", h) // hogere score, geen conflict
+	m3.HandleFunc("GET /a/b", h)
 }
 
-// TestTimeoutDektDeHeleRedirectKeten — elke redirect kreeg een verse Timeout:
-// een call met 600ms kon door drie trage hops ~1,8s duren (review 13-08,
-// tiende ronde). Twee hops van elk ~400ms tegen een totaal van 600ms.
 func TestTimeoutDektDeHeleRedirectKeten(t *testing.T) {
 	slow := leanServer(t, func(w ResponseWriter, r *Request) {
 		time.Sleep(400 * time.Millisecond)
@@ -810,9 +681,6 @@ func TestTimeoutDektDeHeleRedirectKeten(t *testing.T) {
 	}
 }
 
-// TestMuxWeigertOngeldigeVormen — segmenten ná {rest...}, dubbele
-// wildcardnamen, lege accolades én de dekking-dubbeling /files/ vs
-// /files/{rest...} (review 13-08, tiende ronde).
 func TestMuxWeigertOngeldigeVormen(t *testing.T) {
 	expectPanic := func(name string, fn func()) {
 		t.Helper()
@@ -835,10 +703,6 @@ func TestMuxWeigertOngeldigeVormen(t *testing.T) {
 	expectPanic("subtree vs rest: zelfde dekking", func() { m.HandleFunc("GET /files/{rest...}", h) })
 }
 
-// TestTrageBodyGijzeltGeenGoroutine — een client die een Content-Length
-// belooft en stilvalt liet een handler in io.ReadAll eeuwig wachten: de
-// leestermijn werd vóór de handler gewist en de drain-termijn kwam nooit aan
-// bod (review 13-08, tiende ronde).
 func TestTrageBodyGijzeltGeenGoroutine(t *testing.T) {
 	got := make(chan error, 1)
 	addr := leanServer(t, func(w ResponseWriter, r *Request) {
@@ -851,7 +715,7 @@ func TestTrageBodyGijzeltGeenGoroutine(t *testing.T) {
 	}
 	defer c.Close()
 	fmt.Fprintf(c, "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 1000\r\n\r\nhalf")
-	// ... en dan stilte, zonder te sluiten.
+
 	select {
 	case err := <-got:
 		if err == nil {
@@ -862,16 +726,8 @@ func TestTrageBodyGijzeltGeenGoroutine(t *testing.T) {
 	}
 }
 
-// TestDoneOverleeftDeBodyTimeout — serveConn wapent vóór de handler een
-// leestermijn op een body-dragend verzoek; de wachthond van Done() leest op
-// diezelfde verbinding, en een read-fout betekent voor hem "de kijker is weg".
-// Een POST-streamer die eerst netjes zijn body las en dán Done() aanriep
-// (precies wat de docs voorschrijven) zag zijn stream dus na ~5s spontaan
-// verlaten (review 13-08, elfde ronde). Done() hoort de termijn te wissen,
-// zoals Hijack dat doet. Deze test kost bewust bodyTimeout+1s: korter is geen
-// bewijs.
 func TestDoneOverleeftDeBodyTimeout(t *testing.T) {
-	verdict := make(chan bool, 1) // true = Done vuurde terwijl de kijker er nog was
+	verdict := make(chan bool, 1)
 	addr := leanServer(t, func(w ResponseWriter, r *Request) {
 		if _, err := io.Copy(io.Discard, r.Body); err != nil {
 			t.Errorf("body lezen: %v", err)
@@ -891,16 +747,12 @@ func TestDoneOverleeftDeBodyTimeout(t *testing.T) {
 	}
 	defer c.Close()
 	fmt.Fprintf(c, "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 4\r\n\r\nping")
-	// ... en dan blijven we rustig kijken, zonder te sluiten.
+
 	if <-verdict {
 		t.Fatal("Done() vuurde terwijl de client er nog is — de bodyTimeout at de wachthond op")
 	}
 }
 
-// TestPoolDialValtOnderDeTotaaltermijn — de klem van de tiende ronde zat alleen
-// in de kale dialer van do(); via een Client dialde de eigen fallback met de
-// vaste dialTimeout, dus hing een Call.Timeout van 300ms alsnog 10s op een
-// onbereikbare host (review 13-08, elfde ronde).
 func TestPoolDialValtOnderDeTotaaltermijn(t *testing.T) {
 	cl := &Client{}
 	start := time.Now()
@@ -913,9 +765,6 @@ func TestPoolDialValtOnderDeTotaaltermijn(t *testing.T) {
 	}
 }
 
-// TestServerEistEenGeldigeHost — HTTP/1.1 zonder Host, met lege Host of met
-// twee Hosts is achter een proxy een routerings-smokkelgat; en een methode
-// met rare bytes idem (review 13-08, tiende ronde).
 func TestServerEistEenGeldigeHost(t *testing.T) {
 	addr := leanServer(t, func(w ResponseWriter, r *Request) {
 		w.Header().Set("Content-Length", "2")
@@ -931,13 +780,12 @@ func TestServerEistEenGeldigeHost(t *testing.T) {
 			t.Fatalf("%s: antwoord %q, wil een 400", name, got)
 		}
 	}
-	// HTTP/1.0 is gesloopt aan de serverkant (negenentwintigste ronde): 505.
+
 	if got := rawRoundTrip(t, addr, "GET / HTTP/1.0\r\n\r\n"); !strings.Contains(got, "505") {
 		t.Fatalf("HTTP/1.0 gaf %q, wil een 505", got)
 	}
 }
 
-// closeSignal meldt zijn eigen Close — voor de lek-toets hierboven.
 type closeSignal struct {
 	net.Conn
 	done chan struct{}
@@ -945,11 +793,9 @@ type closeSignal struct {
 
 func (c closeSignal) Close() error { close(c.done); return c.Conn.Close() }
 
-// fakeSink is een net.Conn-stub voor de schrijftermijn-test: hij noteert per
-// socket-write of er op dat moment een schrijftermijn stond.
 type fakeSink struct {
 	deadline time.Time
-	unarmed  int // socket-writes zónder termijn
+	unarmed  int
 }
 
 func (f *fakeSink) Write(p []byte) (int, error) {
@@ -966,23 +812,19 @@ func (f *fakeSink) SetDeadline(t time.Time) error      { f.deadline = t; return 
 func (f *fakeSink) SetReadDeadline(time.Time) error    { return nil }
 func (f *fakeSink) SetWriteDeadline(t time.Time) error { f.deadline = t; return nil }
 
-// TestGroteWriteWapentDeSchrijftermijn — de schrijftermijn stond alleen in
-// flush(), maar bufio schrijft bij een volle buffer of een grote p zélf al
-// door naar de socket: een client die niet leest blokkeerde de handler dan al
-// vóór zijn Flush, onbegrensd (review 13-08, twaalfde ronde).
 func TestGroteWriteWapentDeSchrijftermijn(t *testing.T) {
 	f := &fakeSink{}
 	c := &conn{nc: f, br: bufio.NewReaderSize(f, bufSize), bw: bufio.NewWriterSize(&timedWriter{nc: f}, bufSize)}
 	w := &respWriter{c: c, hdr: Header{}, status: StatusOK, keepAlive: true, declared: -1}
 	big := int64(3 * bufSize)
 	w.Header().Set("Content-Length", strconv.FormatInt(big+2, 10))
-	if _, err := w.Write([]byte("hi")); err != nil { // kop eruit, rechtstreeks pad
+	if _, err := w.Write([]byte("hi")); err != nil {
 		t.Fatal(err)
 	}
-	if err := w.Flush(); err != nil { // wist de termijn — zoals tussen twee frames
+	if err := w.Flush(); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := w.Write(make([]byte, big)); err != nil { // past nooit: schrijft dóór
+	if _, err := w.Write(make([]byte, big)); err != nil {
 		t.Fatal(err)
 	}
 	if f.unarmed > 0 {
@@ -990,9 +832,6 @@ func TestGroteWriteWapentDeSchrijftermijn(t *testing.T) {
 	}
 }
 
-// TestKaleLFIsGeenRegel — een regel die op een kale LF eindigt is bij de ene
-// parser een regel en bij de andere deel van de vorige: exact CRLF is de
-// enige vorm zonder differentiaal (review 13-08, dertiende ronde).
 func TestKaleLFIsGeenRegel(t *testing.T) {
 	addr := leanServer(t, func(w ResponseWriter, r *Request) {
 		w.Header().Set("Content-Length", "2")
@@ -1003,9 +842,6 @@ func TestKaleLFIsGeenRegel(t *testing.T) {
 	}
 }
 
-// TestContentLengthAlleenCijfers — ParseInt accepteerde "+5": voor ons een 5,
-// voor een proxy ervóór mogelijk een fout of iets anders — precies het
-// framing-verschil waar smuggling op drijft (review 13-08, dertiende ronde).
 func TestContentLengthAlleenCijfers(t *testing.T) {
 	addr := leanServer(t, func(w ResponseWriter, r *Request) {
 		io.Copy(io.Discard, r.Body)
@@ -1015,16 +851,13 @@ func TestContentLengthAlleenCijfers(t *testing.T) {
 	if got := rawRoundTrip(t, addr, "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: +5\r\nConnection: close\r\n\r\nAAAAA"); !strings.Contains(got, "400") {
 		t.Fatalf("Content-Length +5 gaf %q, wil een 400", got)
 	}
-	// De clientkant weigert een antwoord met zo'n lengte net zo hard.
+
 	srv := rawServer(t, "HTTP/1.1 200 OK\r\nContent-Length: +2\r\n\r\nok")
 	if _, err := Do(Call{URL: "http://" + srv + "/"}); err == nil {
 		t.Fatal("een antwoord met Content-Length +2 hoort een fout te zijn")
 	}
 }
 
-// TestControlByteInHeaderIsFout — een CTL in een headerwaarde (of een losse
-// CR, nu de regel exact op CRLF moet eindigen) is een injectievector, geen
-// waarde (review 13-08, dertiende ronde).
 func TestControlByteInHeaderIsFout(t *testing.T) {
 	addr := leanServer(t, func(w ResponseWriter, r *Request) {
 		w.Header().Set("Content-Length", "2")
@@ -1040,11 +873,8 @@ func TestControlByteInHeaderIsFout(t *testing.T) {
 	}
 }
 
-// TestChunkgrootteAlleenHex — zelfde strengheid voor de chunk-framing: "+3"
-// is geen grootte (review 13-08, dertiende ronde).
 func TestChunkgrootteAlleenHex(t *testing.T) {
-	// Exact 1*HEXDIG (RFC 9112 §7.1): ook OWS eromheen is een fout — juist
-	// bij framing geen tolerantie (review 13-08, zeventiende ronde).
+
 	for _, size := range []string{"+3", " 3", "3 "} {
 		srv := rawServer(t, "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"+size+"\r\nabc\r\n0\r\n\r\n")
 		resp, err := Do(Call{URL: "http://" + srv + "/"})
@@ -1058,10 +888,6 @@ func TestChunkgrootteAlleenHex(t *testing.T) {
 	}
 }
 
-// TestSpillLaatGeenTermijnAchter — de gewapende termijn van een
-// doorschrijvende write moet ná die write weer uit: hij verliep anders stil
-// tijdens het rekenen van de handler, in strijd met "per schrijfronde, niet
-// per antwoord" (review 13-08, dertiende ronde).
 func TestSpillLaatGeenTermijnAchter(t *testing.T) {
 	f := &fakeSink{}
 	c := &conn{nc: f, br: bufio.NewReaderSize(f, bufSize), bw: bufio.NewWriterSize(&timedWriter{nc: f}, bufSize)}
@@ -1076,10 +902,6 @@ func TestSpillLaatGeenTermijnAchter(t *testing.T) {
 	}
 }
 
-// TestStatuscodeExactDrieCijfers — Atoi accepteerde "+200" en " 20": de
-// statuscode stuurt bodyAllowed, de 1xx-lus én de hergebruik-beslissing, dus
-// hier geldt hetzelfde cijfers-only-regime als bij Content-Length
-// (review 13-08, veertiende ronde).
 func TestStatuscodeExactDrieCijfers(t *testing.T) {
 	for _, status := range []string{"+200", "+20", "20", "2000", "0200", "2O0"} {
 		srv := rawServer(t, "HTTP/1.1 "+status+" OK\r\nContent-Length: 2\r\n\r\nok")
@@ -1089,11 +911,6 @@ func TestStatuscodeExactDrieCijfers(t *testing.T) {
 	}
 }
 
-// TestSyntaxfoutDraintNiet — de drain ná een 400 is er voor een aangekondigde
-// body die nog binnenkomt; bij een pure syntaxfout is het verzoek al binnen
-// en pinde de onvoorwaardelijke drain goroutine, socket en (op leannet)
-// budget twee volle seconden per malformed request (review 13-08, vijftiende
-// ronde).
 func TestSyntaxfoutDraintNiet(t *testing.T) {
 	addr := leanServer(t, func(w ResponseWriter, r *Request) {})
 	start := time.Now()
@@ -1106,17 +923,13 @@ func TestSyntaxfoutDraintNiet(t *testing.T) {
 	}
 }
 
-// TestUitgaandeHeaderwaardeStrikt — reader en writers spreken dezelfde
-// grammatica (validFieldValue): een NUL in een headerwaarde kwam uitgaand
-// gewoon op de draad, waarna leanhttp hem zelf geweigerd zou hebben
-// (review 13-08, vijftiende ronde).
 func TestUitgaandeHeaderwaardeStrikt(t *testing.T) {
-	// Clientkant: een fout vóór de dial, geen draadbytes.
+
 	_, err := Do(Call{URL: "http://127.0.0.1:1/", Header: Header{"X-A": "a\x00b"}})
 	if err == nil || !strings.Contains(err.Error(), "illegal value") {
 		t.Fatalf("kreeg %v, wil een illegal-value-fout vóór de dial", err)
 	}
-	// Serverkant: de kop wordt overgeslagen, niet doorgegeven.
+
 	addr := leanServer(t, func(w ResponseWriter, r *Request) {
 		w.Header().Set("X-A", "a\x00b")
 		w.Header().Set("Content-Length", "2")
@@ -1128,9 +941,6 @@ func TestUitgaandeHeaderwaardeStrikt(t *testing.T) {
 	}
 }
 
-// TestDialContextWordtGeannuleerd — DialContext draagt de totaaltermijn als
-// context-deadline, dus de dialer kan écht opgeven: bij Dial begrenst
-// dialBounded alleen het wachten (review 13-08, vijftiende ronde).
 func TestDialContextWordtGeannuleerd(t *testing.T) {
 	canceled := make(chan struct{})
 	start := time.Now()
@@ -1138,7 +948,7 @@ func TestDialContextWordtGeannuleerd(t *testing.T) {
 		URL:     "http://x/",
 		Timeout: 150 * time.Millisecond,
 		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-			<-ctx.Done() // een dialer die netjes op zijn context let
+			<-ctx.Done()
 			close(canceled)
 			return nil, ctx.Err()
 		},
@@ -1156,9 +966,6 @@ func TestDialContextWordtGeannuleerd(t *testing.T) {
 	}
 }
 
-// TestHEADValtTerugOpGET — net/http-semantiek: een GET-route bedient ook
-// HEAD, met dezelfde kop en zonder body-bytes (review 13-08, vijftiende
-// ronde).
 func TestHEADValtTerugOpGET(t *testing.T) {
 	m := NewServeMux()
 	m.HandleFunc("GET /x", func(w ResponseWriter, r *Request) {
@@ -1175,10 +982,6 @@ func TestHEADValtTerugOpGET(t *testing.T) {
 	}
 }
 
-// TestExacteHEADRouteGaatVoorDeTerugval — de GET→HEAD-terugval vuurt pas als
-// er géén exacte HEAD-route is: beide routes krijgen dezelfde score, dus
-// meteen vuren liet registratievolgorde beslissen — precies de ambiguïteit
-// die conflictsWith elders afstraft (review 13-08, zestiende ronde).
 func TestExacteHEADRouteGaatVoorDeTerugval(t *testing.T) {
 	for _, getEerst := range []bool{true, false} {
 		m := NewServeMux()
@@ -1200,10 +1003,6 @@ func TestExacteHEADRouteGaatVoorDeTerugval(t *testing.T) {
 	}
 }
 
-// TestResponseMetDubbeleFramingIsFout — de client keurde elke TE-regel los
-// goed en liet "chunked wint" beslissen, waarna de verbinding met een
-// dubbelzinnig geframed antwoord de pool in kon: twee parsers kunnen op zo'n
-// antwoord een ander einde zien (review 13-08, zeventiende ronde).
 func TestResponseMetDubbeleFramingIsFout(t *testing.T) {
 	for name, resp := range map[string]string{
 		"TE plus CL": "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Length: 3\r\n\r\n3\r\nabc\r\n0\r\n\r\n",
@@ -1216,10 +1015,6 @@ func TestResponseMetDubbeleFramingIsFout(t *testing.T) {
 	}
 }
 
-// TestOngeldigeContentLengthGaatDeDraadNietOp — "abc" of "+5" is zichtbare
-// ASCII en glipte langs validFieldValue de draad op, mét keep-alive-belofte,
-// terwijl dezelfde waarde inkomend een 400 is. Nu: kop eraf, verbinding
-// dicht, framing op EOF (review 13-08, zeventiende ronde).
 func TestOngeldigeContentLengthGaatDeDraadNietOp(t *testing.T) {
 	addr := leanServer(t, func(w ResponseWriter, r *Request) {
 		w.Header().Set("Content-Length", "abc")
@@ -1232,17 +1027,13 @@ func TestOngeldigeContentLengthGaatDeDraadNietOp(t *testing.T) {
 	if !strings.Contains(got, "Connection: close") || !strings.HasSuffix(got, "ok") {
 		t.Fatalf("antwoord %q: wil Connection: close en de body op EOF-framing", got)
 	}
-	// En óók op een HEAD: suppressBody sloeg de validatie eerst helemaal over
-	// (review 13-08, negentiende ronde).
+
 	got = rawRoundTrip(t, addr, "HEAD / HTTP/1.1\r\nHost: x\r\n\r\n")
 	if strings.Contains(got, "abc") {
 		t.Fatalf("HEAD-antwoord %q: de ongeldige lengte staat op de draad", got)
 	}
 }
 
-// TestTerugvalWintVanGeneriekeRoute — "GET /x" is ook voor HEAD specifieker
-// dan "/x": de terugval-kandidaat verloor eerst van élke exacte match, ook
-// een lager gescoorde methode-loze route (review 13-08, zeventiende ronde).
 func TestTerugvalWintVanGeneriekeRoute(t *testing.T) {
 	for _, getEerst := range []bool{true, false} {
 		m := NewServeMux()
@@ -1264,10 +1055,6 @@ func TestTerugvalWintVanGeneriekeRoute(t *testing.T) {
 	}
 }
 
-// TestChunkExtensieEnTrailerStrikt — de chunkgrootte was al strikt, maar
-// alles ná de ";" werd ongevalideerd weggegooid en trailers alleen
-// overgeslagen: malformed extensies, kapotte trailerregels en verboden
-// framing-trailers passeerden stil (review 13-08, negentiende ronde).
 func TestChunkExtensieEnTrailerStrikt(t *testing.T) {
 	kapot := map[string]string{
 		"extensie (weigeren wij volledig)": "3;ext=foo\r\nabc\r\n0\r\n\r\n",
@@ -1288,7 +1075,7 @@ func TestChunkExtensieEnTrailerStrikt(t *testing.T) {
 		}
 		resp.Body.Close()
 	}
-	// En een nette trailer blijft gewoon werken.
+
 	srv := rawServer(t, "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\nX-Sum: ok\r\n\r\n")
 	resp, err := Do(Call{URL: "http://" + srv + "/"})
 	if err != nil {
@@ -1300,12 +1087,6 @@ func TestChunkExtensieEnTrailerStrikt(t *testing.T) {
 	}
 }
 
-// TestMuxKruisendePatronenConflicteren — de oude toets liet overlappende
-// patronen door zodra hun scóres verschilden, maar een score is een telsom,
-// geen subsetrelatie: GET /a/{x}/{y} en GET /{x}/b/c matchen beide /a/b/c
-// zonder dat één een subset is — "meer literals" koos dan de handler, en dus
-// mogelijk de verkeerde autorisatie (review 13-08, eenentwintigste ronde).
-// Alleen een strikte subset mag naast zijn superset bestaan (Go 1.22-regel).
 func TestMuxKruisendePatronenConflicteren(t *testing.T) {
 	h := func(w ResponseWriter, r *Request) {}
 	expectPanic := func(name string, patterns ...string) {
@@ -1320,10 +1101,10 @@ func TestMuxKruisendePatronenConflicteren(t *testing.T) {
 			m.HandleFunc(p, h)
 		}
 	}
-	// Kruisers: overlap zonder subsetrelatie.
+
 	expectPanic("kruisende wildcards", "GET /a/{x}/{y}", "GET /{x}/b/c")
 	expectPanic("kruisend met subtree", "GET /a/{x}/", "GET /{x}/b/")
-	// Strikte subsets blijven gewoon toegestaan.
+
 	for name, patterns := range map[string][]string{
 		"exact onder subtree":    {"GET /files/", "GET /files/x"},
 		"methode onder elk":      {"/x", "GET /x"},
@@ -1344,11 +1125,6 @@ func TestMuxKruisendePatronenConflicteren(t *testing.T) {
 	}
 }
 
-// TestMuxGETKruistHEAD — methoden zijn sets (HEAD ⊂ GET ⊂ ""): GET /a/{x} en
-// HEAD /{x}/b matchen beide HEAD /a/b zonder subsetrelatie en horen dus te
-// conflicteren; de vorige toets zag GET en HEAD als disjunct (review 13-08,
-// tweeëntwintigste ronde). De strikte subset HEAD /x onder GET /x blijft wél
-// toegestaan.
 func TestMuxGETKruistHEAD(t *testing.T) {
 	h := func(w ResponseWriter, r *Request) {}
 	func() {
@@ -1363,14 +1139,9 @@ func TestMuxGETKruistHEAD(t *testing.T) {
 	}()
 	m := NewServeMux()
 	m.HandleFunc("GET /x", h)
-	m.HandleFunc("HEAD /x", h) // strikte subset: mag
+	m.HandleFunc("HEAD /x", h)
 }
 
-// TestMuxSlashIsEenAnderPad — /admin en /admin/ vielen bij het matchen samen
-// en het vaste patroon won op scorepunten: precies de wortel van een
-// beveiligde subtree belandde zo bij de publieke handler (review 13-08,
-// tweeëntwintigste ronde). Het slash-model: vast = exact dit pad zonder
-// slash, subtree = wortel mét slash plus alles eronder.
 func TestMuxSlashIsEenAnderPad(t *testing.T) {
 	m := NewServeMux()
 	tagged := func(tag string) Handler {
@@ -1388,7 +1159,7 @@ func TestMuxSlashIsEenAnderPad(t *testing.T) {
 			t.Fatalf("%s: antwoord %q, wil %s", pad, got, wil)
 		}
 	}
-	// En een vast patroon matcht zijn slash-vorm niet.
+
 	m2 := NewServeMux()
 	m2.HandleFunc("GET /health", tagged("gezond"))
 	addr2 := leanServer(t, m2.ServeHTTP)
@@ -1397,10 +1168,6 @@ func TestMuxSlashIsEenAnderPad(t *testing.T) {
 	}
 }
 
-// TestRedirectAlleenVoorGETEnHEAD — "geen body" was een proxy voor "veilig te
-// herhalen": een bodyloze DELETE werd stil op de nieuwe URL heruitgevoerd, en
-// zelfs een 304 mét Location werd gevolgd (review 13-08, tweeëntwintigste
-// ronde). Alleen 301/302/303/307/308 en alleen GET/HEAD volgen automatisch.
 func TestRedirectAlleenVoorGETEnHEAD(t *testing.T) {
 	m := NewServeMux()
 	m.HandleFunc("/van", func(w ResponseWriter, r *Request) { Redirect(w, "/doel", 302) })
@@ -1427,7 +1194,7 @@ func TestRedirectAlleenVoorGETEnHEAD(t *testing.T) {
 	if string(body) != "doel" {
 		t.Fatalf("GET volgde de 302 niet: %q", body)
 	}
-	// 304 is cache-validatie, geen doorverwijzing — ook niet mét Location.
+
 	srv := rawServer(t, "HTTP/1.1 304 Not Modified\r\nLocation: http://x/\r\n\r\n")
 	resp, err = Do(Call{URL: "http://" + srv + "/"})
 	if err != nil {
@@ -1439,13 +1206,8 @@ func TestRedirectAlleenVoorGETEnHEAD(t *testing.T) {
 	}
 }
 
-// TestMethodeIsHoofdlettergevoelig — methode-tokens zijn hoofdlettergevoelig
-// (RFC 9110 §9.1): "head" is een ándere, custom methode dan HEAD. De server
-// onderdrukte er wél de body voor (met een lengte in de kop: de client bleef
-// op bytes wachten), en de client sloeg er een échte body voor over en poolde
-// de verbinding met ongelezen bytes (review 13-08, drieëntwintigste ronde).
 func TestMethodeIsHoofdlettergevoelig(t *testing.T) {
-	// Serverkant: "head" krijgt gewoon de volledige body.
+
 	addr := leanServer(t, func(w ResponseWriter, r *Request) {
 		w.Header().Set("Content-Length", "5")
 		io.WriteString(w, "hallo")
@@ -1453,8 +1215,7 @@ func TestMethodeIsHoofdlettergevoelig(t *testing.T) {
 	if got := rawRoundTrip(t, addr, "head / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"); !strings.Contains(got, "hallo") {
 		t.Fatalf("antwoord op 'head' mist de body: %q", got)
 	}
-	// Clientkant: een antwoord op "head" draagt een echte body en die hoort
-	// gelezen te worden, niet overgeslagen als ware het HEAD.
+
 	srv := rawServer(t, "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
 	resp, err := Do(Call{Method: "head", URL: "http://" + srv + "/"})
 	if err != nil {
@@ -1466,11 +1227,6 @@ func TestMethodeIsHoofdlettergevoelig(t *testing.T) {
 	}
 }
 
-// TestAmbigueEscapesWordenGeweigerd — het antwoord op de %2F/%2E-klasse is
-// sinds de zevenentwintigste ronde WEIGEREN in plaats van afhandelen: een
-// segment dat naar "/", "." of ".." decodeert is een 400 aan de deur, en een
-// onschuldige escape (%61 = 'a') decodeert gewoon — middleware, Mux en
-// handler zien daardoor per constructie hetzelfde pad.
 func TestAmbigueEscapesWordenGeweigerd(t *testing.T) {
 	m := NewServeMux()
 	m.HandleFunc("GET /objects/{key}", func(w ResponseWriter, r *Request) {
@@ -1489,16 +1245,12 @@ func TestAmbigueEscapesWordenGeweigerd(t *testing.T) {
 			t.Fatalf("%s: antwoord %q, wil een 400", name, got)
 		}
 	}
-	// Onschuldige escapes decoderen aan de deur: /%61dmin ís /admin.
+
 	if got := rawRoundTrip(t, addr, "GET /%61dmin HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"); !strings.Contains(got, "X-Handler: admin") {
 		t.Fatalf("antwoord %q: een onschuldige escape hoort gewoon te routeren", got)
 	}
 }
 
-// TestLegeBodyPooltDirect — een bewezen-lege body (204, HEAD, CL:0) is bij
-// constructie al "gelezen": een caller die alleen netjes Close doet (de
-// DELETE→204-route) sloot anders elke keer de verbinding en betaalde per
-// delete een handshake (review 13-08, drieëntwintigste ronde).
 func TestLegeBodyPooltDirect(t *testing.T) {
 	addr := leanServer(t, func(w ResponseWriter, r *Request) {
 		w.WriteHeader(StatusNoContent)
@@ -1508,17 +1260,12 @@ func TestLegeBodyPooltDirect(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	resp.Body.Close() // zonder Read: het einde is al bewezen
+	resp.Body.Close()
 	if n := cl.idleFor(addr); n != 1 {
 		t.Fatalf("pool draagt %d verbindingen na een 204-Close, wil 1", n)
 	}
 }
 
-// TestMiddlewareEnMuxZienHetzelfdePad — het pad wordt bij het parsen al
-// geschoond (escaped vorm): middleware die /public/../admin goedkeurde zag
-// een ander pad dan de Mux daarna routeerde, en een rewrite van r.Path door
-// middleware werd genegeerd omdat de Mux een privé escaped pad las
-// (review 13-08, vierentwintigste ronde).
 func TestMiddlewareEnMuxZienHetzelfdePad(t *testing.T) {
 	m := NewServeMux()
 	m.HandleFunc("/admin", func(w ResponseWriter, r *Request) { w.Header().Set("X-Handler", "admin") })
@@ -1527,14 +1274,12 @@ func TestMiddlewareEnMuxZienHetzelfdePad(t *testing.T) {
 	middleware := func(w ResponseWriter, r *Request) {
 		zagPad = r.Path
 		if r.Path == "/admin" {
-			r.Path = "/intern" // een rewrite hoort gewoon te tellen
+			r.Path = "/intern"
 		}
 		m.ServeHTTP(w, r)
 	}
 	addr := leanServer(t, middleware)
-	// (Niet-canonieke vormen zijn sinds de tweeëndertigste ronde een 400 aan
-	// de deur — zie TestNietCanoniekIsEen400; hier telt alleen nog dat
-	// middleware en Mux hetzelfde pad zien en dat een rewrite doorwerkt.)
+
 	got := rawRoundTrip(t, addr, "GET /admin HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
 	if zagPad != "/admin" {
 		t.Fatalf("middleware zag %q — een ander pad dan de Mux routeert", zagPad)
@@ -1544,9 +1289,6 @@ func TestMiddlewareEnMuxZienHetzelfdePad(t *testing.T) {
 	}
 }
 
-// TestEscapedLiteralInPatroonPanickt — verzoekpaden zijn bij het parsen al
-// gedecodeerd, dus een %-escape in een patroon-literal zou nooit matchen:
-// bedradingsfout, paniek (review 13-08, zevenentwintigste ronde).
 func TestEscapedLiteralInPatroonPanickt(t *testing.T) {
 	defer func() {
 		if recover() == nil {
@@ -1556,10 +1298,6 @@ func TestEscapedLiteralInPatroonPanickt(t *testing.T) {
 	NewServeMux().HandleFunc("GET /objects/secret%2Fmetadata", func(w ResponseWriter, r *Request) {})
 }
 
-// TestLegeFramingheaderVerdwijntNiet — hdr.add zag een lege waarde als "niet
-// aanwezig": "Content-Length:" + "Content-Length: 5" werd één geldige lengte,
-// een klassiek smuggling-differentiaal. Framingheaders tellen nu per fysieke
-// regel (review 13-08, vierentwintigste ronde).
 func TestLegeFramingheaderVerdwijntNiet(t *testing.T) {
 	addr := leanServer(t, func(w ResponseWriter, r *Request) {
 		io.Copy(io.Discard, r.Body)
@@ -1576,13 +1314,9 @@ func TestLegeFramingheaderVerdwijntNiet(t *testing.T) {
 	}
 }
 
-// TestGeenPoolMetOngelezenBytes — een bewezen-lege body is direct compleet,
-// maar de reader kan een ongevraagd vooruitgestuurd "antwoord" bevatten: dan
-// zou call 2 zijn verzoek schrijven en dát lezen (review 13-08,
-// vierentwintigste ronde). Nooit poolen met br.Buffered() != 0.
 func TestGeenPoolMetOngelezenBytes(t *testing.T) {
 	addr := rawServer(t, "HTTP/1.1 204 No Content\r\n\r\n"+
-		"HTTP/1.1 200 OK\r\nContent-Length: 999\r\n\r\n") // de smokkelwaar
+		"HTTP/1.1 200 OK\r\nContent-Length: 999\r\n\r\n")
 	cl := &Client{}
 	resp, err := cl.Do(Call{URL: "http://" + addr + "/"})
 	if err != nil {
@@ -1597,11 +1331,6 @@ func TestGeenPoolMetOngelezenBytes(t *testing.T) {
 	}
 }
 
-// TestIdleTimeoutRuimtZelfOp — de sweep draaide alleen bij een vólgend
-// verzoek: na het laatste verzoek bleef een gepoolde verbinding onbeperkt
-// staan, en op leannet houdt die minstens 20KiB pot vast — precies het
-// geheugendoel dat de pool moest dienen (review 13-08, vierentwintigste
-// ronde). Nu timer-gedreven.
 func TestIdleTimeoutRuimtZelfOp(t *testing.T) {
 	addr := leanServer(t, func(w ResponseWriter, r *Request) {
 		w.Header().Set("Content-Length", "2")
@@ -1617,18 +1346,12 @@ func TestIdleTimeoutRuimtZelfOp(t *testing.T) {
 	if n := cl.idleCount(); n != 1 {
 		t.Fatalf("pool draagt %d verbindingen, wil 1 (opzet)", n)
 	}
-	time.Sleep(600 * time.Millisecond) // ruim voorbij timeout + marge
+	time.Sleep(600 * time.Millisecond)
 	if n := cl.idleCount(); n != 0 {
 		t.Fatalf("pool draagt na de idle-timeout nog %d verbindingen — niemand ruimt op", n)
 	}
 }
 
-// --- ronde 25 ---
-
-// TestStaleKeepAliveKrijgtEenHerkansing — een server die zijn idle
-// keep-alive netjes sluit gaf de volgende call een zichtbare fout; nu één
-// veilige herkansing (niets van het antwoord geconsumeerd, het hele verzoek
-// gaat opnieuw) — review 13-08, vijfentwintigste ronde.
 func TestStaleKeepAliveKrijgtEenHerkansing(t *testing.T) {
 	l, err := net.Listen("tcp4", "127.0.0.1:0")
 	if err != nil {
@@ -1642,7 +1365,7 @@ func TestStaleKeepAliveKrijgtEenHerkansing(t *testing.T) {
 				return
 			}
 			go func(c net.Conn) {
-				// Eén antwoord (mét keep-alive-belofte), dan hard dicht.
+
 				bufio.NewReader(c).ReadString('\n')
 				io.WriteString(c, "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
 				time.Sleep(50 * time.Millisecond)
@@ -1658,13 +1381,10 @@ func TestStaleKeepAliveKrijgtEenHerkansing(t *testing.T) {
 		}
 		io.Copy(io.Discard, resp.Body)
 		resp.Body.Close()
-		time.Sleep(120 * time.Millisecond) // de server sluit; de pool weet dat niet
+		time.Sleep(120 * time.Millisecond)
 	}
 }
 
-// TestBodyDeadlineGeldtOokVoorGebufferdeBytes — de conn-deadline dekt alleen
-// socket-reads: bytes die de bufio al binnen had, lazen vrolijk door een
-// verlopen Call.Timeout heen (review 13-08, vijfentwintigste ronde).
 func TestBodyDeadlineGeldtOokVoorGebufferdeBytes(t *testing.T) {
 	srv := rawServer(t, "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nbody")
 	resp, err := Do(Call{URL: "http://" + srv + "/", Timeout: 150 * time.Millisecond})
@@ -1672,19 +1392,16 @@ func TestBodyDeadlineGeldtOokVoorGebufferdeBytes(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer resp.Body.Close()
-	time.Sleep(300 * time.Millisecond) // de termijn verloopt; de bytes zijn al gebufferd
+	time.Sleep(300 * time.Millisecond)
 	if _, err := io.ReadAll(resp.Body); err == nil {
 		t.Fatal("een verlopen totaaltermijn las gebufferde bytes gewoon door")
 	}
 }
 
-// deadlineWeigeraar is een net.Conn waarvan de deadline-wis faalt.
 type deadlineWeigeraar struct{ fakeSink }
 
 func (deadlineWeigeraar) SetDeadline(time.Time) error { return errors.New("kapot") }
 
-// TestKapotteDeadlineWisPooltNiet — een transport dat de deadline-wis weigert
-// is niet herbruikbaar (review 13-08, vijfentwintigste ronde).
 func TestKapotteDeadlineWisPooltNiet(t *testing.T) {
 	cl := &Client{}
 	if cl.put("x", &deadlineWeigeraar{}, nil) {
@@ -1692,9 +1409,6 @@ func TestKapotteDeadlineWisPooltNiet(t *testing.T) {
 	}
 }
 
-// TestCloseBreektGeblokkeerdeRead — het contract staat een Close toe die een
-// geblokkeerde Read afbreekt; done/shut zijn nu bewaakt (race-detector dekt
-// dit onder -race) — review 13-08, vijfentwintigste ronde.
 func TestCloseBreektGeblokkeerdeRead(t *testing.T) {
 	l, err := net.Listen("tcp4", "127.0.0.1:0")
 	if err != nil {
@@ -1707,7 +1421,7 @@ func TestCloseBreektGeblokkeerdeRead(t *testing.T) {
 			return
 		}
 		bufio.NewReader(c).ReadString('\n')
-		io.WriteString(c, "HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nhalf") // en dan stilte
+		io.WriteString(c, "HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nhalf")
 		time.Sleep(2 * time.Second)
 		c.Close()
 	}()
@@ -1734,9 +1448,6 @@ func TestCloseBreektGeblokkeerdeRead(t *testing.T) {
 	}
 }
 
-// TestEenRegelPerHeadernaam — directe mapwrites konden twee case-varianten
-// van Content-Length op de draad zetten waarvan er één gevalideerd was
-// (review 13-08, vijfentwintigste ronde).
 func TestEenRegelPerHeadernaam(t *testing.T) {
 	addr := leanServer(t, func(w ResponseWriter, r *Request) {
 		w.Header()["content-length"] = "2"
@@ -1749,12 +1460,9 @@ func TestEenRegelPerHeadernaam(t *testing.T) {
 	}
 }
 
-// TestHijackNaGebufferdeWriteWeigert — de Write rapporteerde succes; een
-// geslaagde Hijack liet die bytes stil verdwijnen (review 13-08,
-// vijfentwintigste ronde).
 func TestHijackNaGebufferdeWriteWeigert(t *testing.T) {
 	addr := leanServer(t, func(w ResponseWriter, r *Request) {
-		io.WriteString(w, "x") // gebufferd: nog niets de deur uit
+		io.WriteString(w, "x")
 		if _, _, err := w.Hijack(); err == nil {
 			t.Error("Hijack slaagde na een gebufferde Write")
 		}
@@ -1762,9 +1470,6 @@ func TestHijackNaGebufferdeWriteWeigert(t *testing.T) {
 	rawRoundTrip(t, addr, "GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
 }
 
-// TestHandlerConnectionCloseWint — de writer overschreef een expliciete
-// handler-"Connection: close" met keep-alive (review 13-08, vijfentwintigste
-// ronde).
 func TestHandlerConnectionCloseWint(t *testing.T) {
 	addr := leanServer(t, func(w ResponseWriter, r *Request) {
 		w.Header().Set("Connection", "close")
@@ -1777,11 +1482,6 @@ func TestHandlerConnectionCloseWint(t *testing.T) {
 	}
 }
 
-// TestWriteHeader1xxIsGeenEindstatus — WriteHeader(103) maakte elke latere
-// 200 onzichtbaar (review 13-08, vijfentwintigste ronde).
-// TestExpectIsEen417 — iedere Expect-header krijgt een 417 en de verbinding
-// gaat dicht: de hele 100-Continue-machine aan de serverkant is gesloopt
-// (review 13-08, eenendertigste ronde). De handler mag het verzoek nooit zien.
 func TestExpectIsEen417(t *testing.T) {
 	raakte := false
 	addr := leanServer(t, func(w ResponseWriter, r *Request) { raakte = true })
@@ -1797,9 +1497,6 @@ func TestExpectIsEen417(t *testing.T) {
 	}
 }
 
-// TestHEADHoudtExplicieteLengte — een handler die op HEAD zélf een correcte
-// lengte zette zonder bytes te schrijven, zag hem met nul overschreven
-// (review 13-08, vijfentwintigste ronde).
 func TestHEADHoudtExplicieteLengte(t *testing.T) {
 	addr := leanServer(t, func(w ResponseWriter, r *Request) {
 		w.Header().Set("Content-Length", "1234")
@@ -1810,8 +1507,6 @@ func TestHEADHoudtExplicieteLengte(t *testing.T) {
 	}
 }
 
-// TestRestHoudtSluitendeSlash — /files/a/ hoort "a/" te vangen, niet "a"
-// (review 13-08, vijfentwintigste ronde).
 func TestRestHoudtSluitendeSlash(t *testing.T) {
 	m := NewServeMux()
 	m.HandleFunc("GET /files/{p...}", func(w ResponseWriter, r *Request) {
@@ -1829,10 +1524,6 @@ func TestRestHoudtSluitendeSlash(t *testing.T) {
 	}
 }
 
-// TestAlleenOriginForm — uitsluitend "/pad?query": de absolute-form (mét de
-// bijbehorende authority-consistentieplicht van de vijfentwintigste ronde), de
-// authority-form (CONNECT) en de asterisk-form (OPTIONS *) zijn alle drie één
-// 400 aan de deur (review 13-08, eenendertigste ronde).
 func TestAlleenOriginForm(t *testing.T) {
 	addr := leanServer(t, func(w ResponseWriter, r *Request) {
 		w.Header().Set("Content-Length", "2")
@@ -1847,9 +1538,7 @@ func TestAlleenOriginForm(t *testing.T) {
 			t.Fatalf("%s: antwoord %q, wil een 400", name, got)
 		}
 	}
-	// CONNECT is serverbreed een 501 — óók met een origin-form target: de
-	// vorm-toets ving alleen de authority-form, en "CONNECT / HTTP/1.1"
-	// bereikte de handler (review 13-08, tweeëndertigste ronde).
+
 	for _, req := range []string{
 		"CONNECT ergens:443 HTTP/1.1\r\nHost: ergens\r\nConnection: close\r\n\r\n",
 		"CONNECT / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
@@ -1863,8 +1552,6 @@ func TestAlleenOriginForm(t *testing.T) {
 	}
 }
 
-// TestOriginNormaliseertDefaultPoort — http://host en http://host:80 zijn
-// dezelfde origin (review 13-08, vijfentwintigste ronde).
 func TestOriginNormaliseertDefaultPoort(t *testing.T) {
 	for _, paar := range [][2]string{
 		{"http://h/a", "http://h:80/b"},
@@ -1884,9 +1571,6 @@ func TestOriginNormaliseertDefaultPoort(t *testing.T) {
 	}
 }
 
-// Test304HoudtInformatieveLengte — RFC 9110 §8.6 staat een informatieve
-// Content-Length op een 304 toe: server én client gooiden hem weg
-// (review 13-08, vijfentwintigste ronde).
 func Test304HoudtInformatieveLengte(t *testing.T) {
 	addr := leanServer(t, func(w ResponseWriter, r *Request) {
 		w.Header().Set("Content-Length", "1234")
@@ -1909,10 +1593,6 @@ func Test304HoudtInformatieveLengte(t *testing.T) {
 	}
 }
 
-// TestSpecifiekWintOngeachtVolgorde — / en /{x}/{rest...} kregen in de
-// score-vorm allebei 0, waarna registratievolgorde besliste. Er ís geen score
-// meer: ServeHTTP kiest per verzoek de meest specifieke match (strikte
-// subset) — review 13-08, zevenentwintigste ronde.
 func TestSpecifiekWintOngeachtVolgorde(t *testing.T) {
 	for _, algemeenEerst := range []bool{true, false} {
 		m := NewServeMux()
@@ -1934,11 +1614,6 @@ func TestSpecifiekWintOngeachtVolgorde(t *testing.T) {
 	}
 }
 
-// TestConflicterendeCasevariantenSluiten — "Content-Length: 2" én
-// "content-length: 5" via directe mapwrites: Get valideerde willekeurig de
-// één terwijl de map-iteratie de ander uitgaf. Nu deterministisch: het
-// conflict gaat er helemaal uit en de verbinding sluit — framing op EOF
-// (review 13-08, zevenentwintigste ronde).
 func TestConflicterendeCasevariantenSluiten(t *testing.T) {
 	addr := leanServer(t, func(w ResponseWriter, r *Request) {
 		w.Header()["Content-Length"] = "2"
@@ -1954,9 +1629,6 @@ func TestConflicterendeCasevariantenSluiten(t *testing.T) {
 	}
 }
 
-// TestStaleRetryAlleenReplaySafe — de herkansing van ronde 25 herhaalde élke
-// call zonder BodyReader, ook een DELETE: dubbel uitvoeren. Nu alleen
-// GET/HEAD (review 13-08, zevenentwintigste ronde).
 func TestStaleRetryAlleenReplaySafe(t *testing.T) {
 	var deletes atomic.Int32
 	l, err := net.Listen("tcp4", "127.0.0.1:0")
@@ -1988,7 +1660,7 @@ func TestStaleRetryAlleenReplaySafe(t *testing.T) {
 	}
 	io.Copy(io.Discard, resp.Body)
 	resp.Body.Close()
-	time.Sleep(120 * time.Millisecond) // de server sloot; de pool weet dat niet
+	time.Sleep(120 * time.Millisecond)
 
 	if _, err := cl.Do(Call{Method: "DELETE", URL: "http://" + l.Addr().String() + "/"}); err == nil {
 		t.Fatal("een DELETE op een stale verbinding werd stil herhaald — dat is niet replay-safe")
@@ -1998,14 +1670,10 @@ func TestStaleRetryAlleenReplaySafe(t *testing.T) {
 	}
 }
 
-// TestWriteIsEenCommit — Write("ok") gevolgd door WriteHeader(500) leverde
-// een 500 mét "ok" als foutbody, en WriteHeader(200) gevolgd door Hijack
-// slaagde en liet de status stil verdwijnen (review 13-08, achtentwintigste
-// ronde).
 func TestWriteIsEenCommit(t *testing.T) {
 	addr := leanServer(t, func(w ResponseWriter, r *Request) {
 		io.WriteString(w, "ok")
-		w.WriteHeader(500) // te laat: de Write was de commit
+		w.WriteHeader(500)
 	})
 	if got := rawRoundTrip(t, addr, "GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"); !strings.Contains(got, " 200 ") {
 		t.Fatalf("antwoord %q: een WriteHeader ná een Write hoort te laat te zijn", got)
@@ -2019,11 +1687,6 @@ func TestWriteIsEenCommit(t *testing.T) {
 	rawRoundTrip(t, addr2, "GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
 }
 
-// TestHTTP10WordtGeweigerd — de serverkant spreekt alléén HTTP/1.1: niets in
-// of rond HopOS stuurt ons nog 1.0-verzoeken, en de hele 1.0-tak (omgekeerde
-// keep-alive-default, geen chunked, eigen statusregel, Host optioneel) was
-// puur reviewvlak (review 13-08, negenentwintigste ronde). De CLIENT blijft
-// 1.0-antwoorden verstaan — Python's http.server spreekt het, gemeten 12-08.
 func TestHTTP10WordtGeweigerd(t *testing.T) {
 	addr := leanServer(t, func(w ResponseWriter, r *Request) {
 		w.Header().Set("Content-Length", "2")
@@ -2034,9 +1697,6 @@ func TestHTTP10WordtGeweigerd(t *testing.T) {
 	}
 }
 
-// TestServerRandvormen — de 405 draagt Allow (RFC 9110 §15.5.6), een Host met
-// pad- of witruimtetekens is een 400, en de asterisk-form weigeren we
-// expliciet (review 13-08, achtentwintigste ronde).
 func TestServerRandvormen(t *testing.T) {
 	m := NewServeMux()
 	h := func(w ResponseWriter, r *Request) {
@@ -2051,14 +1711,10 @@ func TestServerRandvormen(t *testing.T) {
 	if !strings.Contains(got, "405") || !strings.Contains(got, "Allow: ") ||
 		!strings.Contains(got, "GET") || !strings.Contains(got, "PUT") ||
 		!strings.Contains(got, "HEAD") {
-		// GET bedient per contract ook HEAD: de Allow hoort dat te zeggen
-		// (review 13-08, dertigste ronde).
+
 		t.Fatalf("405 zonder (volledige, incl. HEAD) Allow: %q", got)
 	}
-	// De Host-vormparser van de dertigste ronde is in de eenendertigste weer
-	// gesloopt (deze server routeert nergens op Host): élke niet-lege,
-	// CTL-vrije Host is goed. De structurele smuggling-wachten (geen/leeg/
-	// dubbel) staan in TestServerEistEenGeldigeHost.
+
 	for _, host := range []string{"h.example:8080", "[::1]:80", "10.0.0.1", "a,b"} {
 		if got := rawRoundTrip(t, addr, "GET /x HTTP/1.1\r\nHost: "+host+"\r\nConnection: close\r\n\r\n"); !strings.Contains(got, "200") {
 			t.Fatalf("Host %q gaf %q, wil 200", host, got)
@@ -2069,11 +1725,6 @@ func TestServerRandvormen(t *testing.T) {
 	}
 }
 
-// TestStroomWachtOpContinue — de Expect-dans tegen een server die hem écht
-// spreekt (onze eigen server wijst Expect tegenwoordig af met een 417; S3 en
-// net/http sturen de 100): de stroom vertrekt pas ná het oordeel en het
-// echo-antwoord bewijst dat hij aankwam (review 13-08, negenentwintigste
-// ronde; expliciet-oordeel-of-fout sinds de eenendertigste).
 func TestStroomWachtOpContinue(t *testing.T) {
 	l, err := net.Listen("tcp4", "127.0.0.1:0")
 	if err != nil {
@@ -2088,7 +1739,7 @@ func TestStroomWachtOpContinue(t *testing.T) {
 		defer c.Close()
 		c.SetDeadline(time.Now().Add(10 * time.Second))
 		br := bufio.NewReader(c)
-		for { // de verzoekkop tot de lege regel
+		for {
 			line, err := br.ReadString('\n')
 			if err != nil {
 				return
@@ -2118,11 +1769,6 @@ func TestStroomWachtOpContinue(t *testing.T) {
 	}
 }
 
-// TestStilteOpExpectIsFout — een server die op de Expect-vraag ZWIJGT is een
-// fout en de verbinding gaat dicht: het oude "na één seconde vertrekt de
-// stroom alsnog"-pad reed op TLS verder op een reader die de verlopen Peek
-// zojuist permanent vergiftigd had (review 13-08, eenendertigste ronde). De
-// stroom mag daarbij nooit gelezen zijn.
 func TestStilteOpExpectIsFout(t *testing.T) {
 	l, err := net.Listen("tcp4", "127.0.0.1:0")
 	if err != nil {
@@ -2135,19 +1781,18 @@ func TestStilteOpExpectIsFout(t *testing.T) {
 			return
 		}
 		defer c.Close()
-		io.Copy(io.Discard, c) // lezen en zwijgen: het 1s-fallback-scenario
+		io.Copy(io.Discard, c)
 	}()
 	_, err = Do(Call{
 		Method: "PUT", URL: "http://" + l.Addr().String() + "/",
 		BodyReader: striktGeenRead{t}, BodyLen: 4,
-		HeaderTimeout: 200 * time.Millisecond, // begrenst ook het oordeel-wachten
+		HeaderTimeout: 200 * time.Millisecond,
 	})
 	if err == nil || !strings.Contains(err.Error(), "no verdict") {
 		t.Fatalf("stilte op Expect gaf %v, wil een luide geen-oordeel-fout", err)
 	}
 }
 
-// striktGeenRead faalt de test zodra er tóch uit de stroom gelezen wordt.
 type striktGeenRead struct{ t *testing.T }
 
 func (g striktGeenRead) Read([]byte) (int, error) {
@@ -2155,12 +1800,6 @@ func (g striktGeenRead) Read([]byte) (int, error) {
 	return 0, io.EOF
 }
 
-// TestVroegeAfwijzingSpaartDeStroom — een server die de upload op de kop al
-// afwijst krijgt geen enkele body-byte meer: vóór de Expect-dans schreef de
-// client de hele stroom blind en kon hij op een vol receive-window hangen
-// terwijl het antwoord klaarstond (review 13-08, negenentwintigste ronde).
-// Onze eigen server wijst tegenwoordig op de Expect zélf af (417,
-// eenendertigste ronde) — voor déze test is dat hetzelfde vroege oordeel.
 func TestVroegeAfwijzingSpaartDeStroom(t *testing.T) {
 	addr := leanServer(t, func(w ResponseWriter, r *Request) {})
 	resp, err := Do(Call{
@@ -2176,21 +1815,16 @@ func TestVroegeAfwijzingSpaartDeStroom(t *testing.T) {
 	}
 }
 
-// TestRegistratieFaaltVroeg — een kromme methode, een nil-handler en een
-// patroon met dot-segmenten (dat nooit kan vuren: verzoeken met dots worden
-// aan de deur geweigerd) zijn bedradingsfouten die bij HandleFunc horen te
-// panicken, niet bij dispatch (review 13-08, dertigste ronde).
 func TestRegistratieFaaltVroeg(t *testing.T) {
 	h := func(w ResponseWriter, r *Request) {}
 	for name, fn := range map[string]func(){
 		"kromme methode": func() { NewServeMux().HandleFunc("GE(T /x", h) },
 		"nil-handler":    func() { NewServeMux().HandleFunc("GET /x", nil) },
 		"dot-patroon":    func() { NewServeMux().HandleFunc("GET /a/../b", h) },
-		// Niet-canonieke patronen vouwden via Trim+lege-segmenten-overslaan
-		// STIL naar een andere route (review 13-08, vierendertigste ronde):
-		"dubbele slash":  func() { NewServeMux().HandleFunc("GET /a//b", h) },
-		"lege wortel":    func() { NewServeMux().HandleFunc("//a", h) },
-		"lege staart":    func() { NewServeMux().HandleFunc("/a//", h) },
+
+		"dubbele slash": func() { NewServeMux().HandleFunc("GET /a//b", h) },
+		"lege wortel":   func() { NewServeMux().HandleFunc("//a", h) },
+		"lege staart":   func() { NewServeMux().HandleFunc("/a//", h) },
 	} {
 		func() {
 			defer func() {
@@ -2203,12 +1837,6 @@ func TestRegistratieFaaltVroeg(t *testing.T) {
 	}
 }
 
-// TestWriteHeaderPanicktOpOnzin — 0, negatief, viercijferig én élke 1xx ging
-// gewoon de statusregel in (of werd stil genegeerd); dat is een handlerfout
-// die vroeg hoort te knallen: alleen finale statussen 200-599 bestaan, en de
-// WebSocket-101 loopt uitsluitend via Hijack (review 13-08, dertigste +
-// eenendertigste ronde). Direct op de writer getest: een panic in een
-// servergoroutine is by design dodelijk.
 func TestWriteHeaderPanicktOpOnzin(t *testing.T) {
 	for _, status := range []int{0, -1, 1000, 100, 101, 103, 199} {
 		func() {
@@ -2223,9 +1851,6 @@ func TestWriteHeaderPanicktOpOnzin(t *testing.T) {
 	}
 }
 
-// TestPoolTotaalcap — alleen een per-host-cap liet een burst naar unieke
-// hosts op leannet de hele bufferpot claimen voor de idle-termijn
-// (review 13-08, dertigste ronde).
 func TestPoolTotaalcap(t *testing.T) {
 	cl := &Client{}
 	for i := 0; i < 12; i++ {
@@ -2238,21 +1863,12 @@ func TestPoolTotaalcap(t *testing.T) {
 	}
 }
 
-// ---- eenendertigste ronde ----
-
-// TestDrainVoorNetteClose — een handler die de body links laat liggen en een
-// verbinding die daarna dichtgaat: de server hoort het ongelezen restant eerst
-// begrensd weg te slikken. Meteen sluiten met ontvangen-maar-ongelezen bytes
-// wordt op TCP een RST, en een RST gooit óók de zendwachtrij weg — het net
-// verstuurde antwoord kon zo bij de client stukbreken (review 13-08,
-// eenendertigste ronde). net.Pipe is ongebufferd: de tweede body-helft komt er
-// alleen doorheen als de server hem écht leest.
 func TestDrainVoorNetteClose(t *testing.T) {
 	client, server := net.Pipe()
 	defer client.Close()
 	go serveConn(server, func(w ResponseWriter, r *Request) {
 		w.Header().Set("Content-Length", "2")
-		io.WriteString(w, "ok") // en de body blijft bewust ongelezen
+		io.WriteString(w, "ok")
 	})
 
 	client.SetDeadline(time.Now().Add(5 * time.Second))
@@ -2260,7 +1876,7 @@ func TestDrainVoorNetteClose(t *testing.T) {
 		"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 4\r\nConnection: close\r\n\r\nha"); err != nil {
 		t.Fatal(err)
 	}
-	// Het volledige antwoord lezen terwijl de halve body nog onderweg is.
+
 	buf := make([]byte, 512)
 	got := ""
 	for !strings.HasSuffix(got, "ok") {
@@ -2273,8 +1889,7 @@ func TestDrainVoorNetteClose(t *testing.T) {
 	if !strings.Contains(got, " 200 ") {
 		t.Fatalf("antwoord %q, wil een 200", got)
 	}
-	// De rest van de beloofde body: zonder drain is de pipe al dicht en faalt
-	// deze write — mét drain leest de server hem en sluit dan pas.
+
 	if _, err := io.WriteString(client, "lf"); err != nil {
 		t.Fatalf("de server sloot zonder de body te drainen: %v", err)
 	}
@@ -2283,16 +1898,11 @@ func TestDrainVoorNetteClose(t *testing.T) {
 	}
 }
 
-// TestChunkedGooitContentLengthWeg — zodra een antwoord chunked wordt gaat
-// élke Content-Length eruit, ook een LEGE: die ontweek de validatie (Get geeft
-// "") en stond dan naast Transfer-Encoding op de draad — precies het
-// dubbelzinnig geframede antwoord dat we inkomend weigeren (review 13-08,
-// eenendertigste ronde).
 func TestChunkedGooitContentLengthWeg(t *testing.T) {
 	addr := leanServer(t, func(w ResponseWriter, r *Request) {
-		w.Header().Set("Content-Length", "") // de lege variant: Get ziet hem niet
+		w.Header().Set("Content-Length", "")
 		io.WriteString(w, "stuk1")
-		w.Flush() // chunked
+		w.Flush()
 		io.WriteString(w, "stuk2")
 	})
 	got := rawRoundTrip(t, addr, "GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
@@ -2304,17 +1914,13 @@ func TestChunkedGooitContentLengthWeg(t *testing.T) {
 	}
 }
 
-// TestDoneEnHijackSluitenElkaarUit — de leeskant heeft precies één eigenaar:
-// HTTP, de wachthond van Done, óf de overnemer van Hijack. Beide tegelijk liet
-// de wachthond WebSocket-frames van de overnemer opeten (review 13-08,
-// eenendertigste ronde).
 func TestDoneEnHijackSluitenElkaarUit(t *testing.T) {
-	// Hijack ná Done: weigeren.
+
 	w := &respWriter{c: &conn{watched: true}, hdr: Header{}, status: StatusOK, declared: -1}
 	if _, _, err := w.Hijack(); err == nil || !strings.Contains(err.Error(), "Done") {
 		t.Fatalf("Hijack na Done gaf %v, wil een weigering die Done noemt", err)
 	}
-	// Done ná Hijack: panic (bedradingsfout, by design dodelijk).
+
 	defer func() {
 		if recover() == nil {
 			t.Fatal("Done na Hijack: geen panic")
@@ -2324,14 +1930,11 @@ func TestDoneEnHijackSluitenElkaarUit(t *testing.T) {
 	r.Done()
 }
 
-// TestRedirectWeigertHTTPSDowngrade — een https-call die naar http wordt
-// doorverwezen volgt NOOIT: ook zonder headers is de URL zelf (pad, query,
-// een signed token daarin) al de lekkage (review 13-08, eenendertigste ronde).
 func TestRedirectWeigertHTTPSDowngrade(t *testing.T) {
 	addr := rawServer(t, "HTTP/1.1 302 Found\r\nLocation: http://elders.invalid/\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
 	_, err := Do(Call{
 		URL: "https://" + addr + "/pad?token=geheim",
-		// Een "TLS"-dialer voor de test: het schema telt, niet de bytes.
+
 		DialContext: func(ctx context.Context, network, a string) (net.Conn, error) {
 			return net.DialTimeout(network, a, time.Second)
 		},
@@ -2341,18 +1944,8 @@ func TestRedirectWeigertHTTPSDowngrade(t *testing.T) {
 	}
 }
 
-// ---- tweeëndertigste ronde ----
-
-// TestDoneClaimtVoorDeStart — Done is alleen geldig vóór het antwoord en ná de
-// body: een ongelezen body zou door de wachthond opgegeten worden, en een al
-// verstuurde kop heeft keep-alive beloofd op een verbinding die nooit meer
-// hergebruikt wordt (de 200/502-cadans van 12-08). Fail-fast bij de EERSTE
-// aanroep; latere aanroepen (een streamer die per lusronde Done/Context vraagt)
-// zijn vrij (review 13-08, tweeëndertigste ronde).
 func TestDoneClaimtVoorDeStart(t *testing.T) {
-	// Elke casus krijgt een ECHTE verbinding (net.Pipe): zonder de wachten
-	// start Done gewoon zijn wachthond — de test moet het verschil zien
-	// tussen de fail-fast-panic en een crash op ontbrekende bedrading.
+
 	maakConn := func() *conn {
 		p1, p2 := net.Pipe()
 		t.Cleanup(func() { p1.Close(); p2.Close() })
@@ -2371,10 +1964,6 @@ func TestDoneClaimtVoorDeStart(t *testing.T) {
 	kop.headSent = true
 	verwachtPanic("kop al verstuurd", &Request{c: kop, Body: emptyBody{}})
 
-	// Een ongelezen body is GEEN panic (meer): "GET /stream" mét een body is
-	// geldig HTTP van de klant, en de fail-fast die hier één ronde stond was
-	// daarmee een remote kill — op HopOS een node-herstart per verzoek
-	// (review 13-08, zesendertigste ronde). Done draint hem nu begrensd.
 	body := &lengthReader{r: strings.NewReader("xx"), n: 2}
 	r0 := &Request{c: maakConn(), Body: body}
 	if r0.Done() == nil {
@@ -2384,22 +1973,15 @@ func TestDoneClaimtVoorDeStart(t *testing.T) {
 		t.Fatalf("Done liet %d bodybytes ongedraineerd voor de wachthond", body.n)
 	}
 
-	// Ná de claim is een herhaalde aanroep vrij — hop's streamers vragen
-	// r.Context() per lusronde, ook als de kop dan allang de deur uit is.
 	c := maakConn()
 	r := &Request{c: c, Body: emptyBody{}}
 	eerste := r.Done()
-	c.headSent = true // de streamer flusht zijn eerste frame
+	c.headSent = true
 	if tweede := r.Done(); tweede != eerste {
 		t.Fatal("herhaalde Done gaf een ander kanaal")
 	}
 }
 
-// TestExpectOordeelIsEenTermijn — de oordeel-termijn is ABSOLUUT en dekt het
-// complete oordeel: één vroege byte en dan treuzelen gaf eerst een verse
-// kop-termijn bovenop de Peek-termijn (byte op 90ms + rest op 160ms slaagde
-// met HeaderTimeout: 100ms), en zonder verdere termijnen mocht de server na
-// die byte eeuwig zwijgen (review 13-08, tweeëndertigste ronde).
 func TestExpectOordeelIsEenTermijn(t *testing.T) {
 	l, err := net.Listen("tcp4", "127.0.0.1:0")
 	if err != nil {
@@ -2413,7 +1995,7 @@ func TestExpectOordeelIsEenTermijn(t *testing.T) {
 		}
 		defer c.Close()
 		c.SetDeadline(time.Now().Add(10 * time.Second))
-		// Eén vroege byte binnen de termijn, de rest van het oordeel erbuiten.
+
 		time.Sleep(350 * time.Millisecond)
 		io.WriteString(c, "HTTP/1.1 ")
 		time.Sleep(350 * time.Millisecond)
@@ -2430,9 +2012,6 @@ func TestExpectOordeelIsEenTermijn(t *testing.T) {
 	}
 }
 
-// TestExpectHoortBijHetPakket — BodyReader schrijft zelf de Expect-regel; een
-// caller-Expect ernaast gaf twee (mogelijk strijdige) regels op de draad
-// (review 13-08, tweeëndertigste ronde).
 func TestExpectHoortBijHetPakket(t *testing.T) {
 	_, err := Do(Call{
 		Method: "PUT", URL: "http://127.0.0.1:1/",
@@ -2444,10 +2023,6 @@ func TestExpectHoortBijHetPakket(t *testing.T) {
 	}
 }
 
-// TestNietCanoniekIsEen400 — de parser TOETST het pad (canonicalPath) in
-// plaats van het te schonen: "//admin" werd stil "/admin", een tweede
-// interpretatiemoment van hetzelfde pad (review 13-08, tweeëndertigste ronde;
-// cleanPath is gesloopt).
 func TestNietCanoniekIsEen400(t *testing.T) {
 	addr := leanServer(t, func(w ResponseWriter, r *Request) {
 		w.Header().Set("Content-Length", "2")
@@ -2458,18 +2033,12 @@ func TestNietCanoniekIsEen400(t *testing.T) {
 			t.Fatalf("%s gaf %q, wil een 400", pad, got)
 		}
 	}
-	// De sluitende slash blijft betekenis dragen en is gewoon canoniek.
+
 	if got := rawRoundTrip(t, addr, "GET /a/ HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"); !strings.Contains(got, "200") {
 		t.Fatalf("/a/ gaf %q, wil 200", got)
 	}
 }
 
-// ---- vierendertigste ronde ----
-
-// TestClientWeigertCONNECT — er is geen tunnel-API, dus CONNECT serialiseren
-// stuurde een tunnelopdracht de deur uit waarvan het antwoord als gewone
-// response gelezen werd; luid falen vóór dial (review 13-08, vierendertigste
-// ronde; de serverkant weigert hem sinds de tweeëndertigste).
 func TestClientWeigertCONNECT(t *testing.T) {
 	if _, err := Do(Call{Method: "CONNECT", URL: "http://127.0.0.1:1/"}); err == nil ||
 		!strings.Contains(err.Error(), "CONNECT") {
@@ -2477,16 +2046,9 @@ func TestClientWeigertCONNECT(t *testing.T) {
 	}
 }
 
-// ---- zesendertigste ronde ----
-
-// TestDoneOverleeftEenBodyVanBuiten — het remote-kill-scenario voluit: een
-// streaming-handler (roept Done) krijgt een GET mét "Content-Length: 1".
-// Volkomen geldig HTTP, dus dit mag nooit een panic zijn (op HopOS = een
-// node-herstart per verzoek): Done draint de body begrensd en het antwoord
-// komt gewoon (review 13-08, zesendertigste ronde).
 func TestDoneOverleeftEenBodyVanBuiten(t *testing.T) {
 	addr := leanServer(t, func(w ResponseWriter, r *Request) {
-		_ = r.Done() // wat élk streaming-endpoint doet
+		_ = r.Done()
 		w.Header().Set("Content-Length", "2")
 		io.WriteString(w, "ok")
 	})
@@ -2496,13 +2058,6 @@ func TestDoneOverleeftEenBodyVanBuiten(t *testing.T) {
 	}
 }
 
-// TestWriteHeader205BlijftBodyloos205 — 205 wordt als ZICHZELF gedragen
-// (KAM: "de writer verandert haar niet stil in een andere status"), altijd
-// bodyloos, en mét expliciete Content-Length: 0 — RFC 9112 §6.3 noemt 205
-// niet in het framingloos-bodyloze rijtje, dus zonder die nul las een
-// standaardclient tot EOF. De panic (32e) was via hop's status-kopiërende
-// proxy van buiten voedbaar en de 204-remap (36e) was een stille
-// statuswissel (review 13-08, zevendertigste ronde).
 func TestWriteHeader205BlijftBodyloos205(t *testing.T) {
 	addr := leanServer(t, func(w ResponseWriter, r *Request) {
 		w.WriteHeader(205)
@@ -2513,7 +2068,7 @@ func TestWriteHeader205BlijftBodyloos205(t *testing.T) {
 		strings.Contains(got, "mag er niet uit") {
 		t.Fatalf("WriteHeader(205) gaf %q, wil een kale 205 met Content-Length: 0", got)
 	}
-	// En onze eigen client leest hem bodyloos, zonder op EOF te wachten.
+
 	resp, err := Do(Call{URL: "http://" + addr + "/"})
 	if err != nil {
 		t.Fatal(err)

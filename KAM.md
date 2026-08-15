@@ -1,356 +1,340 @@
-# KAM — het bevroren HTTP/TCP-profiel
+# KAM — the frozen HTTP/TCP profile
 
-Dit document legt de scope vast van `leanhttp`, `leanhttps`, `leans3` en
-`leannet`. Het is geen lijst van alles wat HTTP en TCP kunnen. Het is de lijst
-van wat deze repository **belooft goed te doen**, wat zij bewust smaller maakt
-en wat zij luid weigert.
+This document fixes the scope of `leanhttp`, `leanhttps`, `leans3`, and
+`leannet`. It is not a list of everything HTTP and TCP can do. It defines what
+this repository **promises to do correctly**, deliberately narrows, and loudly
+rejects.
 
-De KAM kent drie uitkomsten:
+KAM has three outcomes:
 
-- **KEEP** — nodig voor een gemeten gebruiker. Dit gedrag is contract en een
-  fout erin blokkeert een release.
-- **ADAPT** — de behoefte is echt, maar de grens mag kleiner zijn dan de
-  algemene standaard zolang die grens expliciet en veilig is.
-- **MURDER** — geen gemeten gebruiker. De feature en zijn toestandsruimte gaan
-  eruit; invoer die erop leunt wordt waar mogelijk luid geweigerd.
+- **KEEP** — required by a measured consumer. This behavior is contractual; a
+  defect blocks release.
+- **ADAPT** — the need is real, but the boundary may be smaller than the general
+  standard if it remains explicit and safe.
+- **MURDER** — no measured consumer. Remove the feature and its state space;
+  reject dependent input loudly where possible.
 
-Lean betekent dus minder oppervlak, niet minder correctheid. Binnen het
-ondersteunde profiel gelden framing, deadlines, eigenaarschap, beveiliging en
-resourcevrijgave volledig. Gedrag buiten het profiel is geen stilzwijgende
-compatibiliteitsbelofte en ook geen TODO: het komt pas terug na een meting die
-laat zien dat de afwezigheid iets kost.
+Lean means less surface area, not less correctness. Framing, deadlines,
+ownership, security, and resource release remain complete inside the supported
+profile. Behavior outside it is neither an implicit compatibility promise nor
+a TODO. It returns only after a measurement shows that its absence has a cost.
 
-Dit bestand is normatief voor de scope. `README.md` en package-docs vatten haar
-samen, `leannet/DESIGN.md` motiveert de transportkeuzes en `TODO.md` houdt de
-backlog, bewijsstatus en historische afvinklijst bij. `TODO.md` kan de KAM niet
-stil uitbreiden. Een tegenspraak tussen die documenten is een documentatiebug.
+This file is normative for scope. `README.md` and package docs summarize it,
+`leannet/DESIGN.md` explains the transport choices, and `TODO.md` records the
+backlog, evidence, and history. `TODO.md` cannot silently extend the KAM; a
+contradiction between these documents is a documentation bug.
 
-## Het deploymentprofiel
+## Deployment profile
 
-De stack draagt deze concrete keten:
+The stack supports this concrete chain:
 
-- een plain-HTTP/1.1-server voor lokale API's, bestanden, redirects,
-  browserstreams en een rauwe protocolovername;
-- een HTTP-client voor API-calls en artifactdownloads, eventueel via
-  `leanhttps`, met seriële keep-alive per verbinding;
-- een SigV4-S3-client voor de objectoperaties die Hop en HopOS werkelijk
-  gebruiken;
-- een IPv4/TCP/UDP-stack voor bare-metal nodes, met één begrensde bufferpot.
+- a plain HTTP/1.1 server for local APIs, files, redirects, browser streams, and
+  raw protocol takeover;
+- an HTTP client for API calls and artifact downloads, optionally through
+  `leanhttps`, with sequential keep-alive per connection;
+- a SigV4 S3 client for the object operations Hop and HopOS actually use;
+- an IPv4/TCP/UDP stack for bare-metal nodes with one bounded buffer pool.
 
-"Meerdere dingen over één kanaal" betekent **opeenvolgende verzoeken en
-antwoorden op een keep-alive-verbinding**. Speculatieve HTTP-pipelining en
-multiplexing zijn geen contract.
+“Multiple things over one channel” means **sequential requests and responses
+over a keep-alive connection**. Speculative HTTP pipelining and multiplexing are
+not contractual.
 
-## Beslismatrix
+## Decision matrix
 
-| onderdeel | KEEP | ADAPT | MURDER |
+| Area | KEEP | ADAPT | MURDER |
 |---|---|---|---|
-| HTTP-server | HTTP/1.1, seriële keep-alive, vaste en gestreamde antwoorden, `HEAD`, `204`/`205`/`304`, `Done`, `Hijack` | alleen origin-form, requestbody met bekende lengte, WebSocket via rauwe takeover | HTTP/1.0/2, CONNECT, request-chunking/trailers, server-side Expect-machine, algemene 1xx-machine |
-| Mux | methode+pad, exact/subtree, `{segment}`, `{rest...}`, `GET`→`HEAD`, `404`/`405`+`Allow` | canonieke paden of weigeren; immutable na start | host-routing, `{$}`, escaped/dot-routing, slashnormalisatie, net/http-compatibiliteitswerk |
-| HTTP-client | HTTP/1.1 uitgaand, 1.0/1.1 inkomend, redirects voor GET/HEAD, responseframing, deadlines, keep-alivepool | vaste-lengte streamupload met een strikt Expect-oordeel; compressie als pass-through | request-chunking, automatische decompressie, CONNECT/upgrade, algemene retrymachine |
-| TLS/S3 | expliciet trustmodel, SNI per verbinding, SigV4 en de gebruikte objectoperaties | TLS als dialercompositie; getekende S3-calls volgen nooit redirects | TLS-server, stil skip-verify, multipart, streaming SigV4, SigV4a, presigned URL's, IMDS/IAM |
-| leannet | Ethernet, ARP, IPv4, ICMP echo, UDP, TCP, deadlines, close en begrensd geheugen | verliesherstel zonder OOO-buffer/SACK; één IPv4-identiteit, één totale budgetpot en een optionele per-verbindingklem | IPv6/NDP, fragmentatie, congestion control, timestamps, Nagle, SYN-cookies, logging in het datapad |
+| HTTP server | HTTP/1.1, sequential keep-alive, fixed and streamed responses, `HEAD`, `204`/`205`/`304`, `Done`, `Hijack` | origin-form only, known-length request bodies, WebSocket through raw takeover | HTTP/1.0/2, CONNECT, request chunking/trailers, server-side Expect state machine, general 1xx state machine |
+| Mux | method+path, exact/subtree, `{segment}`, `{rest...}`, `GET`→`HEAD`, `404`/`405`+`Allow` | canonical paths or rejection; immutable after start | host routing, `{$}`, escaped/dot routing, slash normalization, net/http compatibility work |
+| HTTP client | outbound HTTP/1.1, inbound 1.0/1.1, GET/HEAD redirects, response framing, deadlines, keep-alive pool | fixed-length streaming upload with a strict Expect decision; compression pass-through | request chunking, automatic decompression, CONNECT/upgrade, general retry state machine |
+| TLS/S3 | explicit trust model, SNI per connection, SigV4 and used object operations | TLS as a dialer composition; signed S3 calls never follow redirects | TLS server, silent skip-verify, multipart, streaming SigV4, SigV4a, presigned URLs, IMDS/IAM |
+| leannet | Ethernet, ARP, IPv4, ICMP echo, UDP, TCP, deadlines, close, bounded memory | loss recovery without OOO buffering/SACK; one IPv4 identity, one total budget and optional per-connection cap | IPv6/NDP, fragmentation, congestion control, timestamps, Nagle, SYN cookies, data-path logging |
 
-De tabel is de samenvatting. De normatieve grenzen staan hieronder.
+The table is a summary; the boundaries below are normative.
 
-## leanhttp-server en Mux
+## leanhttp server and Mux
 
 ### KEEP
 
-De server MOET:
+The server MUST:
 
-- uitsluitend een syntactisch eenduidig HTTP/1.1-verzoek aan een handler geven;
-- iedere headerregel tot 8 KiB en alle requestheaders samen tot 64 KiB
-  begrenzen;
-- precies één niet-lege `Host` eisen en alleen origin-form targets accepteren;
-- per verbinding verzoeken sequentieel blijven verwerken zolang beide kanten
-  keep-alive toestaan;
-- een requestbody alleen dragen met precies één geldige `Content-Length`, tot
-  maximaal 1 MiB; een korte body is `io.ErrUnexpectedEOF`, nooit succes;
-- een ongelezen requestbody begrensd draineren vóór hergebruik en, waar het
-  transport nog gezond is, vóór een nette close;
-- responseframing ondubbelzinnig houden: een bekende `Content-Length` of
-  writer-owned chunked framing, nooit beide;
-- een antwoord zonder bekende lengte tot maximaal 64 KiB bufferen en daarna
-  automatisch naar chunked framing overschakelen;
-- bij `HEAD`, `204`, `205` en `304` geen bodybytes versturen en `205` met een
-  expliciete `Content-Length: 0` ondubbelzinnig framen;
-- handlerstatussen `200`–`599` dragen; redirects en foutstatussen blijven de
-  keuze van de webserver;
-- tijdelijke acceptfouten met begrensde backoff overleven en requestparsing,
-  requestbody-reads en responsewrites met de vastgelegde deadlines begrenzen.
+- pass only a syntactically unambiguous HTTP/1.1 request to a handler;
+- limit each header line to 8 KiB and all request headers to 64 KiB;
+- require exactly one non-empty `Host` and accept only origin-form targets;
+- process requests sequentially per connection while both sides permit
+  keep-alive;
+- accept a request body only with exactly one valid `Content-Length`, up to
+  1 MiB; a short body returns `io.ErrUnexpectedEOF`, never success;
+- drain an unread request body within bounds before reuse and, while the
+  transport remains healthy, before a clean close;
+- keep response framing unambiguous: known `Content-Length` or writer-owned
+  chunked framing, never both;
+- buffer a response of unknown length up to 64 KiB, then switch automatically
+  to chunked framing;
+- send no body bytes for `HEAD`, `204`, `205`, or `304`, and frame `205`
+  explicitly with `Content-Length: 0`;
+- support handler statuses `200`–`599`; redirects and error statuses remain the
+  web server's decision;
+- survive temporary accept errors with bounded backoff and apply the documented
+  deadlines to request parsing, request-body reads, and response writes.
 
-`Flush` is de gestroomde response-naad. Zonder vooraf bekende lengte kiest de
-writer chunked framing. `Hijack` is de protocolovername-naad: de hijacker
-schrijft zelf de `101`-handshake en bezit daarna bytes, framing en lifecycle.
-Leanhttp implementeert geen WebSocket-handshake of WebSocket-frames.
+`Flush` is the streaming-response seam. Without a known length, the writer
+chooses chunked framing. `Hijack` is the protocol-takeover seam: the hijacker
+writes the `101` handshake and then owns bytes, framing, and lifecycle.
+Leanhttp implements neither the WebSocket handshake nor WebSocket frames.
 
-`Request.Done` is de disconnect-naad voor een langdurige HTTP-stream. De
-aanroep draagt de leeskant aan `Done` over. Als de requestbody nog niet
-volledig gelezen is, doet de server eerst een begrensde drainpoging; daarna
-consumeert één wachthond de resterende invoer tot disconnect. Zo kan een
-geldige, door de client bepaalde body geen ownership-panic veroorzaken.
-Daarvoor gelden drie harde eigendomsregels:
+`Request.Done` is the disconnect seam for a long-lived HTTP stream. Calling it
+transfers ownership of the read side. If the request body is incomplete, the
+server first attempts a bounded drain; one watcher then consumes remaining
+input until disconnect. This keeps a valid client-controlled body from causing
+an ownership panic. Three strict rules apply:
 
-1. een handler die de bodyinhoud nodig heeft leest haar vóór `Done`;
-2. na `Done` leest de handler niet meer uit `Request.Body`, en `Done` wordt
-   geclaimd vóór de eerste responsekop de draad op gaat;
-3. `Done` en `Hijack` sluiten elkaar uit.
+1. a handler that needs body content reads it before `Done`;
+2. after `Done`, the handler never reads `Request.Body`, and it claims `Done`
+   before the first response header reaches the wire;
+3. `Done` and `Hijack` are mutually exclusive.
 
-Alleen de laatste twee grenzen zijn programmeerfouten die MAGGEN fail-fast
-panicken: zij worden volledig door de handler bestuurd. `Serve` herstelt
-handler-panics bewust niet; zo'n programmeerfout kan dus het proces beëindigen.
-Recoverybeleid, als een consumer dat wil, hoort expliciet om de handler heen
-en maakt de eigendomsregels niet optioneel.
+Only the last two boundaries MAY panic fail-fast: the handler controls them
+entirely. `Serve` deliberately does not recover handler panics, so programmer
+errors can terminate the process. Consumers may wrap handlers in an explicit
+recovery policy, but that does not make ownership optional.
 
-De server veronderstelt dat een door de listener geleverde `net.Conn`
-deadlines werkelijk ondersteunt; fouten van de deadline-setters worden niet
-als apart HTTP-antwoord teruggegeven. De `Done`-wachthond leest bewust zonder
-deadline tot disconnect, en na `Hijack` beheert de overnemer alle deadlines.
+The server assumes every `net.Conn` from the listener implements deadlines.
+Deadline-setter errors are not converted into separate HTTP responses. The
+`Done` watcher intentionally reads without a deadline until disconnect; after
+`Hijack`, the new owner manages all deadlines.
 
-De Mux draagt alleen:
+The Mux supports only:
 
-- een exact pad, eventueel voorafgegaan door een methode;
-- een patroon met afsluitende slash als subtree;
-- `{naam}` voor één segment en `{naam...}` voor de rest;
-- de regel dat een `GET`-route ook `HEAD` bedient, waarbij een expliciete
-  `HEAD`-route wint;
-- de meest specifieke route op basis van een strikte subsetrelatie;
-- `404` bij geen padmatch en `405` met `Allow` bij alleen een methodemismatch.
+- an exact path, optionally prefixed by a method;
+- a trailing-slash subtree pattern;
+- `{name}` for one segment and `{name...}` for the remainder;
+- a `GET` route serving `HEAD`, unless an explicit `HEAD` route wins;
+- the most specific route under a strict subset relation;
+- `404` when no path matches and `405` plus `Allow` when only the method differs.
 
-De routetabel is immutable zodra serving begint. Registratiefouten panicken
-vóór serving; synchronisatie op elk verzoek voor dynamische registratie hoort
-niet in dit profiel.
+The route table is immutable after serving starts. Registration errors panic
+before serving; per-request synchronization for dynamic registration is outside
+this profile.
 
-Ook routepatronen moeten canoniek zijn. Registratie van een patroon met onder
-meer dubbele slashes of dotsegmenten panickt vóór serving; de Mux normaliseert
-geen patroon naar een andere routebetekenis.
+Route patterns must also be canonical. Registration of a pattern containing
+duplicate slashes, dot segments, or similar ambiguity panics before serving;
+the Mux never normalizes a pattern into another route meaning.
 
 ### ADAPT
 
-Padinterpretatie heeft precies één vorm. Een requestpad begint met `/`, bevat
-geen lege binnensegmenten en geen `.` of `..`. Percent-escapes die na decoding
-een padscheiding of dotsegment worden, zijn ambigu en worden geweigerd. De
-parser antwoordt daarop met `400`; een handmatig of door middleware gebouwd
-niet-canoniek `Request.Path` matcht in de Mux niet en krijgt `404`.
+Path interpretation has exactly one form. A request path starts with `/`, has no
+empty inner segments, and contains neither `.` nor `..`. Percent escapes that
+decode into a separator or dot segment are ambiguous and rejected. The parser
+returns `400`; a non-canonical `Request.Path` built manually or by middleware
+does not match in the Mux and returns `404`.
 
-Bij registratie en requestdispatch is er bewust geen normalisatiestap en geen
-automatische slashredirect. Eén invoer krijgt niet eerst een
-middlewarebetekenis en daarna een andere routerbetekenis.
+Registration and dispatch deliberately perform no normalization or automatic
+slash redirect. One input never receives one meaning from middleware and a
+different meaning from the router.
 
 ### MURDER
 
-De server weigert expliciet:
+The server explicitly rejects:
 
-- HTTP/1.0 en andere versies (`505`);
+- HTTP/1.0 and other versions (`505`);
 - `CONNECT` (`501`);
-- absolute-, authority- en asterisk-form request-targets (`400`);
-- request-`Transfer-Encoding`, inclusief chunked (`501`);
-- dubbele framing of `Transfer-Encoding` naast `Content-Length` (`400`);
-- een niet-lege `Expect` (`417`);
-- een requestbody groter dan 1 MiB (`413`).
+- absolute-, authority-, and asterisk-form request targets (`400`);
+- request `Transfer-Encoding`, including chunked (`501`);
+- duplicate framing or `Transfer-Encoding` with `Content-Length` (`400`);
+- a non-empty `Expect` (`417`);
+- request bodies larger than 1 MiB (`413`).
 
-`WriteHeader` accepteert geen 1xx. `101` loopt uitsluitend via `Hijack`. `205`
-wordt als eigen finale status gedragen, is altijd bodyloos en krijgt
-`Content-Length: 0`; de writer verandert haar niet stil in een andere status.
+`WriteHeader` does not accept 1xx. `101` is available only through `Hijack`.
+`205` remains its own final status, is always bodyless, and receives
+`Content-Length: 0`; the writer never silently changes it into another status.
 
-De Mux doet geen host-routing, `{$}`, escaped routing, padopschoning,
-automatische slashredirects of volledige `net/http.ServeMux`-algebra.
+The Mux has no host routing, `{$}`, escaped routing, path cleaning, automatic
+slash redirects, or complete `net/http.ServeMux` algebra.
 
-## leanhttp-client
+## leanhttp client
 
 ### KEEP
 
-De client MOET:
+The client MUST:
 
-- HTTP/1.1-verzoeken schrijven en HTTP/1.0- en HTTP/1.1-antwoorden begrijpen;
-- iedere response/statusregel tot 8 KiB en alle interims plus de finale
-  responsekop samen tot 64 KiB begrenzen;
-- `Do` iedere finale status aan de aanroeper geven en bij `Get` exact `200`
-  plus een bekende `Content-Length` eisen;
-- bodies met `Content-Length`, chunked framing of EOF correct begrenzen, met
-  `HEAD`, `204`, `205` en `304` als bewezen bodyloos;
-- een afgebroken vaste-lengtebody als fout melden;
-- `Timeout` als één absolute termijn over dial, redirects, kop en body
-  handhaven; `HeaderTimeout` geldt uitsluitend voor antwoordkop/oordeel;
-- alleen een bewezen volledig gelezen response teruggeven aan de pool;
-- idle verbindingen zowel per host als totaal begrenzen en tijdgestuurd
-  sluiten;
-- maximaal één verse stale-keep-alive-herkansing doen, uitsluitend voor
-  replay-safe `GET`/`HEAD` vóór een bruikbaar antwoord;
-- alleen `301`, `302`, `303`, `307` en `308` automatisch volgen, uitsluitend
-  voor bodyloze `GET`/`HEAD` en maximaal tien hops;
-- bij een cross-origin redirect alle callerheaders verwijderen en een
-  HTTPS→HTTP-downgrade weigeren.
+- write HTTP/1.1 requests and understand HTTP/1.0 and HTTP/1.1 responses;
+- limit each response/status line to 8 KiB and all interim plus final headers
+  together to 64 KiB;
+- return every final status from `Do`, while `Get` requires exactly `200` and a
+  known `Content-Length`;
+- bound bodies using `Content-Length`, chunked framing, or EOF, treating `HEAD`,
+  `204`, `205`, and `304` as proven bodyless;
+- report a truncated fixed-length body as an error;
+- enforce `Timeout` as one absolute deadline across dial, redirects, headers,
+  and body; `HeaderTimeout` applies only to response headers and decisions;
+- return only a proven fully read response to the pool;
+- bound idle connections both per host and globally, and close them by time;
+- retry one fresh connection after a stale keep-alive failure, only for
+  replay-safe `GET`/`HEAD` before a usable response;
+- automatically follow only `301`, `302`, `303`, `307`, and `308`, only for
+  bodyless `GET`/`HEAD`, and for at most ten hops;
+- strip all caller headers on a cross-origin redirect and reject HTTPS→HTTP
+  downgrade.
 
-De package-level calls poolen niet: iedere redirect-hop gebruikt een eigen
-verbinding met `Connection: close`. `Client` is de expliciete keep-alivevorm.
+Package-level calls do not pool: every redirect hop gets a separate connection
+with `Connection: close`. `Client` is the explicit keep-alive form.
 
 ### ADAPT
 
-Een kleine body is `[]byte`. Een grote upload gebruikt `BodyReader` plus een
-exacte `BodyLen`; request-chunking bestaat niet. Zo'n stroom is niet
-replaybaar en verstuurt daarom eerst `Expect: 100-continue`.
+A small body is `[]byte`. A large upload uses `BodyReader` with exact `BodyLen`;
+request chunking does not exist. Such a stream is not replayable and therefore
+sends `Expect: 100-continue` first.
 
-De server MOET binnen één absolute oordeeltermijn een complete `100` of een
-finale responsekop sturen. Stilte, een gedeeltelijk oordeel of alleen andere
-interims tot de deadline is een fout en sluit de verbinding. Er is geen
-"stuur na één seconde toch"-fallback. Na `100` wordt de kopdeadline voor de
-upload gewist en wordt een geconfigureerde `HeaderTimeout` voor het finale
-antwoord opnieuw gezet. Is zowel `HeaderTimeout` als `Timeout` nul, dan heeft
-dat finale antwoord — net als een gewone call — bewust geen deadline.
+Within one absolute decision deadline, the server MUST send a complete `100` or
+a final response header. Silence, a partial decision, or only other interim
+responses until the deadline is an error and closes the connection. There is no
+“send after one second anyway” fallback. After `100`, the upload clears the
+header deadline and applies a configured `HeaderTimeout` anew to the final
+response. If both `HeaderTimeout` and `Timeout` are zero, that final response—
+like a regular call—deliberately has no deadline.
 
-Compressie is pass-through: de default is `identity`; wie zelf
-`Accept-Encoding` zet, leest zelf `Response.Encoding` en pakt zelf uit.
+Compression is pass-through. The default is `identity`; a caller that sets
+`Accept-Encoding` reads `Response.Encoding` and performs decompression itself.
 
-### MURDER en geaccepteerde grens
+### MURDER and accepted boundary
 
-De client doet geen request-chunking, automatische decompressie,
-protocolupgrade of algemene retry van muterende requests. Een `101` is een
-fout. `CONNECT` wordt vóór dial en serialisatie hard geweigerd; de client heeft
-geen ondersteunde tunnelnaad. Callerheaders mogen niet het pakket-eigendom van
-`Host`, framing, `Connection` of `Expect` dupliceren. `Accept-Encoding` is
-juist de expliciete pass-through-uitzondering.
+The client has no request chunking, automatic decompression, protocol upgrade,
+or general retry for mutating requests. A `101` is an error. `CONNECT` is
+rejected before dial and serialization; the client exposes no tunnel seam.
+Caller headers may not duplicate package-owned `Host`, framing, `Connection`,
+or `Expect`. `Accept-Encoding` is the explicit pass-through exception.
 
-Chunked responses dragen alleen kale hex-groottes. Ook syntactisch geldige
-chunk-extensies worden fail-closed geweigerd: een volledige quote-bewuste
-extensieparser heeft geen gemeten gebruiker. Trailers worden begrensd en op
-grammatica/verboden velden gecontroleerd, maar hun waarden worden niet aan de
-caller blootgesteld.
+Chunked responses accept only bare hexadecimal sizes. Even syntactically valid
+chunk extensions fail closed because no measured consumer justifies a complete,
+quote-aware extension parser. Trailers are bounded and validated for grammar
+and forbidden fields, but their values are not exposed.
 
-De keep-alivepool heeft bewust geen permanente read-loop per idle verbinding.
-Daarom geldt het poolcontract voor een protocolcorrecte origin die tijdens
-idle geen ongevraagde responsebytes injecteert. Reeds gebufferde bytes worden
-ontdekt en de verbinding gaat dicht; bytes die pas na die controle arriveren
-vereisen voor volledige verdediging een blijvende reader-eigenaar, en die
-machine is buiten scope. De stale-herkansing beschermt tegen een gesloten idle
-verbinding, niet tegen een syntactisch geldig vervalst antwoord.
+The keep-alive pool deliberately has no permanent read loop per idle connection.
+Its contract therefore assumes a protocol-correct origin that does not inject
+unsolicited response bytes while idle. Already buffered bytes are detected and
+the connection is closed; defending against bytes arriving just after that
+check requires a permanent reader owner and lies outside scope. The stale retry
+protects against a closed idle connection, not a syntactically valid forged
+response.
 
-## leanhttps en leans3
+## leanhttps and leans3
 
 ### leanhttps
 
-`leanhttps` is uitsluitend de compositie van `leanhttp` en `leantls`:
+`leanhttps` only composes `leanhttp` and `leantls`:
 
-- een expliciet trustmodel — gepinde peerkey of certificaatverificatie — is
-  verplicht;
-- SNI komt per verbinding uit het actuele dialadres, zodat een toegestane
-  redirect naar een andere host de juiste naam verifieert;
-- de callerconfig wordt niet gemuteerd;
-- TLS-keep-alive gebruikt `leanhttp.Client` met
-  `leanhttps.DialerContext(...)`.
+- an explicit trust model—pinned peer key or certificate verification—is
+  mandatory;
+- SNI comes from the current dial address for each connection, so an allowed
+  redirect to another host verifies the right name;
+- caller configuration is never mutated;
+- TLS keep-alive uses `leanhttp.Client` with `leanhttps.DialerContext(...)`.
 
-Een nil-config en certificaatvalidatie tegen een kaal IP-adres worden luid
-geweigerd. `ServerName` is package-owned en hoort bij de caller leeg te zijn:
-`Client` weigert een vooraf gezette waarde; de losse `DialerContext`
-overschrijft haar veilig in een configkopie met de actuele dialhost.
-`leanhttps` heeft geen serverhelft en voegt geen HTTP- of TLS-protocol toe.
+A nil config and certificate validation against a bare IP address fail loudly.
+`ServerName` is package-owned and must be empty in caller configuration:
+`Client` rejects a preset value, while standalone `DialerContext` safely
+overwrites it in a configuration copy with the current dial host. `leanhttps`
+has no server side and adds no HTTP or TLS protocol.
 
 ### leans3
 
-`leans3` draagt SigV4 met statische credentials en optioneel sessietoken,
-virtual-hosted en path-style adressen, en de gebruikte objectoperaties:
-`Get`, `GetTo`, `Put`, `PutFrom`, conditionele PUT/DELETE, ETag en gepagineerde
+`leans3` provides SigV4 with static credentials and an optional session token,
+virtual-hosted and path-style addressing, plus the object operations in use:
+`Get`, `GetTo`, `Put`, `PutFrom`, conditional PUT/DELETE, ETag, and paginated
 `ListObjectsV2`.
 
-Daarbij gelden deze invarianten:
+These invariants apply:
 
-- iedere PUT heeft een bekende lengte en payloadhash;
-- `UnsignedPayload` mag uitsluitend bij een HTTPS-endpoint; wie met een custom
-  `Client.DialContext` het standaardtransport vervangt, neemt zelf de plicht
-  over om geauthenticeerde encryptie en peer-validatie te behouden;
-- een getekend verzoek volgt nooit redirects: origin, target en headers zijn
-  onderdeel van de handtekening;
-- verwachte 404/409/412-bodies en andere foutbodies worden begrensd gelezen,
-  zodat een gewone miss/CAS-race de TLS-pool niet onnodig sloopt;
-- grote objecten gebruiken `GetTo`/`PutFrom` en worden niet verplicht volledig
-  gebufferd.
+- every PUT has a known length and payload hash;
+- `UnsignedPayload` is allowed only for an HTTPS endpoint; replacing the
+  default transport with `Client.DialContext` transfers responsibility for
+  authenticated encryption and peer validation to the caller;
+- a signed request never follows redirects because origin, target, and headers
+  are part of the signature;
+- expected 404/409/412 bodies and other error bodies are read within bounds, so
+  an ordinary miss or CAS race does not unnecessarily destroy the TLS pool;
+- large objects use `GetTo`/`PutFrom` and need not be buffered in full.
 
-Geen streaming SigV4, multipart, SigV4a, presigned URL's, IMDS/IAM-credentials,
-HEAD/CopyObject, versioning, object-lock, tagging of S3-level retries. Een
-GET/LIST kan wel de ene generieke, pre-response stale-keep-alive-herkansing van
-`leanhttp` krijgen; muterende S3-operaties worden niet herhaald. Een operatie
-komt pas in het pakket wanneer een echte consumer haar nodig heeft.
+There is no streaming SigV4, multipart, SigV4a, presigned URLs, IMDS/IAM
+credentials, HEAD/CopyObject, versioning, object lock, tagging, or S3-level
+retry. GET/LIST may use leanhttp's single generic stale-keep-alive retry before
+a response; mutating S3 operations are never repeated. Add an operation only
+when a real consumer needs it.
 
-Een S3-context wordt vóór de call gecontroleerd en zijn deadline wordt als
-HTTP-totaaltermijn doorgegeven. Een kale annulering zonder deadline breekt een
-al lopende call niet af; wie dat nodig heeft moet eerst een algemene,
-annuleerbare `leanhttp.Call`-naad meten en ontwerpen.
+An S3 context is checked before the call, and its deadline becomes the total
+HTTP deadline. Bare cancellation without a deadline does not interrupt a call
+already in progress; supporting that requires first measuring and designing a
+general cancellable `leanhttp.Call` seam.
 
-Iedere LIST-pagina is op 4 MiB begrensd. `List(max <= 0)` verzamelt echter
-bewust alle keys uit alle pagina's in één slice en kan dus met het aantal
-objecten meegroeien; callers op een kleine node geven een positieve `max`.
+Each LIST page is limited to 4 MiB. `List(max <= 0)` deliberately collects all
+keys from all pages into one slice and may grow with the object count; callers
+on small nodes should pass a positive `max`.
 
 ## leannet
 
 ### KEEP
 
-`leannet` draagt Ethernet, ARP, IPv4, ICMP echo, UDP en TCP voor één
-IPv4-identiteit, plus `net.Conn`, `net.Listener`, `net.PacketConn` en de
-Tamago-socketnaad.
+`leannet` provides Ethernet, ARP, IPv4, ICMP echo, UDP, and TCP for one IPv4
+identity, together with `net.Conn`, `net.Listener`, `net.PacketConn`, and the
+Tamago socket seam.
 
-De transportkern MOET:
+The transport core MUST:
 
-- alle verbindingsbuffers binnen `Config.Budget` houden;
-- per TCP-verbinding beginnen met 16 KiB RX en 4 KiB TX, op gemeten druk
-  groeien, lege overmaat tijdens idle weer inkrimpen en bij close/reap het
-  resterende budget teruggeven;
-- SYN, data en FIN in dezelfde sequence-ruimte administreren en na verlies
-  opnieuw kunnen versturen;
-- cumulatieve ACKs valideren tegen wat werkelijk verzonden is, ook tijdens
-  een retransmitrewind;
-- reset als fout leveren, niet als EOF;
-- geblokkeerde I/O via wake/deadline sturen en bij `Close` deblokkeren;
-- uitsluitend monotone tijd voor protocoltimers gebruiken;
-- ARP-opgeven op één plek in de pomp uitvoeren, luid falen en alle wachters
-  wekken;
-- volle budgetten, backlogs en onbereikbare routes als expliciete fout of RST
-  behandelen, nooit als een stille permanente wacht.
+- keep all connection buffers within `Config.Budget`;
+- start each TCP connection with 16 KiB RX and 4 KiB TX, grow under measured
+  pressure, shrink unused excess while idle, and return remaining budget on
+  close or reap;
+- account SYN, data, and FIN in one sequence space and retransmit after loss;
+- validate cumulative ACKs against bytes actually sent, including during a
+  retransmission rewind;
+- return reset as an error, not EOF;
+- drive blocked I/O through wakeups and deadlines and unblock it on `Close`;
+- use monotonic time exclusively for protocol timers;
+- perform ARP abandonment in one pump location, fail loudly, and wake all
+  waiters;
+- turn exhausted budgets, full backlogs, and unreachable routes into explicit
+  errors or RSTs, never silent permanent waits.
 
-Bij socket-`Close` komt het ongelezen RX-budget direct terug. TX-budget komt
-terug zodra de FIN bevestigd is of de verbinding wordt gereaped. De bewust
-kleine sluitgrenzen zijn 20 seconden in FIN-WAIT-2 en 1 seconde in TIME-WAIT;
-ze zijn resourcebeleid voor deze nodes, geen algemene internet-default.
+Socket `Close` returns unread RX budget immediately. TX budget returns when FIN
+is acknowledged or the connection is reaped. The deliberately short close
+bounds—20 seconds in FIN-WAIT-2 and 1 second in TIME-WAIT—are resource policy
+for these nodes, not general Internet defaults.
 
-### ADAPT en MURDER
+### ADAPT and MURDER
 
-Out-of-order TCP-data wordt gedropt met een onmiddellijke dup-ACK; de peer
-herstelt via retransmissie. Dat is de gekozen kleine verliesmachine, niet een
-half gebouwde SACK-machine.
+Out-of-order TCP data is dropped with an immediate duplicate ACK; the peer
+recovers through retransmission. This is the chosen small loss state machine,
+not half a SACK implementation.
 
-Niet aanwezig: congestion control, out-of-order reassembly/SACK, IPv6/NDP,
-IPv4-fragmentatie en IPv4-opties, TCP timestamps/PAWS, Nagle, SYN-cookies,
-urgent-data-API, inkomende broadcast-IP en logging in het datapad. De
-motivering en de voorwaarden waaronder iets terug mag komen staan in
-[`leannet/DESIGN.md`](leannet/DESIGN.md).
+Absent: congestion control, out-of-order reassembly/SACK, IPv6/NDP, IPv4
+fragmentation and options, TCP timestamps/PAWS, Nagle, SYN cookies, urgent-data
+API, inbound IP broadcast, and data-path logging. [`leannet/DESIGN.md`](leannet/DESIGN.md)
+explains why and when a feature may return.
 
-## Consumerplichten
+## Consumer obligations
 
-De kleine kern kan alleen klein blijven als seams niet opnieuw half in elke
-consumer worden gebouwd:
+The core stays small only if consumers do not rebuild each seam halfway:
 
-- een streamhandler die de requestbody nodig heeft leest haar vóór `Done`.
-  Anders draagt `Done` de ongelezen body over aan de begrensde serverdrain.
-  Daarna raakt de handler `Request.Body` niet meer aan. De harde grens is vóór
-  de responsekop op de draad staat; de simpele consumerdiscipline is daarom:
-  claim vóór `WriteHeader`, `Write` of `Flush`;
-- een hijacker gebruikt niet ook `Done` of de gewone `ResponseWriter`;
-- een caller die verbindingen wil hergebruiken leest een response tot het
-  bewezen einde en sluit haar altijd;
-- een ondertekend protocol volgt niet generiek redirects maar valideert en
-  tekent iedere hop zelf; `leans3` kiest daarom `NoFollow`;
-- een custom `DialContext` respecteert contextannulering/deadlines en levert
-  een verbinding waarop deadlines werkelijk werken;
-- een custom S3-dialer voor een HTTPS-endpoint behoudt zelf geauthenticeerde
-  encryptie en peer-validatie, in het bijzonder bij `UnsignedPayload`;
-- consumers bouwen standalone tegen een gepubliceerde Lean-versie; een
-  lokale workspace of `replace` naar een lokaal pad is ontwikkelgereedschap,
-  geen releasebewijs.
+- a streaming handler reads needed request-body content before `Done`.
+  Otherwise `Done` transfers the unread body to the bounded server drain. The
+  handler never touches `Request.Body` afterward. The hard boundary is before
+  response headers reach the wire, so the simple rule is to claim it before
+  `WriteHeader`, `Write`, or `Flush`;
+- a hijacker uses neither `Done` nor the regular `ResponseWriter`;
+- a caller that wants connection reuse reads a response to its proven end and
+  always closes it;
+- a signed protocol does not follow generic redirects, but validates and signs
+  each hop itself; `leans3` therefore chooses `NoFollow`;
+- a custom `DialContext` honors context cancellation/deadlines and returns a
+  connection with working deadlines;
+- a custom S3 dialer for HTTPS preserves authenticated encryption and peer
+  validation, especially with `UnsignedPayload`;
+- consumers build standalone against a published Lean version. A local
+  workspace or filesystem `replace` is development tooling, not release proof.
 
-## Release-gate
+## Release gate
 
-Een wijziging aan dit profiel mag pas door wanneer alle relevante poorten
-groen zijn.
+A profile change may land only when all relevant gates pass.
 
 ### Repository
 
@@ -361,25 +345,25 @@ go test -race -count=1 ./...
 go vet ./...
 ```
 
-Nieuwe regressies krijgen bij voorkeur een test op de laag waar de invariant
-hoort: parser/framing en lifecycle in `leanhttp`, de pure TCP/ARP-machine in
-`leannet`, en compositiefouten bij `leanhttps`/`leans3`.
+Prefer regressions at the layer that owns the invariant: parsing, framing, and
+lifecycle in `leanhttp`; the pure TCP/ARP state machine in `leannet`; composition
+errors in `leanhttps` or `leans3`.
 
-### Source-gate voor consumers
+### Consumer source gate
 
-Vóór tags wordt de gemeten keten in één lokale workspace aan de kandidaatbron
-gekoppeld. Lokale `replace`-regels mogen hier bestaan, want dit is een
-bronintegratietest en nog geen releasebewijs. De gate bevat:
+Before tagging, connect the measured chain to candidate source in one local
+workspace. Local `replace` directives are allowed because this is source
+integration, not release proof. The gate includes:
 
-- gewone tests, race-tests en `go vet` voor Hop, hoplock en hoplockserver;
-- een Tamago-compilecheck van Hop's alternatieve HTTP-bestanden:
+- regular tests, race tests, and `go vet` for Hop, hoplock, and hoplockserver;
+- a Tamago compile check of Hop's alternative HTTP files:
   `go test -run '^$' -tags tamago ./pkg/hophttp`;
-- gewone tests, race-tests en `go vet` voor surfserve tegen de lokale Lean;
-- exact twee surfserve-regressies: `GET /stream` met een niet-lege
-  `Content-Length` geeft een 4xx en de server blijft daarna bruikbaar; een
-  bodyloze niet-GET op `/stream` geeft `405`.
+- regular tests, race tests, and `go vet` for surfserve against local Lean;
+- exactly two surfserve regressions: `GET /stream` with a non-empty
+  `Content-Length` returns 4xx and leaves the server usable; a bodyless non-GET
+  on `/stream` returns `405`.
 
-In de bestaande sibling-workspace zijn de eerste drie regels uitvoerbaar als:
+In the existing sibling workspace, the first three lines are:
 
 ```sh
 go test -count=1 ./hop/... ../hoplock/... ./hoplockserver/...
@@ -388,15 +372,15 @@ go vet ./hop/... ../hoplock/... ./hoplockserver/...
 go -C hop test -run '^$' -tags tamago ./pkg/hophttp
 ```
 
-Surfserve staat niet in de gewone ontwikkelworkspace. Koppel de kandidaat
-daarom in een tijdelijk, niet-gecommit `go.work` aan uitsluitend de Lean- en
-hop-os-surf-werkbomen en voer met dát `GOWORK` de hosttests op
-`./stack/surfserve` uit. Het officiële surfserve-buildscript zet zelf
-`GOWORK=off`; dat is dus pas ná publicatie een bewijs voor de kandidaattag.
+Surfserve is absent from the regular development workspace. Connect the
+candidate in a temporary, uncommitted `go.work` containing only the Lean and
+hop-os-surf worktrees, then use that `GOWORK` for host tests of
+`./stack/surfserve`. The official surfserve build script sets `GOWORK=off`, so
+it proves a candidate tag only after publication.
 
 ```sh
-LEAN_CANDIDATE=/pad/naar/lean
-SURF_CANDIDATE=/pad/naar/hop-os-surf
+LEAN_CANDIDATE=/path/to/lean
+SURF_CANDIDATE=/path/to/hop-os-surf
 KAM_WORKDIR="$(mktemp -d)"
 go -C "$KAM_WORKDIR" work init "$LEAN_CANDIDATE" "$SURF_CANDIDATE"
 GOWORK="$KAM_WORKDIR/go.work" go -C "$SURF_CANDIDATE" test -count=1 ./stack/surfserve
@@ -404,16 +388,16 @@ GOWORK="$KAM_WORKDIR/go.work" go -C "$SURF_CANDIDATE" test -race -count=1 ./stac
 GOWORK="$KAM_WORKDIR/go.work" go -C "$SURF_CANDIDATE" vet ./stack/surfserve
 ```
 
-De tijdelijke directory blijft buiten alle repositories en wordt na de gate
-verwijderd.
+The temporary directory stays outside every repository and is removed after
+the gate.
 
-`go test ./...` is voor hop-os-surf geen geldige hostgate: de metal-commands
-zijn Tamago-only. Test in deze pre-tag gate alleen de relevante hostpakketten.
+`go test ./...` is not a valid hop-os-surf host gate because the metal commands
+are Tamago-only. Test only the relevant host packages in this pre-tag gate.
 
-### Release-gate voor consumers
+### Consumer release gate
 
-Na tag en dependencybump draaien Hop, hoplock en hoplockserver opnieuw buiten
-de lokale workspace:
+After tagging and updating dependencies, run Hop, hoplock, and hoplockserver
+again outside the local workspace:
 
 ```sh
 GOWORK=off go test -count=1 ./...
@@ -422,11 +406,10 @@ GOWORK=off go vet ./...
 GOWORK=off go list -m all
 ```
 
-Surfserve gebruikt in plaats van `./...` zijn hostgate op
-`./stack/surfserve` plus het officiële `tools/test.sh`, omdat dat script de
-Tamago-builds draagt en de overige metal-commands niet met de hosttoolchain
-gebouwd kunnen worden. Voor Hop blijft ook de expliciete `-tags tamago`-compile
-van `./pkg/hophttp` verplicht.
+For surfserve, replace `./...` with its host gate on `./stack/surfserve` plus
+the official `tools/test.sh`. That script covers the Tamago builds, while the
+remaining metal commands cannot use the host toolchain. Hop still requires the
+explicit `-tags tamago` compile of `./pkg/hophttp`.
 
 ```sh
 GOWORK=off go test -count=1 ./stack/surfserve
@@ -435,36 +418,35 @@ GOWORK=off go vet ./stack/surfserve
 GOWORK=off ./tools/test.sh
 ```
 
-`tools/test.sh` krijgt daarbij de gepinde Tamago-toolchain via zijn bestaande
-`TAMAGO`-configuratie.
+Provide the pinned Tamago toolchain to `tools/test.sh` through its existing
+`TAMAGO` configuration.
 
-Elke modulelijst MOET de nieuwe tags tonen en MAG geen `replace` naar een
-lokaal bestandssysteempad bevatten — relatief en absoluut zijn allebei geen
-releasebewijs. Draai deze gate vanuit een schone checkout van de te publiceren
-commits; `GOWORK=off` schakelt een `replace` in `go.mod` namelijk niet uit.
+Every module list MUST show the new tags and MUST NOT contain a `replace` to a
+local filesystem path, whether relative or absolute. Run this gate from a clean
+checkout of the commits being published; `GOWORK=off` does not disable a
+`replace` in `go.mod`.
 
-De gate gebruikt één expliciet gepinde toolchain, voor deze KAM Go 1.26.4.
-Consumer-CI MAG niet op een oudere `setup-go`-versie vertrouwen of een
-toevallige automatische toolchain-download als bewijs tellen. Een latere
-toolchain wordt samen met deze regel en de CI-configuratie bewust verhoogd.
+The gate uses one explicitly pinned toolchain: Go 1.26.4 for this KAM. Consumer
+CI MUST NOT rely on an older `setup-go` version or count an incidental automatic
+toolchain download as proof. Upgrade the toolchain together with this rule and
+the CI configuration.
 
-Vóór taggen staan er geen lokale-pad-`replace`-regels in een te publiceren
-`go.mod`. Eerst wordt Lean gepubliceerd, daarna worden consumers in
-afhankelijkheidsvolgorde verhoogd en standalone opnieuw gebouwd. Hardware-,
-netmeter- en 64MiB-OOM-validatie van
-`leannet` blijft als deploymentbewijs in [`TODO.md`](TODO.md) staan; een groene
-hosttest mag die claim niet vervangen.
+Before tagging, no publishable `go.mod` contains local-path `replace`
+directives. Publish Lean first, then update consumers in dependency order and
+rebuild them standalone. Hardware, netmeter, and 64 MiB OOM validation for
+`leannet` remains deployment evidence in [`TODO.md`](TODO.md); passing host
+tests cannot replace it.
 
-## Wijzigingsregel
+## Change rule
 
-Een uitbreiding van deze KAM bevat tegelijk:
+An extension to this KAM includes all of:
 
-1. de meting of concrete consumer die de ontbrekende feature nodig heeft;
-2. de kleinste expliciete contractwijziging;
-3. een regressietest op de eigenaarlaag en, bij een seam, een consumertest;
-4. de bijgewerkte KEEP/ADAPT/MURDER-beslissing in dit document;
-5. bewijs dat hard geweigerde invoer nog steeds luid en begrensd faalt.
+1. the measurement or concrete consumer that needs the missing feature;
+2. the smallest explicit contract change;
+3. a regression test at the owning layer and, for a seam, a consumer test;
+4. the updated KEEP/ADAPT/MURDER decision in this document;
+5. proof that hard-rejected input still fails loudly and within bounds.
 
-Zonder die vijf blijft de feature buiten scope. Dat is geen gebrek aan
-standaardtrouw; het is de veiligheidsgrens waardoor de gedragen subset wel
-volledig te reviewen blijft.
+Without all five, the feature stays outside scope. This is not incomplete
+standards compliance; it is the safety boundary that keeps the supported subset
+fully reviewable.

@@ -16,20 +16,6 @@ import (
 	"time"
 )
 
-// Twee soorten toetsen, en de tweede is de belangrijkste.
-//
-//  1. De ECHTE ketens van de hosts die onze vloot gebruikt, vastgelegd als
-//     fixtures (12-08 opgehaald met openssl s_client). Die dekken wat er in het
-//     wild gebeurt: ECDSA- én RSA-ketens, cross-signing, en een leaf met zes
-//     wildcards in zijn SAN-lijst.
-//  2. De AANVALSBATTERIJ: ketens die geweigerd MOETEN worden. Een validator die
-//     alleen op goede ketens getest is, is niet getest — elk gat in deze
-//     categorie is een verbinding die je denkt te hebben en niet hebt.
-//
-// De fixtures verlopen, dus de tijd waarop we valideren komt uit het leaf zelf
-// (notBefore + een uur). Zo blijft deze test over drie maanden nog precies
-// hetzelfde bewijzen, en de geldigheidscontrole zelf zit in de batterij.
-
 func chainFrom(t *testing.T, path string) [][]byte {
 	t.Helper()
 	b, err := os.ReadFile(path)
@@ -49,8 +35,6 @@ func chainFrom(t *testing.T, path string) [][]byte {
 	}
 }
 
-// roots bouwt een pool uit de bundel in testdata, zodat deze test niet aan de
-// trust store van de machine hangt.
 func roots(t *testing.T) *x509.CertPool {
 	t.Helper()
 	b, err := os.ReadFile("../testdata/cacert.pem")
@@ -87,7 +71,7 @@ func TestRealChains(t *testing.T) {
 			if v == nil {
 				t.Fatal("geen verifier terug")
 			}
-			// En een verkeerde naam moet dezelfde keten afwijzen.
+
 			if _, err := ChainAt(pool, at)(chain, "attacker.example"); err == nil {
 				t.Error("keten geldig verklaard voor een naam die er niet in staat")
 			}
@@ -95,9 +79,8 @@ func TestRealChains(t *testing.T) {
 	}
 }
 
-// De batterij: alles hieronder MOET falen.
 func TestRejects(t *testing.T) {
-	// Een eigen mini-PKI, zodat we de fouten kunnen máken.
+
 	caKey, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	caTmpl := &x509.Certificate{
 		SerialNumber:          big.NewInt(1),
@@ -140,26 +123,19 @@ func TestRejects(t *testing.T) {
 		}
 	}
 
-	// verlopen
 	exp := base()
 	exp.NotBefore, exp.NotAfter = time.Now().Add(-48*time.Hour), time.Now().Add(-24*time.Hour)
 
-	// nog niet geldig
 	fut := base()
 	fut.NotBefore, fut.NotAfter = time.Now().Add(24*time.Hour), time.Now().Add(48*time.Hour)
 
-	// een leaf die zichzelf CA verklaart en dan een tweede cert ondertekent:
-	// het klassieke gat. Hier toetsen we de eerste helft — een leaf van een
-	// onbekende uitgever.
 	selfKey, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	selfTmpl := base()
 	selfTmpl.Subject = pkix.Name{CommonName: "self"}
-	// De naam MOET kloppen, anders faalt dit geval op de hostnaam en toetst het
-	// niet wat het moet toetsen: dat een onbekende uitgever wordt geweigerd.
+
 	selfTmpl.DNSNames = []string{"self"}
 	selfDER, _ := x509.CreateCertificate(rand.Reader, selfTmpl, selfTmpl, &selfKey.PublicKey, selfKey)
 
-	// verkeerde extended key usage (voor code signing uitgegeven)
 	eku := base()
 	eku.ExtKeyUsage = []x509.ExtKeyUsage{x509.ExtKeyUsageCodeSigning}
 
@@ -198,8 +174,6 @@ func wildcard(c *x509.Certificate) *x509.Certificate {
 	return c
 }
 
-// De handtekening-verifier: een server mag niet kiezen welk algoritme bij zijn
-// sleutel hoort. Dit toetst de twee verwisselingen die anders mogelijk zijn.
 func TestVerifierAlgorithmMismatch(t *testing.T) {
 	ec, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	rk, _ := rsa.GenerateKey(rand.Reader, 2048)
@@ -210,12 +184,11 @@ func TestVerifierAlgorithmMismatch(t *testing.T) {
 	if err := verifierFor(&rk.PublicKey)(ECDSASecp256r1SHA256, []byte("x"), nil); err == nil {
 		t.Error("ECDSA-code met een RSA-sleutel werd geaccepteerd")
 	}
-	// Verkeerde curve bij de juiste soort.
+
 	if err := verifierFor(&ec.PublicKey)(ECDSASecp384r1SHA384, []byte("x"), nil); err == nil {
 		t.Error("P-384-code met een P-256-sleutel werd geaccepteerd")
 	}
-	// En een algoritme dat we niet aanbieden (PKCS#1v1.5, in 1.3 verboden voor
-	// de handshake) mag nooit langskomen.
+
 	if err := verifierFor(&rk.PublicKey)(0x0401, []byte("x"), nil); err == nil {
 		t.Error("rsa_pkcs1_sha256 werd geaccepteerd in een TLS 1.3-handshake")
 	}

@@ -6,8 +6,6 @@ import (
 	"testing"
 )
 
-// refChecksum is een onafhankelijke, naïeve RFC 1071-implementatie waar de
-// productie-checksum tegenaan gelegd wordt — het meetinstrument eerst.
 func refChecksum(blocks ...[]byte) uint16 {
 	var sum uint64
 	var all []byte
@@ -26,8 +24,6 @@ func refChecksum(blocks ...[]byte) uint16 {
 	return ^uint16(sum)
 }
 
-// TestChecksumGolden legt de checksum tegen het klassieke IPv4-voorbeeld:
-// header met checksumveld 0xb861 telt op tot 0.
 func TestChecksumGolden(t *testing.T) {
 	hdr := []byte{
 		0x45, 0x00, 0x00, 0x73, 0x00, 0x00, 0x40, 0x00,
@@ -37,7 +33,7 @@ func TestChecksumGolden(t *testing.T) {
 	if got := checksum(hdr); got != 0 {
 		t.Fatalf("golden IPv4 header: checksum = %#04x, want 0", got)
 	}
-	// En zonder het checksumveld moet precies 0xb861 eruit rollen.
+
 	blank := append([]byte(nil), hdr...)
 	blank[10], blank[11] = 0, 0
 	if got := checksum(blank); got != 0xb861 {
@@ -85,9 +81,9 @@ func TestARPRoundtrip(t *testing.T) {
 		!bytes.Equal(f.SenderProto(), si[:]) || !bytes.Equal(f.TargetProto(), ti[:]) {
 		t.Fatalf("ARP fields corrupted: op=%d", f.Op())
 	}
-	// Niet-ethernet/IPv4-ARP wordt geweigerd.
+
 	bad := append([]byte(nil), buf[:n]...)
-	binary.BigEndian.PutUint16(bad[0:2], 6) // htype IEEE 802
+	binary.BigEndian.PutUint16(bad[0:2], 6)
 	if _, err := ParseARP(bad); err == nil {
 		t.Error("non-ethernet ARP accepted")
 	}
@@ -102,8 +98,7 @@ func TestIPv4Roundtrip(t *testing.T) {
 	if err != nil || n != sizeIPv4 {
 		t.Fatalf("PutIPv4: n=%d err=%v", n, err)
 	}
-	// Parse over een buffer mét ethernet-padding erachter: Payload moet op
-	// TotalLen knippen, niet op len(b).
+
 	f, err := ParseIPv4(buf[:60])
 	if err != nil {
 		t.Fatal(err)
@@ -117,26 +112,25 @@ func TestIPv4Roundtrip(t *testing.T) {
 	if !bytes.Equal(f.Payload(), payload) {
 		t.Fatalf("payload = %q (len %d), want %q", f.Payload(), len(f.Payload()), payload)
 	}
-	// Corruptie moet de checksum breken.
-	buf[8]-- // TTL
+
+	buf[8]--
 	if f.ChecksumOK() {
 		t.Error("checksum still valid after corruption")
 	}
 	buf[8]++
 
-	// Opties en fragmenten weigeren luid, elk met hun eigen fout.
 	withOpts := append([]byte(nil), buf[:60]...)
 	withOpts[0] = 4<<4 | 6
 	if _, err := ParseIPv4(withOpts); err != errIPv4Options {
 		t.Errorf("options: err = %v", err)
 	}
 	frag := append([]byte(nil), buf[:60]...)
-	binary.BigEndian.PutUint16(frag[6:8], 0x2000) // MF
+	binary.BigEndian.PutUint16(frag[6:8], 0x2000)
 	if _, err := ParseIPv4(frag); err != errFragmented {
 		t.Errorf("fragment: err = %v", err)
 	}
 	frag2 := append([]byte(nil), buf[:60]...)
-	binary.BigEndian.PutUint16(frag2[6:8], 0x0001) // offset 8
+	binary.BigEndian.PutUint16(frag2[6:8], 0x0001)
 	if _, err := ParseIPv4(frag2); err != errFragmented {
 		t.Errorf("fragment offset: err = %v", err)
 	}
@@ -151,7 +145,7 @@ func TestUDPRoundtrip(t *testing.T) {
 	if err != nil || n != sizeUDP+len(payload) {
 		t.Fatalf("PutUDP: n=%d err=%v", n, err)
 	}
-	f, err := ParseUDP(buf[:n+6]) // + rommel erachter: Len moet knippen
+	f, err := ParseUDP(buf[:n+6])
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -161,11 +155,11 @@ func TestUDPRoundtrip(t *testing.T) {
 	if !f.ChecksumOK(src, dst) {
 		t.Error("UDP checksum invalid")
 	}
-	// src↔dst wisselen verandert de som niet (commutatief) — een ander adres wél.
+
 	if f.ChecksumOK(src, [4]byte{10, 100, 0, 3}) {
 		t.Error("UDP checksum ignores the pseudo-header")
 	}
-	// Checksum 0 = afwezig = goedkeuren.
+
 	binary.BigEndian.PutUint16(buf[6:8], 0)
 	if !f.ChecksumOK(src, dst) {
 		t.Error("absent UDP checksum rejected")
@@ -176,7 +170,7 @@ func TestTCPRoundtrip(t *testing.T) {
 	buf := make([]byte, 256)
 	src, dst := [4]byte{192, 168, 99, 2}, [4]byte{140, 82, 121, 4}
 	payload := []byte("GET / HTTP/1.1\r\n")
-	opts := []byte{2, 4, 0x05, 0xb4} // MSS 1460
+	opts := []byte{2, 4, 0x05, 0xb4}
 	copy(buf[sizeTCP+len(opts):], payload)
 	n, err := PutTCP(buf, 49152, 443, 1000, 2000, FlagACK|FlagPSH, 0xfff0, opts, src, dst, len(payload))
 	if err != nil {
@@ -209,19 +203,16 @@ func TestTCPRoundtrip(t *testing.T) {
 	}
 	buf[n-1] ^= 0xff
 
-	// Opties moeten op 4 uitgelijnd zijn; een kapotte data-offset weigert.
 	if _, err := PutTCP(buf, 1, 2, 0, 0, FlagSYN, 0, []byte{2, 4, 0}, src, dst, 0); err == nil {
 		t.Error("unaligned options accepted")
 	}
 	bad := append([]byte(nil), buf[:n]...)
-	bad[12] = 3 << 4 // offset 12 bytes < 20
+	bad[12] = 3 << 4
 	if _, err := ParseTCP(bad); err != errBadTCPOff {
 		t.Errorf("bad offset: err = %v", err)
 	}
 }
 
-// TestPseudoChecksumAgainstRef legt de pseudo-header-checksum tegen de
-// referentie-implementatie voor een reeks lengtes (even, oneven, leeg).
 func TestPseudoChecksumAgainstRef(t *testing.T) {
 	src, dst := [4]byte{1, 2, 3, 4}, [4]byte{5, 6, 7, 8}
 	for _, n := range []int{0, 1, 2, 3, 19, 20, 21, 1460} {
