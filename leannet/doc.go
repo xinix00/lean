@@ -1,5 +1,6 @@
 // Package leannet is a small TCP/IP stack for bare-metal Go (TamaGo): Ethernet,
-// ARP, IPv4, ICMP echo, UDP, and TCP, plus a socket layer that supplies
+// ARP, IPv4, ICMP echo, UDP, TCP, and link-local IPv4 multicast (mDNS), plus
+// a socket layer that supplies
 // net.Conn, net.Listener, and net.PacketConn to net.SocketFunc. It uses only the
 // standard library.
 //

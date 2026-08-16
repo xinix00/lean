@@ -164,7 +164,13 @@ func PutIPv4(b []byte, proto byte, src, dst [4]byte, payloadLen int) (int, error
 	binary.BigEndian.PutUint16(b[2:4], uint16(sizeIPv4+payloadLen))
 	binary.BigEndian.PutUint16(b[4:6], 0)      // identification is unused without fragmentation
 	binary.BigEndian.PutUint16(b[6:8], 0x4000) // DF
-	b[8] = 64                                  // TTL
+	// TTL follows the destination's scope: link-local multicast wants 255
+	// (RFC 6762 §11) and cannot be forwarded by routers anyway (RFC 5771);
+	// everything else keeps the routed-unicast default.
+	b[8] = 64
+	if isLinkLocalMulticast(dst) {
+		b[8] = 255
+	}
 	b[9] = proto
 	binary.BigEndian.PutUint16(b[10:12], 0)
 	copy(b[12:16], src[:])

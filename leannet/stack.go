@@ -108,6 +108,10 @@ type Stack struct {
 	loopback [][]byte
 	lbFree   [][]byte
 
+	// Joined link-local multicast groups (multicast.go): a bounded set,
+	// lazily allocated — most stacks never join anything.
+	groups map[[4]byte]struct{}
+
 	gwMAC    [6]byte // statically planned gateway
 	hasGwMAC bool
 
@@ -210,6 +214,7 @@ func (s *Stack) Close() {
 		return
 	}
 	s.closed = true
+	s.groups = nil
 	for key, c := range s.conns {
 		c.tcp.abort()
 		s.reap(key, c)
@@ -331,7 +336,20 @@ func (s *Stack) ingressLocked(eth EthFrame, now int64) {
 		s.notify() // resolution or a reply may now be ready
 	case EtherTypeIPv4:
 		if !toUs {
-			return // not addressed to us; broadcast IP ingress is unsupported
+			// Joined multicast is the one exception to "addressed to us".
+			// UDP only: RFC 1122 §3.2.2.6 discourages echo replies to
+			// multicast and TCP has no meaning there. Everything else is
+			// normal LAN noise and leaves silently — counting it would
+			// drown the drop counters that matter.
+			if !isMulticastMAC([6]byte(eth.Dst())) {
+				return
+			}
+			ip, err := ParseIPv4(eth.Payload())
+			if err != nil || !ip.ChecksumOK() || !s.joinedLocked(ip.Dst()) || ip.Proto() != ProtoUDP {
+				return
+			}
+			s.recvIPv4(ip, [6]byte(eth.Src()), now)
+			return
 		}
 		ip, err := ParseIPv4(eth.Payload())
 		if err != nil || !ip.ChecksumOK() || ip.Dst() != s.cfg.IP {
@@ -346,6 +364,12 @@ func (s *Stack) ingressLocked(eth EthFrame, now int64) {
 
 func (s *Stack) recvIPv4(ip IPv4Frame, srcMAC [6]byte, now int64) {
 	src := ip.Src()
+	// A multicast source address is never valid (RFC 1112 §7.2): discard
+	// silently before any transport work or replies.
+	if isMulticastIP(src) {
+		s.stats.DropBadFrame++
+		return
+	}
 	// Learn only from unicast addressed to us after transport checksum
 	// validation. The checksum is not authentication; arp.learn's cap remains
 	// the security boundary.
@@ -367,7 +391,9 @@ func (s *Stack) recvIPv4(ip IPv4Frame, srcMAC [6]byte, now int64) {
 		s.recvTCP(f, src, now)
 	case ProtoUDP:
 		f, err := ParseUDP(ip.Payload())
-		if err != nil || !f.ChecksumOK(src, s.cfg.IP) {
+		// The pseudo-header carries the frame's own destination: our unicast
+		// address (guaranteed by ingress) or a joined multicast group.
+		if err != nil || !f.ChecksumOK(src, ip.Dst()) {
 			s.stats.DropBadFrame++
 			return
 		}
@@ -690,6 +716,9 @@ func (s *Stack) nextDeadlineLocked() int64 {
 // marks a static gateway route that no ARP failure may block. Dial, UDP, and the
 // pump share this decision.
 func (s *Stack) nextHopLocked(dst [4]byte) (hop [4]byte, viaARP bool) {
+	if isLinkLocalMulticast(dst) {
+		return dst, false // link-local: never the gateway, never ARP
+	}
 	if s.hasGwMAC && (dst == s.cfg.GW || !sameSubnet(dst, s.cfg.IP, s.cfg.Prefix)) {
 		return dst, false // static plan has no ARP outcome
 	}
@@ -706,6 +735,12 @@ func (s *Stack) routeLocked(dst [4]byte, now int64, query bool) ([6]byte, bool) 
 	// succeed because a switch does not reflect the broadcast to its source.
 	if dst == s.cfg.IP {
 		return s.cfg.MAC, true
+	}
+	// Link-local multicast maps straight to its Ethernet address (RFC 1112
+	// §6.4): no resolution, and never the gateway — the scope is this link.
+	// Wider multicast never reaches here: writeUDP refuses it, dialTCP too.
+	if isLinkLocalMulticast(dst) {
+		return multicastMAC(dst), true
 	}
 	// Route limited and directed broadcasts to the Ethernet broadcast MAC. This
 	// is required for DHCP rebind (RFC 2131 §4.4.5); replies arrive unicast.
@@ -773,6 +808,20 @@ func (s *Stack) sendEthLocked(dst [6]byte, etherType uint16, payloadLen int) err
 			s.txBuf[i] = 0
 		}
 		n = 60
+	}
+	// A joined group hears its own sends (IP_MULTICAST_LOOP semantics
+	// elsewhere): copy to loopback AND still transmit to the wire. mDNS
+	// responders depend on hearing their own queries. Overflow only loses
+	// the local copy.
+	if isMulticastMAC(dst) && etherType == EtherTypeIPv4 {
+		if ip, err := ParseIPv4(s.txBuf[EthernetHeaderSize:n]); err == nil && s.joinedLocked(ip.Dst()) {
+			if len(s.loopback) < loopbackMax {
+				s.loopback = append(s.loopback, append(s.lbBuf(), s.txBuf[:n]...))
+				s.notify()
+			} else {
+				s.stats.DropReplyFull++
+			}
+		}
 	}
 	// Frames to our own MAC enter local ingress rather than the wire, providing
 	// loopback semantics on this stack's only address.

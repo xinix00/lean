@@ -309,6 +309,12 @@ func (s *Stack) dialTCP(ctx context.Context, raddr [4]byte, rport uint16, deadli
 	if deadline.IsZero() {
 		deadline = time.Now().Add(dialTimeoutDefault)
 	}
+	// TCP to a multicast address is meaningless: ingress drops multicast TCP
+	// by contract, so a SYN would only burn wire and ~20 KiB of connection
+	// state until the handshake times out. Refuse before any of that exists.
+	if isMulticastIP(raddr) {
+		return nil, errors.New("leannet: tcp to a multicast address")
+	}
 	s.mu.Lock()
 	if s.closed {
 		s.mu.Unlock()
@@ -577,6 +583,12 @@ func (u *udpSock) WriteTo(p []byte, addr net.Addr) (int, error) {
 func (u *udpSock) writeUDP(p []byte, dst [4]byte, dport uint16) (int, error) {
 	if err := u.s.closedFirst(func() bool { return u.port.closed }); err != nil {
 		return 0, err
+	}
+	// Only the link-local block is sendable multicast: wider groups could be
+	// forwarded beyond the LAN by a multicast router (RFC 2365), and nothing
+	// here needs them. Explicit refusal beats an ARP timeout.
+	if isMulticastIP(dst) && !isLinkLocalMulticast(dst) {
+		return 0, errNotLinkLocalMulticast
 	}
 	if len(p) > MTU-sizeIPv4-sizeUDP {
 		return 0, errors.New("leannet: udp datagram exceeds mtu")

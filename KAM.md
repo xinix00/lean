@@ -47,7 +47,7 @@ not contractual.
 | Mux | method+path, exact/subtree, `{segment}`, `{rest...}`, `GET`→`HEAD`, `404`/`405`+`Allow` | canonical paths or rejection; immutable after start | host routing, `{$}`, escaped/dot routing, slash normalization, net/http compatibility work |
 | HTTP client | outbound HTTP/1.1, inbound 1.0/1.1, GET/HEAD redirects, response framing, deadlines, keep-alive pool | fixed-length streaming upload with a strict Expect decision; compression pass-through | request chunking, automatic decompression, CONNECT/upgrade, general retry state machine |
 | TLS/S3 | explicit trust model, SNI per connection, SigV4 and used object operations | TLS as a dialer composition; signed S3 calls never follow redirects | TLS server, silent skip-verify, multipart, streaming SigV4, SigV4a, presigned URLs, IMDS/IAM |
-| leannet | Ethernet, ARP, IPv4, ICMP echo, UDP, TCP, deadlines, close, bounded memory | loss recovery without OOO buffering/SACK; one IPv4 identity, one total budget and optional per-connection cap | IPv6/NDP, fragmentation, congestion control, timestamps, Nagle, SYN cookies, data-path logging |
+| leannet | Ethernet, ARP, IPv4, ICMP echo, UDP, TCP, link-local IPv4 multicast (224.0.0.0/24, join-only, UDP only), deadlines, close, bounded memory | loss recovery without OOO buffering/SACK; one IPv4 identity, one total budget and optional per-connection cap | IPv6/NDP, IGMP, fragmentation, congestion control, timestamps, Nagle, SYN cookies, data-path logging |
 
 The table is a summary; the boundaries below are normative.
 
@@ -274,9 +274,30 @@ on small nodes should pass a positive `max`.
 
 ### KEEP
 
-`leannet` provides Ethernet, ARP, IPv4, ICMP echo, UDP, and TCP for one IPv4
-identity, together with `net.Conn`, `net.Listener`, `net.PacketConn`, and the
-Tamago socket seam.
+`leannet` provides Ethernet, ARP, IPv4, ICMP echo, UDP, TCP, and link-local
+IPv4 multicast for one IPv4 identity, together with `net.Conn`,
+`net.Listener`, `net.PacketConn`, and the Tamago socket seam.
+
+Multicast MUST:
+
+- accept joins for 224.0.0.0/24 only (RFC 5771 link-local — the block routers
+  never forward), idempotent, capped (`maxGroups`), for the stack's lifetime
+  (no Leave: the only consumer never leaves), released on `Close`;
+- deliver a joined group's UDP datagrams and ignore other multicast silently
+  — normal LAN noise, not a drop statistic;
+- map groups per RFC 1112 §6.4 (01:00:5e plus the low 23 bits), never ARP and
+  never route via the gateway — the scope is this link;
+- send with TTL 255 (safe precisely because the block is unroutable; RFC 6762
+  §11) and loop a joined sender's own datagrams back to its local listeners,
+  while still transmitting them to the wire;
+- refuse what multicast can never be: TCP dials to 224.0.0.0/4, UDP sends to
+  multicast outside the link-local block (routable scope, RFC 2365), and any
+  packet whose SOURCE is multicast (silently, RFC 1112 §7.2);
+- carry UDP only: no ICMP echo replies to multicast (RFC 1122 §3.2.2.6).
+  IGMP is omitted: home switches flood link-local multicast, and a snooping
+  switch that requires membership reports is out of scope. The device below
+  must already pass multicast frames; NIC filters are not this stack's
+  concern.
 
 The transport core MUST:
 
