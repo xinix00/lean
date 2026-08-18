@@ -1336,31 +1336,60 @@ func TestStackIdleVerbindingGeeftBuffersTerug(t *testing.T) {
 		t.Fatal("data kwam beschadigd aan")
 	}
 
+	// Sinds de RX-groei op volle segmenten (tcp.go) draagt een gegroeide
+	// ontvanger een venster-BELOFTE die de pot pint zolang de verbinding
+	// idle openstaat — de belofte mag niet naar links (RFC 9293, zie
+	// shrinkRing). "Snel heeft altijd een eind": de verbinding die groeide
+	// hoort te SLUITEN (de leanhttp-pool sluit gegroeide verbindingen,
+	// client.go put; trage stromen groeien nooit en poolen gewoon). De
+	// invariant is dus: bij close komt álles per direct terug in de pot.
+	if err := client.Close(); err != nil {
+		t.Fatalf("client close: %v", err)
+	}
+	if err := srv.Close(); err != nil {
+		t.Fatalf("server close: %v", err)
+	}
 	const slack = tcpFloorRing
 	deadline := time.Now().Add(5 * time.Second)
 	for {
 		freeA, freeB := a.pot.free(), b.pot.free()
-		if freeA >= budget-tcpFloorRing-slack && freeB >= budget-tcpFloorRing-slack {
+		if freeA >= budget-slack && freeB >= budget-slack {
 			break
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("pot niet teruggestort: zender %d van %d vrij, ontvanger %d van %d "+
-				"— een verbinding die klaar is houdt zijn gegroeide buffers vast",
+			t.Fatalf("pot niet teruggestort ná close: zender %d van %d vrij, ontvanger %d van %d "+
+				"— een gesloten verbinding houdt zijn gegroeide buffers vast",
 				freeA, budget, freeB, budget)
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
 
-	if _, err := srv.Write([]byte("terug")); err != nil {
-		t.Fatalf("schrijven na krimp: %v", err)
+	// Een nieuwe verbinding over dezelfde stack bewijst dat de pot na de
+	// teruggave gewoon bruikbaar is (de oude na-krimp-echo kan niet meer:
+	// de gegroeide verbinding is per het model hierboven gesloten).
+	go func() {
+		c, err := listener.Accept()
+		if err == nil {
+			server <- c
+		}
+	}()
+	second, err := a.DialTCP([4]byte{10, 0, 0, 2}, 90, time.Now().Add(5*time.Second))
+	if err != nil {
+		t.Fatalf("verse verbinding na teruggave: %v", err)
 	}
-	client.SetReadDeadline(time.Now().Add(5 * time.Second))
+	defer second.Close()
+	srv2 := <-server
+	defer srv2.Close()
+	if _, err := second.Write([]byte("terug")); err != nil {
+		t.Fatalf("schrijven na teruggave: %v", err)
+	}
 	echo := make([]byte, 5)
-	if _, err := io.ReadFull(client, echo); err != nil {
-		t.Fatalf("lezen na krimp: %v", err)
+	srv2.SetReadDeadline(time.Now().Add(5 * time.Second))
+	if _, err := io.ReadFull(srv2, echo); err != nil {
+		t.Fatalf("lezen na teruggave: %v", err)
 	}
 	if string(echo) != "terug" {
-		t.Fatalf("na krimp kwam %q terug", echo)
+		t.Fatalf("na teruggave kwam %q terug", echo)
 	}
 }
 

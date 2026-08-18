@@ -451,6 +451,22 @@ func (t *tcpSock) Close() error {
 func (t *tcpSock) LocalAddr() net.Addr  { return tcpAddr(t.s.cfg.IP, t.c.key.lport) }
 func (t *tcpSock) RemoteAddr() net.Addr { return tcpAddr(t.c.key.rip, t.c.key.rport) }
 
+// Grown reports whether this connection's rings outgrew their floors. That is
+// the connection classifying itself: only bulk transfers grow (a full segment
+// is the growth signal, tcp.go); chatty long-lived streams (SSE, attach
+// sessions) stay at the floor forever. A grown receive ring carries an
+// advertised-window promise that pins budget for as long as the connection
+// idles open (shrinkRing: the promise cannot shrink left, RFC 9293). So "fast
+// always has an end": a pool should CLOSE a grown connection instead of
+// keeping it idle — the promise dies with the close and the budget returns at
+// once. leanhttp's pool does exactly that (client.go put).
+func (t *tcpSock) Grown() bool {
+	s := t.s
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return t.c.tcp.rx.size() > tcpFloorRx || t.c.tcp.tx.size() > tcpFloorTx
+}
+
 // Wake deadline waiters only when a new deadline is earlier or replaces zero.
 // Extending one is observed when the old timer fires, avoiding broadcast storms.
 func deadlineNeedsWake(old, new time.Time) bool {

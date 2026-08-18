@@ -155,6 +155,16 @@ func (cl *Client) put(addr string, c net.Conn, br *bufio.Reader) bool {
 	if pc, ok := c.(*pooledConn); ok {
 		c = pc.Conn
 	}
+	// "Fast always has an end": a connection whose rings grew was a bulk
+	// transfer, and its advertised window pins budget for as long as it idles
+	// open (leannet: the promise cannot shrink left). Close it instead of
+	// pooling — the promise dies with the close and the budget returns at
+	// once. Slow streams (SSE, chat) never grow and pool as always. The cost
+	// is one fresh handshake per bulk reuse — exactly the rare, already
+	// expensive case.
+	if g, ok := c.(interface{ Grown() bool }); ok && g.Grown() {
+		return false
+	}
 	max := cl.MaxIdlePerHost
 	if max == 0 {
 		max = defaultMaxIdlePerHost

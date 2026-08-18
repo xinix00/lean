@@ -107,6 +107,10 @@ type Conn struct {
 	conn net.Conn
 	cfg  Config
 
+	// Grown (method below) passes the transport's bulk-classification through
+	// the TLS layer so a pool can apply its close-grown-connections rule to
+	// TLS connections too.
+
 	// One lock per direction preserves net.Conn concurrency without reusing an
 	// AES-GCM sequence number/nonce. Read also processes post-handshake messages
 	// and may acquire wmu while holding rmu.
@@ -368,6 +372,17 @@ func keyUpdateMsg() []byte {
 }
 
 func (c *Conn) LocalAddr() net.Addr                { return c.conn.LocalAddr() }
+
+// Grown geeft de bulk-classificatie van het onderliggende transport door
+// (zie leannet tcpSock.Grown): zo geldt de pool-regel "gegroeid = sluiten,
+// niet poolen" ook voor TLS-verbindingen. Een transport zonder het begrip
+// is per definitie niet gegroeid.
+func (c *Conn) Grown() bool {
+	if g, ok := c.conn.(interface{ Grown() bool }); ok {
+		return g.Grown()
+	}
+	return false
+}
 func (c *Conn) RemoteAddr() net.Addr               { return c.conn.RemoteAddr() }
 func (c *Conn) SetDeadline(t time.Time) error      { return c.conn.SetDeadline(t) }
 func (c *Conn) SetReadDeadline(t time.Time) error  { return c.conn.SetReadDeadline(t) }

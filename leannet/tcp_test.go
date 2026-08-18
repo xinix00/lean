@@ -474,6 +474,103 @@ func TestTCPRxGrowsUnderPressure(t *testing.T) {
 	}
 }
 
+// TestTCPRxGrowsOnFullSegments is de ijzer-conditie van 18-08 (LicheeRV): een
+// SNELLE lezer draint de ring tussen de segmenten door, dus vrij==0 komt op
+// aankomstmoment nooit voor — en een MSS-gekwantiseerde zender vult een
+// 16KiB-venster sowieso nooit exact (11×1460 = 16060). Een vol-alleen-trigger
+// hield elke bulk-transfer daardoor voorgoed op de vloer: image-streams op
+// ~170KB/s terwijl de budget-pot leeg stond te wachten. Het groei-signaal is
+// het VOLLE segment (len == advMSS): dat zegt "de zender is venster-beperkt".
+// Chat-verkeer stuurt nooit volle segmenten en blijft op de vloer.
+func TestTCPRxGrowsOnFullSegments(t *testing.T) {
+	w := newTCPPair(t, 32<<10, 4096)
+	pot := &budget{total: 64 << 10}
+	w.b.pot, w.b.maxBuf = pot, 16<<10
+	w.connect()
+
+	payload := make([]byte, 12<<10)
+	for i := range payload {
+		payload[i] = byte(i * 31)
+	}
+	var got []byte
+	written := 0
+	for round := 0; round < 200 && len(got) < len(payload); round++ {
+		if written < len(payload) {
+			n, _ := w.a.write(payload[written:])
+			written += n
+		}
+		// Per segment bezorgen en meteen lezen: de snelle lezer. De ring van b
+		// is zo nooit vol op aankomstmoment — precies de conditie waarin een
+		// vol-alleen-trigger nooit vuurt.
+		for _, seg := range w.drain(w.a) {
+			w.b.recv(seg, w.now)
+			got = append(got, readAll(w.b)...)
+		}
+		for _, seg := range w.drain(w.b) {
+			w.a.recv(seg, w.now)
+		}
+	}
+	if !bytes.Equal(got, payload) {
+		t.Fatalf("transfer incomplete: %d/%d", len(got), len(payload))
+	}
+	if w.b.rx.size() <= 4096 {
+		t.Fatalf("rx ring never grew for a window-limited sender with a fast reader: %d", w.b.rx.size())
+	}
+	if w.b.rx.size() > 16<<10 {
+		t.Fatalf("rx ring exceeded maxBuf: %d", w.b.rx.size())
+	}
+
+	// Chat-verkeer: kleine segmenten, nooit vol — geen reden om te groeien.
+	w2 := newTCPPair(t, 32<<10, 4096)
+	w2.b.pot, w2.b.maxBuf = &budget{total: 64 << 10}, 16<<10
+	w2.connect()
+	for round := 0; round < 40; round++ {
+		w2.a.write([]byte("ping"))
+		for _, seg := range w2.drain(w2.a) {
+			w2.b.recv(seg, w2.now)
+			readAll(w2.b)
+		}
+		for _, seg := range w2.drain(w2.b) {
+			w2.a.recv(seg, w2.now)
+		}
+	}
+	if w2.b.rx.size() != 4096 {
+		t.Fatalf("rx ring grew on small segments: %d", w2.b.rx.size())
+	}
+}
+
+// TestTCPWindowUpdateForBlockedSender: een snelle lezer houdt de ring leeg,
+// dus de klassieke bijna-vol-conditie vuurt nooit — maar de ZENDER heeft zijn
+// geadverteerde belofte opgemaakt en wacht. De read hoort dan een window-
+// update te queuen die de emit-lus ook zónder inkomend verkeer verstuurt;
+// anders loopt elke bulk-transfer op de persist-probe-klok van de peer
+// (gemeten 18-08 op de LicheeRV: mediaan 165ms per venster-ronde, 100% van de
+// transfertijd was wachten).
+func TestTCPWindowUpdateForBlockedSender(t *testing.T) {
+	w := newTCPPair(t, 32<<10, 4096)
+	w.connect()
+
+	// De zender mag precies het geadverteerde venster (~4096) kwijt; daarna
+	// blokkeert hij op zijn opgemaakte belofte.
+	payload := make([]byte, 8<<10)
+	w.a.write(payload)
+	for _, seg := range w.drain(w.a) {
+		w.b.recv(seg, w.now)
+		readAll(w.b) // de snelle lezer: ring leeg vóór het volgende segment
+	}
+
+	// Zonder nieuw inkomend verkeer moet b nu uit zichzelf een window-update
+	// emitten die de zender weer ruimte geeft.
+	segs := w.drain(w.b)
+	if len(segs) == 0 {
+		t.Fatal("geen window-update voor een geblokkeerde zender — de transfer zou op de persist-probe van de peer lopen")
+	}
+	last := segs[len(segs)-1]
+	if int(last.wnd)<<w.b.rcvWS < int(w.b.peerMSS) {
+		t.Fatalf("update adverteert geen bruikbaar venster: %d", int(last.wnd)<<w.b.rcvWS)
+	}
+}
+
 func TestTCPTxGrowsWhenPeerOffersWindow(t *testing.T) {
 	w := newTCPPair(t, 512, 16384)
 	pot := &budget{total: 16384}

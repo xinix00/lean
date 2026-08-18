@@ -364,6 +364,20 @@ func (c *tcpConn) read(p []byte) (int, error) {
 	if wasFree < thresh && c.rx.free() >= thresh {
 		c.needAck = true
 	}
+	// Het venster van de PEER is wat wij hem het laatst beloofden
+	// (advEdge − rcvNxt), niet onze lokale vrije ruimte. Een snelle lezer
+	// houdt de ring leeg — wasFree blijft dan hoog en de conditie hierboven
+	// vuurt nooit — terwijl de zender zijn belofte allang heeft opgemaakt en
+	// geblokkeerd wacht. Zonder deze check kwam de window-update dan pas mee
+	// op de persist-probe van de peer: gemeten 18-08 (LicheeRV, zender-
+	// zijdig): 194 stalls die sámen 43,047 van de 43,049s besloegen, mediaan
+	// 165ms per venster-ronde — élke stream liep op de probe-klok van de Mac.
+	if c.advSet {
+		if out := seqDiff(c.advEdge, c.rcvNxt); out >= 0 && out < thresh &&
+			c.rx.free()-out >= thresh {
+			c.needAck = true
+		}
+	}
 	// The application caught up; release surplus empty capacity.
 	c.shrinkRx()
 	return n, nil
@@ -782,9 +796,19 @@ func (c *tcpConn) processData(seg tcpSeg, now int64) {
 		n := c.rx.write(seg.data)
 		c.rcvNxt += uint32(n)
 		c.needAck = true
-		if c.rx.free() == 0 && c.advSet {
-			// Filling the promised window signals receive growth, but only after
-			// the first regular advertised edge anchors that promise.
+		// Receive growth, anchored to the first regular advertised edge. Two
+		// signals, either one grows the ring:
+		//   - the promised window filled (free == 0): the pressure case — a
+		//     slow reader against a fast sender;
+		//   - a FULL segment arrived (len == advMSS): the sender is window-
+		//     limited while the reader keeps up. A fast reader drains between
+		//     poll batches, so the ring never fills and a full-only trigger
+		//     kept every bulk transfer at the 16KiB floor forever — measured
+		//     18-08 on the LicheeRV: image streams at ~170KB/s (one floor
+		//     window per ~90ms) while the budget pot sat idle. Chatty
+		//     connections never send full segments and stay at the floor;
+		//     shrinkRx returns grown rings there after the final read.
+		if c.advSet && (c.rx.free() == 0 || len(seg.data) >= int(c.advMSS)) {
 			if c.growRing(&c.rx) && n < dataLen {
 				m := c.rx.write(seg.data[n:])
 				c.rcvNxt += uint32(m)
