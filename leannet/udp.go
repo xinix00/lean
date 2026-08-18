@@ -23,9 +23,14 @@ var (
 // and allocation rounding. Wire overhead would undercount memory use.
 const udpDGramOverhead = 48
 
-// udpDatagram stores one received datagram and its sender.
+// udpDatagram stores one received datagram and its sender. The source is wide
+// enough for both families: IPv4 lives in the first four bytes with is6 false.
+// One shape instead of two queue types keeps deliver, recvFrom, and the budget
+// accounting single-sourced; the four spare bytes per queued datagram are noise
+// next to udpDGramOverhead.
 type udpDatagram struct {
-	src     [4]byte
+	src     [16]byte
+	is6     bool
 	srcPort uint16
 	payload []byte // private copy; the RX frame is reused
 }
@@ -66,8 +71,21 @@ func (t *udpTable) bound(port uint16) bool {
 	return taken
 }
 
-// deliver queues an incoming datagram. False means no bound port or a full queue.
+// deliver queues an incoming IPv4 datagram. False means no bound port or a
+// full queue.
 func (t *udpTable) deliver(dstPort uint16, src [4]byte, srcPort uint16, payload []byte) bool {
+	var wide [16]byte
+	copy(wide[:4], src[:])
+	return t.deliverWide(dstPort, wide, false, srcPort, payload)
+}
+
+// deliver6 is deliver for IPv6 sources; the tables are per family, so a v6
+// stack owns its own instance and family mixups cannot happen here.
+func (t *udpTable) deliver6(dstPort uint16, src [16]byte, srcPort uint16, payload []byte) bool {
+	return t.deliverWide(dstPort, src, true, srcPort, payload)
+}
+
+func (t *udpTable) deliverWide(dstPort uint16, src [16]byte, is6 bool, srcPort uint16, payload []byte) bool {
 	u, bound := t.ports[dstPort]
 	if !bound {
 		t.cntNoPort++
@@ -87,6 +105,7 @@ func (t *udpTable) deliver(dstPort uint16, src [4]byte, srcPort uint16, payload 
 	u.used += cost
 	u.q = append(u.q, udpDatagram{
 		src:     src,
+		is6:     is6,
 		srcPort: srcPort,
 		payload: append([]byte(nil), payload...),
 	})
@@ -101,8 +120,9 @@ type udpPort struct {
 	cap   int // queue capacity reserved from the budget
 
 	// DialUDP configures this connected filter while holding the stack lock.
+	// peer is family-wide like udpDatagram.src: IPv4 in the first four bytes.
 	connected bool
-	peer      [4]byte
+	peer      [16]byte
 	peerPort  uint16
 	used      int // occupied bytes, including overhead
 	q         []udpDatagram
@@ -113,9 +133,9 @@ type udpPort struct {
 
 // recvFrom pops the oldest datagram without blocking. If p is too small, UDP
 // semantics discard the remainder while preserving the record boundary.
-func (u *udpPort) recvFrom(p []byte) (n int, src [4]byte, srcPort uint16, ok bool) {
+func (u *udpPort) recvFrom(p []byte) (n int, src [16]byte, is6 bool, srcPort uint16, ok bool) {
 	if len(u.q) == 0 {
-		return 0, src, 0, false
+		return 0, src, false, 0, false
 	}
 	d := u.q[0]
 	u.q[0] = udpDatagram{} // clear the payload reference for GC
@@ -125,7 +145,7 @@ func (u *udpPort) recvFrom(p []byte) (n int, src [4]byte, srcPort uint16, ok boo
 	}
 	u.used -= udpDGramOverhead + len(d.payload)
 	n = copy(p, d.payload)
-	return n, d.src, d.srcPort, true
+	return n, d.src, d.is6, d.srcPort, true
 }
 
 // close releases the port and returns its entire queue reservation. It is idempotent.

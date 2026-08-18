@@ -112,6 +112,11 @@ type Stack struct {
 	// lazily allocated — most stacks never join anything.
 	groups map[[4]byte]struct{}
 
+	// The opt-in IPv6 lane (ipv6.go): nil until the first v6 socket or group
+	// join, so a v4-only stack pays one nil check at the demux.
+	v6   *v6State
+	out6 []outPkt6
+
 	gwMAC    [6]byte // statically planned gateway
 	hasGwMAC bool
 
@@ -140,6 +145,9 @@ type Stats struct {
 
 	// ARP contains a complete copy of the ARP machine counters.
 	ARP ARPStats
+
+	// NDP mirrors ARP for the v6 lane; all-zero when the lane never existed.
+	NDP NDPStats
 }
 
 // ARPStats contains ARP machine counters.
@@ -158,6 +166,9 @@ func (s *Stack) Stats() Stats {
 	defer s.mu.Unlock()
 	st := s.stats
 	st.ARP = s.arp.cnt
+	if s.v6 != nil {
+		st.NDP = s.v6.ndp.cnt
+	}
 	return st
 }
 
@@ -227,6 +238,12 @@ func (s *Stack) Close() {
 	for _, u := range s.udp.ports {
 		// Deletion during map iteration is defined and close is idempotent.
 		u.close()
+	}
+	if s.v6 != nil {
+		for _, u := range s.v6.udp.ports {
+			u.close()
+		}
+		s.v6.groups = nil
 	}
 	s.notify()
 }
@@ -359,6 +376,20 @@ func (s *Stack) ingressLocked(eth EthFrame, now int64) {
 		// Passive learning happens after transport checksum validation so a
 		// forged IP header alone cannot claim a cache entry.
 		s.recvIPv4(ip, [6]byte(eth.Src()), now)
+	case EtherTypeIPv6:
+		// The lane is opt-in: without it, v6 frames are ordinary LAN noise
+		// and leave silently, uncounted, like unjoined multicast above.
+		if s.v6 == nil {
+			return
+		}
+		ip, err := ParseIPv6(eth.Payload())
+		if err != nil {
+			return // extension headers and truncations are noise, not faults
+		}
+		if !s.v6.acceptDst6(ip.Dst()) {
+			return
+		}
+		s.recvIPv6(ip, [6]byte(eth.Src()), now)
 	}
 }
 
@@ -637,6 +668,9 @@ func (s *Stack) drainLocked() (again bool) {
 		s.notify()
 	}
 
+	// The v6 lane's replies and NDP emission; a nil lane returns immediately.
+	s.drain6Locked(now)
+
 	// Drain each TCP connection when its route is available. emit is lazy, so a
 	// missing MAC consumes no sequence state while ARP resolution runs.
 	for key, c := range s.conns {
@@ -708,6 +742,9 @@ func (s *Stack) nextDeadlineLocked() int64 {
 			// No wakeup: every lookup expires lazily and capacity paths sweep.
 			// Memory is already capped, so periodic cleanup would only cost idle CPU.
 		}
+	}
+	if s.v6 != nil {
+		s.v6.ndp.nextDeadline(add)
 	}
 	return d
 }
@@ -820,6 +857,19 @@ func (s *Stack) sendEthLocked(dst [6]byte, etherType uint16, payloadLen int) err
 				s.notify()
 			} else {
 				s.stats.DropReplyFull++
+			}
+		}
+	}
+	// The same IP_MULTICAST_LOOP semantics for the v6 lane's joined groups.
+	if isMulticastMAC6(dst) && etherType == EtherTypeIPv6 && s.v6 != nil {
+		if ip, err := ParseIPv6(s.txBuf[EthernetHeaderSize:n]); err == nil {
+			if _, joined := s.v6.groups[ip.Dst()]; joined {
+				if len(s.loopback) < loopbackMax {
+					s.loopback = append(s.loopback, append(s.lbBuf(), s.txBuf[:n]...))
+					s.notify()
+				} else {
+					s.stats.DropReplyFull++
+				}
 			}
 		}
 	}

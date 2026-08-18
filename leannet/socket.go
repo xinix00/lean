@@ -18,10 +18,13 @@ import (
 	"time"
 )
 
-// Socket family and type values match syscall on supported targets.
+// Socket family and type values match TamaGo's syscall package, the one
+// consumer of this boundary. TamaGo numbers them with iota (UNSPEC, UNIX,
+// INET, INET6), so AF_INET happens to match Linux's 2 while AF_INET6 is 3 —
+// NOT Linux's 10; that mismatch cost a QEMU boot to find (18-08).
 const (
 	afINET     = 2
-	afINET6    = 10
+	afINET6    = 3
 	sockSTREAM = 1
 	sockDGRAM  = 2
 )
@@ -506,9 +509,11 @@ type udpSock struct {
 	s     *Stack
 	port  *udpPort
 	lport uint16
+	v6    bool // bound on the v6 lane (ipv6.go); families never mix on one socket
 
+	// raddr is family-wide like udpDatagram.src: IPv4 in the first four bytes.
 	connected bool
-	raddr     [4]byte
+	raddr     [16]byte
 	rport     uint16
 
 	rdDeadline time.Time
@@ -542,9 +547,11 @@ func (s *Stack) DialUDP(raddr [4]byte, rport uint16) (*udpSock, error) {
 	if err != nil {
 		return nil, err
 	}
-	u.connected, u.raddr, u.rport = true, raddr, rport
+	var wide [16]byte
+	copy(wide[:4], raddr[:])
+	u.connected, u.raddr, u.rport = true, wide, rport
 	u.s.mu.Lock()
-	u.port.connected, u.port.peer, u.port.peerPort = true, raddr, rport
+	u.port.connected, u.port.peer, u.port.peerPort = true, wide, rport
 	u.s.mu.Unlock()
 	return u, nil
 }
@@ -564,14 +571,18 @@ func (u *udpSock) ReadFrom(p []byte) (int, net.Addr, error) {
 					// Both socket and stack close release the queue; no datagram can follow.
 					return false, net.ErrClosed
 				}
-				n, src, sport, ok := u.port.recvFrom(p)
+				n, src, is6, sport, ok := u.port.recvFrom(p)
 				if !ok {
 					return false, nil // wait for a datagram
 				}
 				if u.connected && (src != u.raddr || sport != u.rport) {
 					continue // connected sockets ignore other senders
 				}
-				total, from = n, udpAddr(src, sport)
+				if is6 {
+					total, from = n, &net.UDPAddr{IP: append(net.IP(nil), src[:]...), Port: int(sport)}
+				} else {
+					total, from = n, udpAddr([4]byte(src[:4]), sport)
+				}
 				return true, nil
 			}
 		})
@@ -586,7 +597,15 @@ func (u *udpSock) WriteTo(p []byte, addr net.Addr) (int, error) {
 	ua, isUDP := addr.(*net.UDPAddr)
 	if !isUDP || ua == nil || ua.Port <= 0 || ua.Port > 65535 {
 		// Require *net.UDPAddr explicitly; generic extraction also accepts TCP addresses.
-		return 0, errors.New("leannet: WriteTo needs an IPv4 *net.UDPAddr with a valid port")
+		return 0, errors.New("leannet: WriteTo needs a *net.UDPAddr with a valid port")
+	}
+	if u.v6 {
+		// The families never mix on one socket: a v6 socket writes v6 only,
+		// exactly like a kernel socket bound with IPV6_V6ONLY.
+		if ua.IP.To4() != nil || len(ua.IP.To16()) != 16 {
+			return 0, errors.New("leannet: WriteTo on a v6 socket needs an IPv6 *net.UDPAddr")
+		}
+		return u.writeUDP6(p, [16]byte(ua.IP.To16()), uint16(ua.Port))
 	}
 	dst, dport, ok := addrPort(addr)
 	if !ok {
@@ -655,7 +674,10 @@ func (u *udpSock) Write(p []byte) (int, error) {
 	if !u.connected {
 		return 0, errors.New("leannet: Write on unconnected udp socket")
 	}
-	return u.writeUDP(p, u.raddr, u.rport)
+	if u.v6 {
+		return u.writeUDP6(p, u.raddr, u.rport)
+	}
+	return u.writeUDP(p, [4]byte(u.raddr[:4]), u.rport)
 }
 
 func (u *udpSock) Close() error {
@@ -667,12 +689,21 @@ func (u *udpSock) Close() error {
 	return nil
 }
 
-func (u *udpSock) LocalAddr() net.Addr { return udpAddr(u.s.cfg.IP, u.lport) }
+func (u *udpSock) LocalAddr() net.Addr {
+	if u.v6 {
+		ll := llAddrFromMAC(u.s.cfg.MAC)
+		return &net.UDPAddr{IP: append(net.IP(nil), ll[:]...), Port: int(u.lport)}
+	}
+	return udpAddr(u.s.cfg.IP, u.lport)
+}
 func (u *udpSock) RemoteAddr() net.Addr {
 	if !u.connected {
 		return nil
 	}
-	return udpAddr(u.raddr, u.rport)
+	if u.v6 {
+		return &net.UDPAddr{IP: append(net.IP(nil), u.raddr[:]...), Port: int(u.rport)}
+	}
+	return udpAddr([4]byte(u.raddr[:4]), u.rport)
 }
 
 // UDP uses the same deadline wake rule as TCP; see storeDeadline.
@@ -693,7 +724,10 @@ func (u *udpSock) SetWriteDeadline(t time.Time) error {
 // dials return (nil, err), never a substitute value.
 func (s *Stack) Socket(ctx context.Context, network string, family, sotype int, laddr, raddr net.Addr) (interface{}, error) {
 	if family == afINET6 {
-		return nil, errors.ErrUnsupported
+		// The v6 lane (ipv6.go) is UDP-only and opt-in by use: the app that
+		// opens a udp6 socket (Matter) is the switch. TCP over v6 stays
+		// unsupported — nothing on a HopOS node needs it.
+		return s.socket6(ctx, network, sotype, laddr, raddr)
 	}
 	if family != afINET {
 		return nil, errors.New("leannet: unsupported address family")
@@ -742,4 +776,79 @@ func (s *Stack) Socket(ctx context.Context, network string, family, sotype int, 
 		return s.ListenUDP(lport)
 	}
 	return nil, errors.New("leannet: unsupported network " + network)
+}
+
+// socket6 is the AF_INET6 half of the SocketFunc boundary: UDP only.
+func (s *Stack) socket6(ctx context.Context, network string, sotype int, laddr, raddr net.Addr) (interface{}, error) {
+	_ = ctx
+	switch network {
+	case "udp", "udp6":
+	case "tcp", "tcp6":
+		return nil, errors.ErrUnsupported
+	default:
+		return nil, errors.New("leannet: unsupported network " + network)
+	}
+	if sotype != sockDGRAM {
+		return nil, errors.New("leannet: udp requires SOCK_DGRAM")
+	}
+	lip, lport, okL := addrPort6(laddr)
+	if laddr != nil && !okL {
+		return nil, errors.New("leannet: unsupported local address")
+	}
+	if !isZero6(lip) {
+		// The lane owns two addresses at most (link-local and one SLAAC);
+		// wildcard binds cover both, and anything else is a caller bug.
+		s.mu.Lock()
+		v6 := s.enableV6Locked()
+		ours := v6.ourAddr6(lip)
+		s.mu.Unlock()
+		if !ours {
+			return nil, errors.New("leannet: local address is not this stack's address")
+		}
+	}
+	rip, rport, okR := addrPort6(raddr)
+	if raddr != nil && (!okR || rport == 0) {
+		return nil, errors.New("leannet: unsupported remote address")
+	}
+	if raddr != nil {
+		if lport != 0 {
+			return nil, errors.New("leannet: dialing from a fixed local port is not supported")
+		}
+		return s.DialUDP6(rip, rport)
+	}
+	return s.ListenUDP6(lport)
+}
+
+// addrPort6 extracts a v6 address and port; a v4 or v4-mapped address is not ok.
+func addrPort6(a net.Addr) (ip [16]byte, port uint16, ok bool) {
+	var nip net.IP
+	var p int
+	switch t := a.(type) {
+	case *net.UDPAddr:
+		if t == nil {
+			return ip, 0, false
+		}
+		nip, p = t.IP, t.Port
+	case *net.TCPAddr:
+		if t == nil {
+			return ip, 0, false
+		}
+		nip, p = t.IP, t.Port
+	default:
+		return ip, 0, false
+	}
+	if p < 0 || p > 65535 {
+		return ip, 0, false
+	}
+	if len(nip) == 0 {
+		return ip, uint16(p), true // wildcard (::)
+	}
+	if nip.To4() != nil {
+		return ip, 0, false
+	}
+	b := nip.To16()
+	if b == nil {
+		return ip, 0, false
+	}
+	return [16]byte(b), uint16(p), true
 }

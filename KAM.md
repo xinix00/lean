@@ -1,9 +1,9 @@
-# KAM — the frozen HTTP/TCP profile
+# KAM — the frozen HTTP/IP profile
 
 This document fixes the scope of `leanhttp`, `leanhttps`, `leans3`, and
-`leannet`. It is not a list of everything HTTP and TCP can do. It defines what
-this repository **promises to do correctly**, deliberately narrows, and loudly
-rejects.
+`leannet`. It is not a list of everything HTTP and the underlying IP transports
+can do. It defines what this repository **promises to do correctly**,
+deliberately narrows, and loudly rejects.
 
 KAM has three outcomes:
 
@@ -33,7 +33,8 @@ The stack supports this concrete chain:
 - an HTTP client for API calls and artifact downloads, optionally through
   `leanhttps`, with sequential keep-alive per connection;
 - a SigV4 S3 client for the object operations Hop and HopOS actually use;
-- an IPv4/TCP/UDP stack for bare-metal nodes with one bounded buffer pool.
+- an IPv4/TCP/UDP stack plus an opt-in, UDP-only IPv6 lane for bare-metal
+  nodes, with one bounded buffer pool.
 
 “Multiple things over one channel” means **sequential requests and responses
 over a keep-alive connection**. Speculative HTTP pipelining and multiplexing are
@@ -47,7 +48,7 @@ not contractual.
 | Mux | method+path, exact/subtree, `{segment}`, `{rest...}`, `GET`→`HEAD`, `404`/`405`+`Allow` | canonical paths or rejection; immutable after start | host routing, `{$}`, escaped/dot routing, slash normalization, net/http compatibility work |
 | HTTP client | outbound HTTP/1.1, inbound 1.0/1.1, GET/HEAD redirects, response framing, deadlines, keep-alive pool | fixed-length streaming upload with a strict Expect decision; compression pass-through | request chunking, automatic decompression, CONNECT/upgrade, general retry state machine |
 | TLS/S3 | explicit trust model, SNI per connection, SigV4 and used object operations | TLS as a dialer composition; signed S3 calls never follow redirects | TLS server, silent skip-verify, multipart, streaming SigV4, SigV4a, presigned URLs, IMDS/IAM |
-| leannet | Ethernet, ARP, IPv4, ICMP echo, UDP, TCP, link-local IPv4 multicast (224.0.0.0/24, join-only, UDP only), deadlines, close, bounded memory | loss recovery without OOO buffering/SACK; one IPv4 identity, one total budget and optional per-connection cap | IPv6/NDP, IGMP, fragmentation, congestion control, timestamps, Nagle, SYN cookies, data-path logging |
+| leannet | Ethernet; IPv4 ARP/ICMP/UDP/TCP and link-local multicast; opt-in IPv6 UDP, ICMPv6/NDP, link-scoped multicast, one SLAAC identity, and PIO/RIO routing; deadlines, close, bounded memory | one IPv4 identity; one derived link-local plus one SLAAC IPv6 identity; bounded simplified NDP and route state; fixed 1280-byte IPv6 packet ceiling | TCPv6, DHCPv6, extension headers, fragmentation, PMTUD, MLD/IGMP, wider multicast, dual-family sockets, full NUD and renumbering, congestion control, timestamps, Nagle, SYN cookies, data-path logging |
 
 The table is a summary; the boundaries below are normative.
 
@@ -274,9 +275,10 @@ on small nodes should pass a positive `max`.
 
 ### KEEP
 
-`leannet` provides Ethernet, ARP, IPv4, ICMP echo, UDP, TCP, and link-local
-IPv4 multicast for one IPv4 identity, together with `net.Conn`,
-`net.Listener`, `net.PacketConn`, and the Tamago socket seam.
+`leannet` provides Ethernet; IPv4 ARP, ICMP echo, UDP, TCP, and link-local
+multicast for one IPv4 identity; plus an opt-in IPv6 UDP/ICMPv6 lane. It
+implements `net.Conn`, `net.Listener`, `net.PacketConn`, and the Tamago socket
+seam only for the combinations named below.
 
 Multicast MUST:
 
@@ -299,9 +301,45 @@ Multicast MUST:
   must already pass multicast frames; NIC filters are not this stack's
   concern.
 
+The IPv6 lane exists for one concrete path: Matter discovery and UDP traffic
+to a device ULA behind a Thread border router. It remains absent until the
+first IPv6 UDP socket or `JoinGroup6`; a v4-only stack pays no IPv6 state or
+timers.
+
+The IPv6 lane MUST:
+
+- provide UDP through `AF_INET6`, `ListenUDP6`, and `DialUDP6`; sockets are
+  wildcard-bound and v6-only, so a non-wildcard local address and an
+  IPv4-mapped address fail loudly, while TCPv6 remains unsupported;
+- own one EUI-64 link-local address and at most the first SLAAC address from an
+  autonomous `/64`; use a link-local source only for link-local unicast and
+  `ff02::/16`, and require the SLAAC source for every routed packet;
+- implement only the ICMPv6 control needed by this path: bounded RS/RA and
+  NS/NA plus unicast echo; validate checksum, hop limit, code, addresses,
+  targets, and options completely before rejected input can mutate state;
+- retain bounded on-link PIO prefixes and bounded RIO routes, prefer the
+  longest RIO match, replace the next hop for a repeated prefix, remove an
+  explicitly withdrawn PIO or RIO, and use one advertised default router only
+  as a last resort;
+- accept explicit joins only for `ff02::/16`, with capped, stack-lifetime
+  membership and local-loop behavior; all-nodes and the stack's
+  solicited-node groups are implicit;
+- require a nonzero UDP checksum and emit no IPv6 packet larger than the
+  IPv6-minimum MTU of 1280 bytes; without fragmentation or PMTUD, an emitted
+  UDPv6 payload is therefore at most 1232 bytes;
+- reject unspecified, loopback, multicast-source, and IPv4-mapped traffic at
+  the applicable public or ingress boundary; the stack's own link-local or
+  SLAAC address is the only supported local loopback destination;
+- fail immediately when no usable source or route exists, fail after bounded
+  NDP resolution when a neighbor is unreachable, and wake blocked operations
+  on resolution, failure, deadline, or close;
+- accept only unicast frames addressed to this interface's MAC and multicast
+  frames addressed to the exact `33:33` mapping of an implicit or joined IPv6
+  group.
+
 The transport core MUST:
 
-- keep all connection buffers within `Config.Budget`;
+- keep all TCP rings and UDP queue reservations within `Config.Budget`;
 - start each TCP connection with 16 KiB RX and 4 KiB TX, grow under measured
   pressure, shrink unused excess while idle, and return remaining budget on
   close or reap;
@@ -311,7 +349,7 @@ The transport core MUST:
 - return reset as an error, not EOF;
 - drive blocked I/O through wakeups and deadlines and unblock it on `Close`;
 - use monotonic time exclusively for protocol timers;
-- perform ARP abandonment in one pump location, fail loudly, and wake all
+- perform ARP and NDP abandonment in the pump, fail loudly, and wake all
   waiters;
 - turn exhausted budgets, full backlogs, and unreachable routes into explicit
   errors or RSTs, never silent permanent waits.
@@ -321,16 +359,38 @@ is acknowledged or the connection is reaped. The deliberately short close
 bounds—20 seconds in FIN-WAIT-2 and 1 second in TIME-WAIT—are resource policy
 for these nodes, not general Internet defaults.
 
-### ADAPT and MURDER
+### ADAPT
 
 Out-of-order TCP data is dropped with an immediate duplicate ACK; the peer
 recovers through retransmission. This is the chosen small loss state machine,
 not half a SACK implementation.
 
-Absent: congestion control, out-of-order reassembly/SACK, IPv6/NDP, IPv4
-fragmentation and options, TCP timestamps/PAWS, Nagle, SYN cookies, urgent-data
-API, inbound IP broadcast, and data-path logging. [`leannet/DESIGN.md`](leannet/DESIGN.md)
-explains why and when a feature may return.
+IPv6 is not a general dual-stack implementation. NDP uses the same bounded,
+ARP-like resolution and aging model instead of the complete Neighbor
+Unreachability Detection state machine. The first autonomous `/64` remains
+selected for the stack lifetime; SLAAC renumbering requires a restart. PIO and
+RIO wall-clock expiry and route-preference machinery are absent, but an
+explicit zero-lifetime PIO or RIO withdrawal takes effect and a newer RIO for
+the same prefix replaces its next hop. A write before the first usable RA
+receives an explicit no-route error rather than implicitly waiting for
+configuration. Withdrawing a PIO removes its on-link classification but does
+not silently replace the selected SLAAC identity.
+
+The socket seam is equally narrow: IPv4 and IPv6 have separate UDP port spaces
+and no dual-family socket. IPv6 binds are wildcard-only, report `[::]:port` as
+their local bind, and choose a wire source per destination; pretending to honor
+a specific local address is forbidden.
+
+### MURDER
+
+Absent: congestion control, out-of-order reassembly/SACK, TCPv6, DHCPv6,
+IPv4-mapped dual-family sockets, active DAD, privacy or temporary addresses,
+multiple SLAAC identities, full NUD and automatic renumbering, MLD/IGMP,
+multicast outside link scope, ICMPv6 redirects and error/PMTUD state, IPv4 and
+IPv6 fragmentation, IPv4 options, IPv6 extension headers and jumbograms, TCP
+timestamps/PAWS, Nagle, SYN cookies, urgent-data API, inbound IP broadcast,
+and data-path logging. [`leannet/DESIGN.md`](leannet/DESIGN.md) explains why
+and when a feature may return.
 
 ## Consumer obligations
 
@@ -350,6 +410,17 @@ The core stays small only if consumers do not rebuild each seam halfway:
   connection with working deadlines;
 - a custom S3 dialer for HTTPS preserves authenticated encryption and peer
   validation, especially with `UnsignedPayload`;
+- IPv6 slot traffic is native layer-2/routed traffic, not IPv4 NAT. `leannet`
+  is not a firewall: the switch or application owns exposure policy for every
+  bound UDPv6 port;
+- a consumer explicitly joins every application multicast group; opening an
+  IPv6 UDP socket does not by itself join `ff02::fb` or another application
+  group;
+- the `Device` below an IPv6-enabled stack passes the stack's unicast MAC and
+  relevant `33:33` multicast frames. A consumer that depends on promiscuous or
+  all-multicast NIC mode proves that mode on each supported driver;
+- an off-link caller treats no-route before the first usable RA as an explicit,
+  retryable result rather than an implicit configuration wait;
 - consumers build standalone against a published Lean version. A local
   workspace or filesystem `replace` is development tooling, not release proof.
 
@@ -367,8 +438,14 @@ go vet ./...
 ```
 
 Prefer regressions at the layer that owns the invariant: parsing, framing, and
-lifecycle in `leanhttp`; the pure TCP/ARP state machine in `leannet`; composition
-errors in `leanhttps` or `leans3`.
+lifecycle in `leanhttp`; the pure TCP/ARP/NDP state machines in `leannet`;
+composition errors in `leanhttps` or `leans3`.
+
+An IPv6 profile change additionally proves lazy enablement, v4/v6 port
+isolation, the mandatory UDP checksum, the 1280/1232-byte transmit boundary,
+exact Ethernet destination filtering, malformed NDP with zero state mutation,
+NDP give-up/deadline/close wakeups, and RA source selection plus
+PIO/RIO/default-route precedence, replacement, and explicit withdrawal.
 
 ### Consumer source gate
 
@@ -379,6 +456,8 @@ integration, not release proof. The gate includes:
 - regular tests, race tests, and `go vet` for Hop, hoplock, and hoplockserver;
 - a Tamago compile check of Hop's alternative HTTP files:
   `go test -run '^$' -tags tamago ./pkg/hophttp`;
+- regular tests, race tests, and `go vet` for HopOS `metal/net/hopswitch`
+  against the candidate Lean when IPv6 routing or multicast changes;
 - regular tests, race tests, and `go vet` for surfserve against local Lean;
 - exactly two surfserve regressions: `GET /stream` with a non-empty
   `Content-Length` returns 4xx and leaves the server usable; a bodyless non-GET
@@ -457,6 +536,15 @@ directives. Publish Lean first, then update consumers in dependency order and
 rebuild them standalone. Hardware, netmeter, and 64 MiB OOM validation for
 `leannet` remains deployment evidence in [`TODO.md`](TODO.md); passing host
 tests cannot replace it.
+
+The IPv6 hardware gate first proves slot-to-slot link-local UDP6 echo. Before
+SLAAC/RIO and IPv6 application multicast count as released consumer paths, it
+also proves one real Thread-border-router exchange—RA to SLAAC to RIO to UDP
+`:5540` and back—and an explicit `ff02::fb` join. Every advertised NIC either
+passes relevant `33:33` multicast and synthetic slot-MAC unicast or is excluded
+from the IPv6 hardware scope. The app or switch test also proves that a bound
+UDPv6 port has the intended exposure policy; IPv4 NAT tests are not evidence
+for native IPv6.
 
 ## Change rule
 

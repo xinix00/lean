@@ -51,15 +51,15 @@ func TestUDPDeliverRecvRoundtrip(t *testing.T) {
 	}
 
 	buf := make([]byte, 64)
-	n, src, srcPort, ok := u.recvFrom(buf)
+	n, src, _, srcPort, ok := u.recvFrom(buf)
 	if !ok || n != len(payload) || !bytes.Equal(buf[:n], payload) {
 		t.Fatalf("recvFrom = %q, %v; want %q, true", buf[:n], ok, payload)
 	}
-	if src != udpTestSrc || srcPort != 5678 {
+	if [4]byte(src[:4]) != udpTestSrc || srcPort != 5678 {
 		t.Fatalf("recvFrom src = %v:%d, want %v:5678", src, srcPort, udpTestSrc)
 	}
 
-	if _, _, _, ok := u.recvFrom(buf); ok {
+	if _, _, _, _, ok := u.recvFrom(buf); ok {
 		t.Fatal("recvFrom on empty queue returned ok")
 	}
 
@@ -94,7 +94,7 @@ func TestUDPQueueFullDrop(t *testing.T) {
 	}
 
 	buf := make([]byte, 64)
-	n, _, srcPort, ok := u.recvFrom(buf)
+	n, _, _, srcPort, ok := u.recvFrom(buf)
 	if !ok || srcPort != 1 || !bytes.Equal(buf[:n], first) {
 		t.Fatal("surviving datagram corrupted by the dropped one")
 	}
@@ -154,11 +154,11 @@ func TestUDPDatagramBoundaries(t *testing.T) {
 	one[0] = 'X'
 
 	buf := make([]byte, 64)
-	n, _, srcPort, ok := u.recvFrom(buf)
+	n, _, _, srcPort, ok := u.recvFrom(buf)
 	if !ok || n != 2 || srcPort != 1 || !bytes.Equal(buf[:n], []byte("aa")) {
 		t.Fatalf("first recv = %q (n=%d, port=%d), want \"aa\"", buf[:n], n, srcPort)
 	}
-	n, _, srcPort, ok = u.recvFrom(buf)
+	n, _, _, srcPort, ok = u.recvFrom(buf)
 	if !ok || n != 4 || srcPort != 2 || !bytes.Equal(buf[:n], two) {
 		t.Fatalf("second recv = %q (n=%d, port=%d), want \"bbbb\"", buf[:n], n, srcPort)
 	}
@@ -177,12 +177,12 @@ func TestUDPTruncation(t *testing.T) {
 		t.Fatal("deliver failed")
 	}
 	small := make([]byte, 4)
-	n, _, _, ok := u.recvFrom(small)
+	n, _, _, _, ok := u.recvFrom(small)
 	if !ok || n != 4 || !bytes.Equal(small, []byte("0123")) {
 		t.Fatalf("truncated recv = %q (n=%d), want \"0123\"", small[:n], n)
 	}
 
-	if _, _, _, ok := u.recvFrom(small); ok {
+	if _, _, _, _, ok := u.recvFrom(small); ok {
 		t.Fatal("truncated remainder still readable")
 	}
 
