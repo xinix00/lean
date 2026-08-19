@@ -1,8 +1,8 @@
 # KAM — the frozen HTTP/IP profile
 
-This document fixes the scope of `leanhttp`, `leanhttps`, `leans3`, and
-`leannet`. It is not a list of everything HTTP and the underlying IP transports
-can do. It defines what this repository **promises to do correctly**,
+This document fixes the scope of `leanhttp`, `leanh2`, `leanhttps`, `leans3`,
+and `leannet`. It is not a list of everything HTTP and the underlying IP
+transports can do. It defines what this repository **promises to do correctly**,
 deliberately narrows, and loudly rejects.
 
 KAM has three outcomes:
@@ -34,17 +34,24 @@ The stack supports this concrete chain:
   `leanhttps`, with sequential keep-alive per connection;
 - a SigV4 S3 client for the object operations Hop and HopOS actually use;
 - an IPv4/TCP/UDP stack plus an opt-in IPv6 lane with UDP as its only
-  application transport for bare-metal nodes, with one bounded buffer pool.
+  application transport for bare-metal nodes, with one bounded buffer pool;
+- an HTTP/2 server role on a connection the caller supplies and has already
+  chosen, for one measured consumer: a Cloudflare Tunnel, where the far side
+  dials nothing and speaks HTTP/2 client over our outbound connection.
 
-“Multiple things over one channel” means **sequential requests and responses
-over a keep-alive connection**. Speculative HTTP pipelining and multiplexing are
-not contractual.
+For `leanhttp`, “multiple things over one channel” means **sequential requests
+and responses over a keep-alive connection**; speculative HTTP pipelining is not
+contractual, and that package multiplexes nothing. Concurrent streams exist in
+exactly one place, `leanh2`, because one measured consumer's peer opens them —
+not as a general capability of this stack. A caller that has a choice uses
+`leanhttp`.
 
 ## Decision matrix
 
 | Area | KEEP | ADAPT | MURDER |
 |---|---|---|---|
-| HTTP server | HTTP/1.1, sequential keep-alive, fixed and streamed responses, `HEAD`, `204`/`205`/`304`, `Done`, `Hijack` | origin-form only, known-length request bodies, WebSocket through raw takeover | HTTP/1.0/2, CONNECT, request chunking/trailers, server-side Expect state machine, general 1xx state machine |
+| HTTP server | HTTP/1.1, sequential keep-alive, fixed and streamed responses, `HEAD`, `204`/`205`/`304`, `Done`, `Hijack` | origin-form only, known-length request bodies, WebSocket through raw takeover | HTTP/1.0, HTTP/2 in this package (it lives in `leanh2`), CONNECT, request chunking/trailers, server-side Expect state machine, general 1xx state machine |
+| leanh2 | HTTP/2 server role on a caller-supplied connection: the client preface then SETTINGS first; 32 streams; 16 KiB frames; 64 KiB compressed and decoded headers; 64 KiB receive window per stream; atomic two-level flow control; statuses 200–599 | request bodies with exact Content-Length integrity; exact static HPACK matches use their index, otherwise response fields are literals without indexing; syntactically valid PRIORITY accepted and ignored; `GOAWAY` with the highest accepted stream | client role, listener/dialer, TLS/ALPN, `h2c` upgrade, protocol sniffing, push, CONNECT, trailing header sections, 1xx, priority state or scheduling, dynamic response compression |
 | Mux | method+path, exact/subtree, `{segment}`, `{rest...}`, `GET`→`HEAD`, `404`/`405`+`Allow` | canonical paths or rejection; immutable after start | host routing, `{$}`, escaped/dot routing, slash normalization, net/http compatibility work |
 | HTTP client | outbound HTTP/1.1, inbound 1.0/1.1, GET/HEAD redirects, response framing, deadlines, keep-alive pool | fixed-length streaming upload with a strict Expect decision; compression pass-through | request chunking, automatic decompression, CONNECT/upgrade, general retry state machine |
 | TLS/S3 | explicit trust model, SNI per connection, SigV4 and used object operations | TLS as a dialer composition; signed S3 calls never follow redirects | TLS server, silent skip-verify, multipart, streaming SigV4, SigV4a, presigned URLs, IMDS/IAM |
@@ -400,6 +407,166 @@ cookies, urgent-data API, inbound IP broadcast, and data-path logging.
 [`leannet/DESIGN.md`](leannet/DESIGN.md) explains why and when a feature may
 return.
 
+## leanh2
+
+`leanh2` is the one place in this repository where concurrent streams exist. It
+serves the HTTP/2 **server** role on a connection the caller supplies and has
+already chosen: no listener, no dialer, no client role, and no negotiation
+about which protocol version this is.
+
+The measured consumer is a Cloudflare Tunnel (`HopOS/apps/cloudflared-lean`).
+That consumer's shape is the whole reason for the profile below: the tunnel
+dials out, and the edge then behaves as the HTTP/2 client on that outbound
+connection — it sends the preface, it opens every stream, and it never expects a
+request from this side.
+
+### KEEP
+
+The connection MUST:
+
+- invoke `Serve` exactly once for a `Conn`;
+- read the client preface before anything else and refuse a connection that
+  does not begin with it;
+- require the peer's first frame after that preface to be a non-acknowledgement
+  `SETTINGS` frame on stream zero;
+- refuse public `GOAWAY` output until `Serve` has read the preface and sent its
+  initial SETTINGS, so no shutdown race can precede the server SETTINGS frame;
+- announce `HEADER_TABLE_SIZE=0`, `ENABLE_PUSH=0`,
+  `MAX_CONCURRENT_STREAMS=32`, `INITIAL_WINDOW_SIZE=65536`,
+  `MAX_FRAME_SIZE=16384`, and `MAX_HEADER_LIST_SIZE=65536`; honour the peer's
+  `INITIAL_WINDOW_SIZE` and `MAX_FRAME_SIZE`, including the shift a changed
+  initial window applies to live streams. Output remains at the 16384-byte RFC
+  floor even when the peer permits larger frames;
+- raise the default connection receive window once by exactly 1048576 bytes;
+  this bounds total unread body data across streams while allowing several
+  65536-byte stream windows to make progress;
+- answer every non-acknowledgement `PING` with its payload, because a peer may
+  withhold all work until it sees the acknowledgement;
+- accept a header block as one indivisible unit: after `HEADERS` without
+  `END_HEADERS`, only `CONTINUATION` on that same stream is accepted and
+  anything else ends the connection;
+- write a header block as one indivisible unit: `HEADERS` and its
+  `CONTINUATION` frames leave the connection with no other frame between them,
+  whatever other streams are writing;
+- accept only client-initiated stream identifiers that are odd and strictly
+  increasing, and refuse an even, reused, or lower identifier;
+- admit at most 32 concurrent streams, at most 65536 accumulated compressed
+  header bytes in one block, at most 65536 decoded header-list bytes, and at
+  most 65536 unread request-body bytes per stream;
+- claim the same final byte count atomically from the outbound stream and
+  connection windows granted by the peer: concurrent response writers may
+  neither spend the same connection credit twice nor lose the difference
+  between the two levels;
+- debit every received `DATA` payload, including its pad-length byte and
+  padding, from both receive windows before accepting it; refuse either window
+  being exceeded and refuse every update that would overflow a window;
+- return receive credit only for bytes the handler consumed or the server
+  deliberately discarded; resetting or completing a stream with buffered,
+  unread body bytes returns their connection credit exactly once;
+- keep request delivery off the connection frame loop, so one slow handler
+  cannot stall `PING`, `SETTINGS`, or another stream;
+- pass only a request with exactly one non-empty valid-token `:method`, exactly
+  one non-empty `:scheme`, exactly one non-empty `:path`, at most one
+  `:authority`, no other pseudo-header, and no pseudo-header after a regular
+  field; `CONNECT` and extended CONNECT are rejected before the handler;
+- require every regular field name to be a non-empty lowercase HTTP token and
+  every value to be a valid HTTP field value; reject connection-specific
+  fields and a trailing header section, and join split `cookie` fields with
+  `"; "` before exposing the generic request;
+- accept at most one `content-length`, in strict unsigned decimal form, and
+  require it to equal exactly the number of unpadded `DATA` octets received
+  when the request ends; a short or overlong body is an error, never a request
+  the handler may mistake for complete;
+- accept only final response statuses 200–599, reject 1xx before writing, and
+  reject a body write for `HEAD`, `204`, `205`, or `304` before emitting bytes;
+- validate response field names and values before writing and reject pseudo-
+  headers supplied by the handler, connection-specific fields, trailers, and
+  `content-length`; DATA plus `END_STREAM` is the sole response-length state;
+- give each stream its own goroutine and contain a handler panic to that
+  stream, with `RST_STREAM` to the peer and the connection intact;
+- send `GOAWAY` with the highest stream identifier it accepted and may still
+  finish, and accept no new stream afterwards, so the peer never retries work
+  that can still have side effects here;
+- release every stream's state and reader on close, with the reason. The caller
+  chooses the connection and owns its deadline policy; once `Serve` starts,
+  `Conn` closes the transport before that sole invocation returns so a blocked
+  writer, body reader, or flow-control waiter is released before it completes.
+
+### ADAPT
+
+- A request body is delivered, bounded by the window this side advertises
+  rather than by any figure the peer names. The consumer needs it: the tunnel's
+  control stream is bidirectional and its configuration push carries JSON.
+- An exact response field in HPACK's static table uses that index; every other
+  response field goes out as a literal without indexing. The encoder therefore
+  keeps no dynamic table, and the announced table size of zero keeps the peer
+  from building one either. The decoder does maintain the peer's table, because
+  the peer may use it before that setting arrives.
+- `SETTINGS_HEADER_TABLE_SIZE` is announced as zero and a peer size update is
+  accepted only at the start of a header block. Once the peer acknowledges the
+  setting, zero is enforced for every following block. A static-only block is
+  accepted without demanding the otherwise ceremonial leading update-to-zero;
+  any growth or dynamic reference is still refused.
+- A handler that closes a request body stops receiving stream credit; later
+  bytes can consume only the already announced remainder until response finish
+  resets the remote half. DATA already in flight after our reset is discarded
+  only for a bounded set of 32 recent reset streams and only within each one's
+  remaining window; DATA after a normal close remains an error.
+- A syntactically valid five-byte `PRIORITY` frame on a nonzero stream, and the
+  syntactically valid priority field of `HEADERS`, are accepted and ignored.
+  They allocate no state and influence no scheduling.
+
+### MURDER
+
+No measured consumer, removed with its state space, and refused loudly where
+input can reach it: the client role; a listener or dialer; TLS, ALPN, and `h2c`
+upgrade; protocol sniffing between HTTP/1.1 and HTTP/2 on one connection;
+`PUSH_PROMISE` and server push; `CONNECT` and extended CONNECT; request or
+response trailing header sections; 1xx responses; priority state and priority
+scheduling; and dynamic compression of response headers. The valid PRIORITY
+wire forms named under ADAPT are compatibility input, not a priority feature.
+
+Protocol sniffing deserves its own sentence, because it was written and removed:
+four bytes cannot prove an HTTP/2 preface follows — `PRI` is a valid HTTP
+extension method — and the seam it advertised did not exist, since `leanhttp`
+exposes no per-connection serve entry. A caller that must carry both versions
+chooses per listener, not per connection.
+
+### Change rule, filled in
+
+1. **Measurement and consumer.** `HopOS/apps/cloudflared-lean` needs an HTTP/2
+   server role: the Cloudflare edge speaks HTTP/2 client over the tunnel's
+   outbound connection and offers no HTTP/1.1 transport (`--protocol` accepts
+   only `auto`, `quic`, and `http2`). Two equivalent one-connection servers,
+   `-ldflags="-s -w"`, CGO off, 2026-08-19: `x/net/http2` with `net/http`
+   5.10 MB against 2.22 MB, so 2.88 MB and 56%. The cause is structural:
+   `http2.Server.ServeConn` takes an `http.Handler`, so that package cannot be
+   used without `net/http`, which links `crypto/tls` and `crypto/x509` whether
+   or not the connection is encrypted.
+2. **Smallest explicit contract change.** A separate package, not a mode of
+   `leanhttp`: importing one links nothing of the other, and `leanhttp` keeps
+   murdering HTTP/2. The server role only, on a caller-supplied connection.
+3. **Tests.** At the owning layer: the settings exchange and its
+   acknowledgement and SETTINGS as the first peer frame; the exact announced
+   caps; `PING`; indivisible header blocks in both directions; the 32-stream
+   cap and identifier discipline; simultaneous response writers competing for
+   one connection window; stream- and connection-level receive overruns;
+   consumed and discarded body credit; strict pseudo-header, field, CONNECT,
+   trailer, Content-Length, response-status, and bodyless-response rules; a
+   contained handler panic; a wrong preface; and `GOAWAY` once with its highest
+   accepted stream. HPACK decoding against RFC 7541 Appendix C and against a
+   recorded header block from the edge, including enforcement of the zero table
+   size after SETTINGS acknowledgement. For the seam, the consumer test is the
+   tunnel against the real edge: registration, a public request with the
+   `Host` preserved, and 5 MiB byte-identical.
+4. **Decision.** The matrix row and the boundaries above.
+5. **Hard rejection.** Every peer protocol violation in KEEP ends the
+   connection with a named error and bounded work. A handler-side response
+   violation returns an error before malformed bytes are written; finish keeps
+   the stream well framed and resets it only when cancellation is required.
+   The recorded edge block proves the decoder handles the peer that actually
+   calls.
+
 ## Consumer obligations
 
 The core stays small only if consumers do not rebuild each seam halfway:
@@ -410,6 +577,17 @@ The core stays small only if consumers do not rebuild each seam halfway:
   response headers reach the wire, so the simple rule is to claim it before
   `WriteHeader`, `Write`, or `Flush`;
 - a hijacker uses neither `Done` nor the regular `ResponseWriter`;
+- a `leanh2` caller chooses HTTP/2 before constructing `Conn` and supplies its
+  liveness/deadline policy. The transport permits one concurrent read and write,
+  and closing it wakes both. The caller may close or deadline it to initiate a
+  stop; a graceful stop sends `GOAWAY` after startup and then closes that
+  transport. `Conn` also guarantees the transport is closed before its sole
+  `Serve` invocation returns, so a blocked reader or writer cannot survive it;
+- a `leanh2` handler also bounds its own external work and returns after its
+  Body or Response reports cancellation. Closing the connection wakes package-
+  owned waits; it cannot interrupt an arbitrary channel receive or third-party
+  call inside handler code, and that handler keeps one of the 32 slots until it
+  returns;
 - a caller that wants connection reuse reads a response to its proven end and
   always closes it;
 - a signed protocol does not follow generic redirects, but validates and signs
@@ -446,7 +624,8 @@ go vet ./...
 ```
 
 Prefer regressions at the layer that owns the invariant: parsing, framing, and
-lifecycle in `leanhttp`; the pure TCP/ARP/NDP state machines in `leannet`;
+lifecycle in `leanhttp`; framing, stream state, HPACK, and both flow-control
+levels in `leanh2`; the pure TCP/ARP/NDP state machines in `leannet`;
 composition errors in `leanhttps` or `leans3`.
 
 An IPv6 profile change additionally proves lazy enablement, v4/v6 port
@@ -475,7 +654,10 @@ integration, not release proof. The gate includes:
 - regular tests, race tests, and `go vet` for surfserve against local Lean;
 - exactly two surfserve regressions: `GET /stream` with a non-empty
   `Content-Length` returns 4xx and leaves the server usable; a bodyless non-GET
-  on `/stream` returns `405`.
+  on `/stream` returns `405`;
+- regular tests, race tests, `go vet`, and a host build for
+  `HopOS/apps/cloudflared-lean` against candidate Lean; its two TamaGo images
+  must also compile with the pinned toolchain before release.
 
 In the existing sibling workspace, the first three lines are:
 
@@ -485,6 +667,29 @@ go test -race -count=1 ./hop/... ../hoplock/... ./hoplockserver/...
 go vet ./hop/... ../hoplock/... ./hoplockserver/...
 go -C hop test -run '^$' -tags tamago ./pkg/hophttp
 ```
+
+`cloudflared-lean` is its own module inside HopOS. Connect exactly that module
+and candidate Lean in a temporary workspace; testing the surrounding HopOS
+module does not exercise this seam.
+
+```sh
+LEAN_CANDIDATE=/path/to/lean
+CLOUDFLARED_LEAN_CANDIDATE=/path/to/hop-os/apps/cloudflared-lean
+H2_KAM_WORKDIR="$(mktemp -d)"
+go -C "$H2_KAM_WORKDIR" work init "$LEAN_CANDIDATE" "$CLOUDFLARED_LEAN_CANDIDATE"
+GOWORK="$H2_KAM_WORKDIR/go.work" go -C "$CLOUDFLARED_LEAN_CANDIDATE" test -count=1 ./...
+GOWORK="$H2_KAM_WORKDIR/go.work" go -C "$CLOUDFLARED_LEAN_CANDIDATE" test -race -count=1 ./...
+GOWORK="$H2_KAM_WORKDIR/go.work" go -C "$CLOUDFLARED_LEAN_CANDIDATE" vet ./...
+GOWORK="$H2_KAM_WORKDIR/go.work" go -C "$CLOUDFLARED_LEAN_CANDIDATE" build -o "$H2_KAM_WORKDIR/cloudflared-lean-host" ./cmd/cloudflared-lean
+```
+
+The module lookup in that workspace MUST resolve `github.com/xinix00/lean` to
+`LEAN_CANDIDATE`; an older tag or an unrelated filesystem `replace` is not
+candidate evidence. The host tests are not a TamaGo build. Run the consumer's
+official `tools/build.sh` with the pinned `TAMAGO` compiler after its Lean
+dependency points at the candidate tag; it builds both arm64 and riscv64.
+Until that script creates its ignored `out` directory before its host build,
+the gate MUST precreate `out` as the standalone command block below does.
 
 Surfserve is absent from the regular development workspace. Connect the
 candidate in a temporary, uncommitted `go.work` containing only the Lean and
@@ -508,6 +713,41 @@ the gate.
 `go test ./...` is not a valid hop-os-surf host gate because the metal commands
 are Tamago-only. Test only the relevant host packages in this pre-tag gate.
 
+### leanh2 real-edge gate
+
+Wire-unit tests cannot substitute for the peer that selected this profile.
+Before tagging any change to leanh2 framing, HPACK, stream lifecycle, flow
+control, or its consumer seam, use the host binary built from the candidate
+workspace above against `region1.v2.argotunnel.com` or
+`region2.v2.argotunnel.com` with a dedicated test tunnel.
+
+The origin fixture records the received `Host` and serves one deterministic
+file of exactly 5 MiB. Then run the candidate host binary with the test token
+and that fixture as its fallback origin:
+
+```sh
+TUNNEL_TOKEN=the-dedicated-test-token \
+TUNNEL_URL=http://127.0.0.1:the-origin-port \
+"$H2_KAM_WORKDIR/cloudflared-lean-host"
+```
+
+The gate passes only when all of these are observed on the same candidate:
+
+1. every configured tunnel connection logs successful registration and stays
+   registered through the transfers;
+2. a request through the public hostname reaches the fixture with that exact
+   public `Host`, not the edge address or fallback origin address;
+3. downloading the 5 MiB fixture through the public hostname is byte-for-byte
+   identical to the local fixture;
+4. a configuration push is read to its exact end and acknowledged, proving the
+   bidirectional request-body path; and
+5. shutdown sends `GOAWAY`, closes the supplied connection, and leaves no stuck
+   process or stream.
+
+Record the edge region, date, candidate commits, file digest, and outcomes.
+The token is never written to this repository. A recorded HPACK block proves
+decoder compatibility but does not replace this gate.
+
 ### Consumer release gate
 
 After tagging and updating dependencies, run Hop, hoplock, and hoplockserver
@@ -519,6 +759,23 @@ GOWORK=off go test -race -count=1 ./...
 GOWORK=off go vet ./...
 GOWORK=off go list -m all
 ```
+
+For `HopOS/apps/cloudflared-lean`, after updating it to the released Lean tag,
+run its standalone gate with no workspace and no Lean filesystem replacement:
+
+```sh
+GOWORK=off go test -count=1 ./...
+GOWORK=off go test -race -count=1 ./...
+GOWORK=off go vet ./...
+GOWORK=off go list -m all
+mkdir -p out
+GOWORK=off ./tools/build.sh
+```
+
+Run those commands from the `cloudflared-lean` module. Its module list MUST
+name the released Lean version. Repeat the real-edge gate with the standalone
+host binary produced by `tools/build.sh`; a source-workspace success does not
+prove the published dependency chain.
 
 For surfserve, replace `./...` with its host gate on `./stack/surfserve` plus
 the official `tools/test.sh`. That script covers the Tamago builds, while the

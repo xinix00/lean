@@ -5,7 +5,9 @@ package leanhttp
 //
 // The model is intentionally small: one handler, Content-Length responses until
 // Flush switches to chunked, and Hijack for protocols such as WebSocket. It has
-// no HTTP/2, TLS, or pipelining.
+// no HTTP/2, TLS, or pipelining. HTTP/2 lives in leanh2, a separate package on
+// purpose: importing this one links nothing of it, and a caller that must carry
+// both versions chooses per listener.
 //
 // Essential features are:
 //

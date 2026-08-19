@@ -15,6 +15,7 @@ that one.
 | | |
 |---|---|
 | [`leanhttp`](leanhttp/) | HTTP/1.1 without TLS — small client and server, sequential keep-alive and chunked responses |
+| [`leanh2`](leanh2/) | **HTTP/2 server role on a connection the caller already chose**, for the measured Cloudflare Tunnel consumer. Its KAM profile is fixed: SETTINGS first, at most 32 streams, 16 KiB frames, 64 KiB compressed and decoded headers, and a 64 KiB receive window per stream; both flow-control levels and discarded-body credit stay exact. Requests have strict pseudo-header and Content-Length integrity; responses are final 200–599 and `HEAD`/`204`/`205`/`304` are bodyless. Valid PRIORITY wire input is ignored without state. No client, listener, TLS, sniffing, CONNECT, push, trailers, response Content-Length, or 1xx; the caller supplies deadlines, calls `Serve` once, and may initiate close, while `Conn` closes before that call returns. **2.88 MB** lighter than `x/net/http2` plus `net/http` for the same one-connection server |
 | [`leandhcp`](leandhcp/) | DHCPv4 (RFC 2131) on raw ethernet frames — a lease before any netstack exists |
 | [`leannet`](leannet/) | TCP/IP for bare-metal Go — Ethernet; IPv4 ARP, ICMP echo, UDP, TCP, and link-local multicast; plus an opt-in IPv6 UDP/ICMPv6 lane with NDP, link-scoped multicast, one SLAAC identity, and bounded PIO/RIO routing. It supplies `net.Conn`/`Listener`/`PacketConn`, with one shared buffer budget, an optional TCP per-connection cap, and buffers that grow with use instead of configuration |
 | [`leancookie`](leancookie/) | A cookie jar (RFC 6265) on `net/url` and strings — domain, path, expiry and Secure, without dragging `net/http/cookiejar` (and with it 3.2 MB of `net/http`) into the image. Host-only by default, because a public-suffix list is not something a bare-metal image should carry |
@@ -45,9 +46,9 @@ three more along with it.
 ## The HTTP/IP KAM
 
 Lean means reduced scope, not reduced correctness. The frozen contract for
-`leanhttp`, `leanhttps`, `leans3` and `leannet` — what stays, what is narrowed,
-what is deliberately removed, and which release gates protect that boundary —
-is documented in [KAM.md](KAM.md).
+`leanhttp`, `leanh2`, `leanhttps`, `leans3` and `leannet` — what stays, what is
+narrowed, what is deliberately removed, and which release gates protect that
+boundary — is documented in [KAM.md](KAM.md).
 
 ## The one exception: compositions
 
