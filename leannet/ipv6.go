@@ -122,6 +122,14 @@ func (s *Stack) recvIPv6(ip IPv6Frame, srcMAC [6]byte, now int64) {
 		s.stats.DropBadFrame++
 		return
 	}
+	// Passive learning belongs only to validated unicast for one of our own
+	// addresses. A routed peer's Ethernet source is its router, not that peer.
+	learn := func() {
+		if v6.ourAddr6(ip.Dst()) && !v6.ourAddr6(src) && v6.onLink6(src) &&
+			validUnicastMAC(srcMAC) && v6.ndp.learn(src, srcMAC, now) {
+			s.notify()
+		}
+	}
 	switch ip.NextHeader() {
 	case ProtoICMPv6:
 		f, err := ParseICMPv6(ip.Payload(), src, ip.Dst())
@@ -153,19 +161,18 @@ func (s *Stack) recvIPv6(ip IPv6Frame, srcMAC [6]byte, now int64) {
 		case icmp6EchoRequest:
 			// Mirror the IPv4 echo: the free field diagnostic. Unicast only —
 			// answering multicast pings is how a link gets storms.
-			if f.Code() != 0 || len(f) < 8 || len(f) > ipv6MinimumMTU-sizeIPv6 || !validIngressSource6(src) ||
-				!v6.ourAddr6(ip.Dst()) || len(s.out6) >= outQueueCap {
-				if len(s.out6) >= outQueueCap {
-					s.stats.DropReplyFull++
-				}
-				if f.Code() != 0 || len(f) < 8 || len(f) > ipv6MinimumMTU-sizeIPv6 || !validIngressSource6(src) {
-					s.stats.DropBadFrame++
-				}
+			bad := f.Code() != 0 || len(f) < 8 || len(f) > ipv6MinimumMTU-sizeIPv6 || !validIngressSource6(src)
+			switch {
+			case bad:
+				s.stats.DropBadFrame++
+				return
+			case !v6.ourAddr6(ip.Dst()):
+				return
+			case len(s.out6) >= outQueueCap:
+				s.stats.DropReplyFull++
 				return
 			}
-			if !v6.ourAddr6(src) && v6.onLink6(src) && validUnicastMAC(srcMAC) {
-				v6.ndp.learn(src, srcMAC, now)
-			}
+			learn()
 			reply := append([]byte(nil), f...)
 			reply[0] = icmp6EchoReply
 			reply[2], reply[3] = 0, 0
@@ -184,12 +191,7 @@ func (s *Stack) recvIPv6(ip IPv6Frame, srcMAC [6]byte, now int64) {
 			s.stats.DropBadFrame++
 			return
 		}
-		// Learn only from unicast addressed to us, after checksum validation,
-		// mirroring the IPv4 discipline.
-		if v6.ourAddr6(ip.Dst()) && !v6.ourAddr6(src) && v6.onLink6(src) &&
-			validUnicastMAC(srcMAC) && v6.ndp.learn(src, srcMAC, now) {
-			s.notify()
-		}
+		learn() // only after transport checksum validation, like the IPv4 path
 		if !v6.udp.deliver6(f.DstPort(), src, f.SrcPort(), f.Payload()) {
 			s.stats.DropNoPort++
 			return
@@ -369,7 +371,7 @@ func (s *Stack) drain6Locked(now int64) {
 	gaveUpBefore := v6.ndp.cnt.GaveUp
 	var body [64]byte
 	for {
-		e, ok := v6.ndp.emit(body[:], v6.ll, now)
+		e, ok := v6.ndp.emit(body[:], now)
 		if !ok {
 			break
 		}
@@ -418,7 +420,7 @@ func (s *Stack) ListenUDP6(port uint16) (*udpSock, error) {
 
 // DialUDP6 binds an ephemeral v6 port connected to one peer.
 func (s *Stack) DialUDP6(raddr [16]byte, rport uint16) (*udpSock, error) {
-	if rport == 0 || !validUDP6Remote(raddr) {
+	if rport == 0 || !validAppDst6(raddr) {
 		return nil, errInvalidUDP6Remote
 	}
 	u, err := s.ListenUDP6(0)

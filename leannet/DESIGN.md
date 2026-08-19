@@ -102,6 +102,11 @@ exception. IPv6 output is capped at the 1280-byte minimum MTU, so a UDP payload
 is at most 1232 bytes; extension headers, fragmentation, and PMTUD cannot blur
 that boundary.
 
+Supported NS, NA, and RA are deliberately stricter than RFC 4861: every
+SLLA/TLLA must exactly match the Ethernet source MAC. A mismatch is rejected
+before state mutation. This fail-closed home/Matter-link rule intentionally
+excludes proxy-ND and VRRP-style virtual-router MAC indirection.
+
 The asymmetric floors—16 KiB RX and 4 KiB TX—are the only values not derived
 from pressure. The peer controls RX rate and starts with an initial congestion
 window of ten segments (RFC 6928). Advertising less prevents that burst, while
@@ -156,8 +161,9 @@ The files follow ownership boundaries rather than promising one file per layer:
    views and checksums. Every `Parse*` rejects malformed or unsupported input.
 2. `budget.go` and `ring.go` own reservations and TCP rings. `txRing` anchors
    the send ring in sequence space (head = `snd.UNA`, cursor = bytes sent).
-3. `tcp.go`, `arp.go`, `ndp.go`, `udp.go`, and `icmp.go` contain the bounded
-   protocol machines; `multicast.go` and `ipv6.go` contain the corresponding
+3. `tcp.go`, `udp.go`, and `icmp.go` contain the bounded transport machines;
+   `neighbor.go` owns the one lifecycle shared by the wire-specific `arp.go`
+   and `ndp.go`; `multicast.go` and `ipv6.go` contain the corresponding
    family-specific membership, address, and route policy.
 4. `stack.go` owns the mutex, ingress demux, loopback, and the single transmit
    pump that drives TCP, ARP, NDP, and connectionless replies.

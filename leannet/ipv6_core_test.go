@@ -238,6 +238,43 @@ func TestIPv6IngressRequiresExactEthernetDestination(t *testing.T) {
 	}
 }
 
+func TestIPv6EchoDropCountersAreDisjoint(t *testing.T) {
+	s, _ := newIPv6CoreStack(t)
+	if _, err := s.ListenUDP6(0); err != nil {
+		t.Fatal(err)
+	}
+	ourHW := s.cfg.MAC
+	peerHW := [6]byte{2, 0, 0, 0, 0, 2}
+	ourLL := llAddrFromMAC(ourHW)
+	peerLL := llAddrFromMAC(peerHW)
+	recvFull := func(raw []byte) (bad, full int) {
+		eth, err := ParseEth(raw)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ip, err := ParseIPv6(eth.Payload())
+		if err != nil {
+			t.Fatal(err)
+		}
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		s.out6 = make([]outPkt6, outQueueCap)
+		beforeBad, beforeFull := s.stats.DropBadFrame, s.stats.DropReplyFull
+		s.recvIPv6(ip, peerHW, s.now())
+		return s.stats.DropBadFrame - beforeBad, s.stats.DropReplyFull - beforeFull
+	}
+
+	bad := testNDP6EthernetFrame(t, ourHW, peerHW, peerLL, ourLL, icmp6EchoRequest, 1, make([]byte, 4))
+	if badDrops, fullDrops := recvFull(bad); badDrops != 1 || fullDrops != 0 {
+		t.Fatalf("bad echo counters: bad=%d reply-full=%d", badDrops, fullDrops)
+	}
+
+	valid := testNDP6EthernetFrame(t, ourHW, peerHW, peerLL, ourLL, icmp6EchoRequest, 0, make([]byte, 4))
+	if badDrops, fullDrops := recvFull(valid); badDrops != 0 || fullDrops != 1 {
+		t.Fatalf("full echo counters: bad=%d reply-full=%d", badDrops, fullDrops)
+	}
+}
+
 func TestRAPreservesAtomicityAndCanonicalRouteActions(t *testing.T) {
 	s, _ := newIPv6CoreStack(t)
 	if _, err := s.ListenUDP6(0); err != nil {
@@ -368,6 +405,39 @@ func TestNDPFormValidationBeforeMutation(t *testing.T) {
 	_, resolved = tab.peek(peerLL, 1)
 	if !resolved {
 		t.Fatal("valid unicast NA did not resolve the pending neighbor")
+	}
+}
+
+func TestNDPRefreshIsNotIgnored(t *testing.T) {
+	ourHW := [6]byte{2, 0, 0, 0, 0, 1}
+	ourLL := llAddrFromMAC(ourHW)
+	peerHW := [6]byte{2, 0, 0, 0, 0, 2}
+	peerLL := llAddrFromMAC(peerHW)
+	tab := newNDPTable(ourHW, 0)
+	tab.entries[peerLL] = &neighborEntry{mac: peerHW, state: neighborResolved}
+
+	advert := func(target [16]byte, mac [6]byte) ICMPv6Frame {
+		body := make([]byte, 28)
+		body[0] = 0x20 // unsolicited override
+		copy(body[4:20], target[:])
+		body[20], body[21] = ndpOptTargetLLA, 1
+		copy(body[22:], mac[:])
+		return testICMP6(icmp6NeighborAdvert, 0, body)
+	}
+	newHW := [6]byte{2, 0, 0, 0, 0, 3}
+	tab.recvNA(advert(peerLL, newHW), peerLL, ourLL, newHW, 1)
+	if tab.cnt.Ignored != 0 || tab.cnt.MACChanged != 1 {
+		t.Fatalf("refresh counters: ignored=%d changed=%d", tab.cnt.Ignored, tab.cnt.MACChanged)
+	}
+	if got, ok := tab.peek(peerLL, 1); !ok || got != newHW {
+		t.Fatalf("refreshed neighbor = (%v, %v), want (%v, true)", got, ok, newHW)
+	}
+
+	unknownHW := [6]byte{2, 0, 0, 0, 0, 4}
+	unknown := llAddrFromMAC(unknownHW)
+	tab.recvNA(advert(unknown, unknownHW), unknown, allNodes6, unknownHW, 2)
+	if tab.cnt.Ignored != 1 {
+		t.Fatalf("unknown advertisement ignored=%d, want 1", tab.cnt.Ignored)
 	}
 }
 

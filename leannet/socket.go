@@ -608,9 +608,6 @@ func (u *udpSock) WriteTo(p []byte, addr net.Addr) (int, error) {
 			return 0, errors.New("leannet: WriteTo on a v6 socket needs an IPv6 *net.UDPAddr")
 		}
 		dst := [16]byte(ua.IP.To16())
-		if !validUDP6Remote(dst) {
-			return 0, errInvalidUDP6Remote
-		}
 		return u.writeUDP6(p, dst, uint16(ua.Port))
 	}
 	dst, dport, ok := addrPort(addr)
@@ -809,22 +806,20 @@ func (s *Stack) socket6(ctx context.Context, network string, sotype int, laddr, 
 		return nil, errors.New("leannet: IPv6 local address must be wildcard")
 	}
 	rip, rport, okR := addrPort6(raddr)
-	if raddr != nil && (!okR || rport == 0 || !validUDP6Remote(rip)) {
+	if raddr != nil && (!okR || rport == 0) {
 		return nil, errors.New("leannet: unsupported remote address")
 	}
 	if raddr != nil {
 		if lport != 0 {
 			return nil, errors.New("leannet: dialing from a fixed local port is not supported")
 		}
-		return s.DialUDP6(rip, rport)
+		u, err := s.DialUDP6(rip, rport)
+		if err != nil {
+			return nil, err // avoid a typed nil inside the interface result
+		}
+		return u, nil
 	}
 	return s.ListenUDP6(lport)
-}
-
-// validUDP6Remote gives the socket seam one name for the shared IPv6
-// application-destination policy used by Socket, WriteTo, and DialUDP6.
-func validUDP6Remote(ip [16]byte) bool {
-	return validAppDst6(ip)
 }
 
 // addrPort6 extracts a v6 address and port; a v4 or v4-mapped address is not ok.

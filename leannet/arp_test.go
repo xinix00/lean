@@ -171,13 +171,13 @@ func TestARPExpiry(t *testing.T) {
 	tab := newARPTable(arpTestOurIP, arpTestOurMAC)
 	arpEstablish(t, tab, arpTestPeerIP, arpTestPeerMAC, 0)
 
-	if _, ok := tab.resolve(arpTestPeerIP, arpEntryTTL-1); !ok {
+	if _, ok := tab.resolve(arpTestPeerIP, neighborEntryTTL-1); !ok {
 		t.Fatal("entry expired before its TTL")
 	}
-	if _, ok := tab.resolve(arpTestPeerIP, arpEntryTTL); ok {
+	if _, ok := tab.resolve(arpTestPeerIP, neighborEntryTTL); ok {
 		t.Fatal("entry survived its TTL")
 	}
-	if got := arpDrain(t, tab, arpEntryTTL); got != 1 {
+	if got := arpDrain(t, tab, neighborEntryTTL); got != 1 {
 		t.Fatalf("emitted %d queries after expiry-restart, want 1", got)
 	}
 }
@@ -187,7 +187,7 @@ func TestARPRetryAndGiveUp(t *testing.T) {
 	sec := int64(time.Second)
 
 	tab.resolve(arpTestPeerIP, 0)
-	for i := 0; i < arpQueryTries; i++ {
+	for i := 0; i < neighborQueryTries; i++ {
 		now := int64(i) * sec
 		if got := arpDrain(t, tab, now); got != 1 {
 			t.Fatalf("try %d: emitted %d queries, want 1", i+1, got)
@@ -198,7 +198,7 @@ func TestARPRetryAndGiveUp(t *testing.T) {
 		}
 	}
 
-	giveUp := int64(arpQueryTries) * sec
+	giveUp := int64(neighborQueryTries) * sec
 	if got := arpDrain(t, tab, giveUp); got != 0 {
 		t.Fatal("query emitted after give-up point")
 	}
@@ -216,9 +216,9 @@ func TestARPRetryAndGiveUp(t *testing.T) {
 		t.Fatal("resolve on failed entry restarted the query early")
 	}
 
-	fresh := giveUp + arpFailTTL
+	fresh := giveUp + neighborFailTTL
 	if tab.noAnswer(arpTestPeerIP, fresh) {
-		t.Fatal("noAnswer sticks past arpFailTTL")
+		t.Fatal("noAnswer sticks past neighborFailTTL")
 	}
 	if _, ok := tab.resolve(arpTestPeerIP, fresh); ok {
 		t.Fatal("resolve hit without any reply")
@@ -305,14 +305,14 @@ func TestARPLearnPassive(t *testing.T) {
 		t.Fatalf("passive learn did not resolve: %x ok=%v", got, ok)
 	}
 
-	tbl.learn(peer, mac, t0+arpEntryTTL-1)
-	if _, ok := tbl.resolve(peer, t0+arpEntryTTL+1); !ok {
+	tbl.learn(peer, mac, t0+neighborEntryTTL-1)
+	if _, ok := tbl.resolve(peer, t0+neighborEntryTTL+1); !ok {
 		t.Fatal("passive refresh did not extend the TTL")
 	}
 
 	evil := [6]byte{0xde, 0xad, 0, 0, 0, 1}
-	tbl.learn(peer, evil, t0+arpEntryTTL+2)
-	if got, _ := tbl.resolve(peer, t0+arpEntryTTL+2); got == evil {
+	tbl.learn(peer, evil, t0+neighborEntryTTL+2)
+	if got, _ := tbl.resolve(peer, t0+neighborEntryTTL+2); got == evil {
 		t.Fatal("passive learning overwrote a MAC; a spoofed data frame could reroute traffic")
 	}
 
@@ -335,7 +335,7 @@ func TestARPStaticSeedSurvivesEverything(t *testing.T) {
 	gw, mac := [4]byte{10, 100, 0, 1}, [6]byte{2, 0, 0, 0, 0, 0}
 	tbl.seed(gw, mac)
 
-	if got, ok := tbl.resolve(gw, t0+100*arpEntryTTL); !ok || got != mac {
+	if got, ok := tbl.resolve(gw, t0+100*neighborEntryTTL); !ok || got != mac {
 		t.Fatalf("static seed expired: %x ok=%v", got, ok)
 	}
 

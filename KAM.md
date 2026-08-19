@@ -317,6 +317,8 @@ The IPv6 lane MUST:
 - implement only the ICMPv6 control needed by this path: bounded RS/RA and
   NS/NA plus unicast echo; validate every invariant of those supported forms
   before rejected input can mutate state;
+- require every SLLA/TLLA in a supported NS, NA, or RA to equal the Ethernet
+  source MAC; reject a mismatch before it can mutate state;
 - retain bounded on-link PIO prefixes and bounded RIO routes, prefer the
   longest RIO match, replace the next hop for a repeated prefix, remove an
   explicitly withdrawn PIO or RIO, and use one advertised default router only
@@ -377,6 +379,10 @@ receives an explicit no-route error rather than implicitly waiting for
 configuration. Withdrawing a PIO removes its on-link classification but does
 not silently replace the selected SLAAC identity.
 
+NDP is deliberately stricter than RFC 4861: the SLLA/TLLA and Ethernet source
+MAC must identify the same sender. This fail-closed home-link rule excludes
+proxy-ND and VRRP-style virtual-router MAC indirection.
+
 The socket seam is equally narrow: IPv4 and IPv6 have separate UDP port spaces
 and no dual-family socket. IPv6 binds are wildcard-only, report `[::]:port` as
 their local bind, and choose a wire source per destination; pretending to honor
@@ -387,11 +393,12 @@ a specific local address is forbidden.
 Absent: congestion control, out-of-order reassembly/SACK, TCPv6, DHCPv6,
 IPv4-mapped dual-family sockets, active DAD, privacy or temporary addresses,
 multiple SLAAC identities, full NUD and automatic renumbering, MLD/IGMP,
-multicast outside link scope, ICMPv6 redirects and error/PMTUD state, IPv4 and
-IPv6 fragmentation, IPv4 options, IPv6 extension headers and jumbograms, TCP
-timestamps/PAWS, Nagle, SYN cookies, urgent-data API, inbound IP broadcast,
-and data-path logging. [`leannet/DESIGN.md`](leannet/DESIGN.md) explains why
-and when a feature may return.
+multicast outside link scope, proxy-ND and VRRP-style MAC indirection, ICMPv6
+redirects and error/PMTUD state, IPv4 and IPv6 fragmentation, IPv4 options,
+IPv6 extension headers and jumbograms, TCP timestamps/PAWS, Nagle, SYN
+cookies, urgent-data API, inbound IP broadcast, and data-path logging.
+[`leannet/DESIGN.md`](leannet/DESIGN.md) explains why and when a feature may
+return.
 
 ## Consumer obligations
 

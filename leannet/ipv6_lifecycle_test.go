@@ -49,7 +49,7 @@ func TestUDP6NDPWaiterLifecycle(t *testing.T) {
 			s.mu.Unlock()
 			t.Fatal("pending NDP entry disappeared")
 		}
-		e.tries = arpQueryTries
+		e.tries = neighborQueryTries
 		e.due = s.now()
 		s.drain6Locked(s.now())
 		s.mu.Unlock()

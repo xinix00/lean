@@ -2193,7 +2193,7 @@ func TestARPResolveVerdringtGeleerd(t *testing.T) {
 	if _, ok := tab.resolve(want, 0); ok {
 		t.Fatal("een verse resolve kan niet meteen opgelost zijn")
 	}
-	if e, exists := tab.entries[want]; !exists || e.state != arpPending {
+	if e, exists := tab.entries[want]; !exists || e.state != neighborPending {
 		t.Fatal("resolve op een volle tabel maakte geen pending entry — de verdringing werkt niet")
 	}
 	if len(tab.entries) > arpCacheCap {
@@ -2313,7 +2313,7 @@ func TestRefuseRSTStartGeenARPQuery(t *testing.T) {
 	_, exists := s.arp.entries[src]
 	n, pending := len(s.arp.entries), 0
 	for _, e := range s.arp.entries {
-		if e.state == arpPending {
+		if e.state == neighborPending {
 			pending++
 		}
 	}
@@ -2348,7 +2348,7 @@ func TestRefuseRSTNaarGatewayStartWelEenQuery(t *testing.T) {
 	s.mu.Lock()
 	e, exists := s.arp.entries[gw]
 	s.mu.Unlock()
-	if !exists || e.state != arpPending {
+	if !exists || e.state != neighborPending {
 		t.Fatal("de RST naar een off-subnet peer startte geen gateway-query — de weigering verdampt op een verse node")
 	}
 }
@@ -2652,7 +2652,7 @@ func TestCapaciteitssweepLaatPendingMetRust(t *testing.T) {
 
 	for i := 0; i < arpCacheCap; i++ {
 		ip := [4]byte{10, 0, byte(i >> 8), byte(i)}
-		tbl.entries[ip] = &arpEntry{state: arpPending, tries: arpQueryTries, due: now - 1}
+		tbl.entries[ip] = &neighborEntry{state: neighborPending, tries: neighborQueryTries, due: now - 1}
 	}
 
 	tbl.resolve([4]byte{10, 0, 200, 200}, now)
@@ -2661,7 +2661,7 @@ func TestCapaciteitssweepLaatPendingMetRust(t *testing.T) {
 		t.Fatalf("GaveUp = %d buiten de pomp om — die transitie is van emit", tbl.cnt.GaveUp)
 	}
 	for ip, e := range tbl.entries {
-		if e.state != arpPending {
+		if e.state != neighborPending {
 			t.Fatalf("%v is %v geworden buiten de pomp om", ip, e.state)
 		}
 	}
@@ -2682,7 +2682,7 @@ func wachtOpPending(t *testing.T, s *Stack, ip [4]byte) {
 	for begin := time.Now(); time.Since(begin) < 2*time.Second; {
 		s.mu.Lock()
 		e, ok := s.arp.entries[ip]
-		pending := ok && e.state == arpPending
+		pending := ok && e.state == neighborPending
 		s.mu.Unlock()
 		if pending {
 			return
@@ -2762,7 +2762,7 @@ func TestSeedRespecteertTotaalcap(t *testing.T) {
 	a, _ := newStackPair(t, 0, 0)
 	a.mu.Lock()
 	for i := 0; i < 65; i++ {
-		a.arp.entries[[4]byte{10, 0, 0, byte(3 + i)}] = &arpEntry{state: arpPending, due: a.now()}
+		a.arp.entries[[4]byte{10, 0, 0, byte(3 + i)}] = &neighborEntry{state: neighborPending, due: a.now()}
 	}
 	a.mu.Unlock()
 	geplant := 0
@@ -2789,10 +2789,10 @@ func TestResolveVerdringtTotErRuimteIs(t *testing.T) {
 	over := func(evictable int) *arpTable {
 		tbl := newARPTable([4]byte{10, 0, 0, 1}, [6]byte{2, 0, 0, 0, 0, 1})
 		for i := 0; i < arpCacheCap+1-evictable; i++ {
-			tbl.entries[[4]byte{10, 1, byte(i >> 8), byte(i)}] = &arpEntry{state: arpPending, due: now}
+			tbl.entries[[4]byte{10, 1, byte(i >> 8), byte(i)}] = &neighborEntry{state: neighborPending, due: now}
 		}
 		for i := 0; i < evictable; i++ {
-			tbl.entries[[4]byte{10, 2, 0, byte(i)}] = &arpEntry{state: arpResolved, born: now}
+			tbl.entries[[4]byte{10, 2, 0, byte(i)}] = &neighborEntry{state: neighborResolved, born: now}
 		}
 		return tbl
 	}
@@ -2800,7 +2800,7 @@ func TestResolveVerdringtTotErRuimteIs(t *testing.T) {
 	tbl := over(2)
 	doel := [4]byte{10, 3, 0, 1}
 	tbl.resolve(doel, now)
-	if e, ok := tbl.entries[doel]; !ok || e.state != arpPending {
+	if e, ok := tbl.entries[doel]; !ok || e.state != neighborPending {
 		t.Fatal("resolve startte geen query terwijl er (na twee verdringingen) ruimte was")
 	}
 	if len(tbl.entries) > arpCacheCap {
@@ -2901,7 +2901,7 @@ func TestStatischeGatewayNegeertVolleTabel(t *testing.T) {
 	a.cfg.GW = [4]byte{10, 0, 0, 2}
 	a.gwMAC, a.hasGwMAC = [6]byte{2, 0, 0, 0, 0, 2}, true
 	for i := 0; i < arpCacheCap; i++ {
-		a.arp.entries[[4]byte{10, 0, 1, byte(i)}] = &arpEntry{state: arpPending, due: a.now()}
+		a.arp.entries[[4]byte{10, 0, 1, byte(i)}] = &neighborEntry{state: neighborPending, due: a.now()}
 	}
 	a.mu.Unlock()
 

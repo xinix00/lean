@@ -152,7 +152,7 @@ type Stats struct {
 
 // ARPStats contains ARP machine counters.
 type ARPStats struct {
-	GaveUp     int // queries abandoned after arpQueryTries attempts
+	GaveUp     int // queries abandoned after neighborQueryTries attempts
 	Ignored    int // replies neither addressed to us nor gratuitous
 	MACChanged int // refreshes that changed an existing entry's MAC
 	ReplyDrop  int // replies dropped because their queue was full
@@ -742,17 +742,7 @@ func (s *Stack) nextDeadlineLocked() int64 {
 	for _, c := range s.conns {
 		add(c.tcp.nextDeadline())
 	}
-	for _, e := range s.arp.entries {
-		switch e.state {
-		case arpPending:
-			add(e.due)
-		case arpFailed:
-			add(e.born + arpFailTTL)
-		case arpResolved:
-			// No wakeup: every lookup expires lazily and capacity paths sweep.
-			// Memory is already capped, so periodic cleanup would only cost idle CPU.
-		}
-	}
+	s.arp.nextDeadline(add)
 	if s.v6 != nil {
 		s.v6.ndp.nextDeadline(add)
 	}

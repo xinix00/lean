@@ -3,10 +3,9 @@ package leannet
 // ndp.go implements the neighbor half of NDP (RFC 4861) the way arp.go
 // implements ARP: no goroutines or clock, callers pass monotonic nanoseconds,
 // the stack lock covers every operation, and the pump polls resolve until it
-// gets a MAC or noAnswer reports failure. The lifecycle constants are ARP's;
-// the RFC's full reachability state machine (REACHABLE/STALE/PROBE) is
-// deliberately absent — the ARP model has served the IPv4 half on the same
-// links, and a wrong entry ages out on the same TTL.
+// gets a MAC or noAnswer reports failure. neighborTable owns their shared
+// lifecycle; RFC 4861's full REACHABLE/STALE/PROBE machine is deliberately
+// absent, and a wrong entry ages out on the same bounded TTL as IPv4.
 //
 // The router side (RS/RA with prefix and route options) lives here too: it is
 // a few fields, and the emitter that sends solicitations is shared. SLAAC
@@ -18,7 +17,7 @@ package leannet
 
 import "encoding/binary"
 
-// Caps mirror arp.go where a v6 twin exists.
+// NDP-specific queue and router-state caps.
 const (
 	ndpReplyQueueCap = 8
 	ndpCacheCap      = 128
@@ -35,7 +34,7 @@ type NDPStats struct {
 	FullDrop   int // resolutions refused because the table was full
 	ReplyDrop  int // NA replies dropped by the queue cap
 	MACChanged int // resolved entries whose MAC changed
-	Ignored    int // advertisements that matched no query of ours
+	Ignored    int // advertisements that matched no refreshable entry
 	BadNDP     int // NDP packets that failed validation (hop limit, options)
 }
 
@@ -48,11 +47,11 @@ type ndpReply struct {
 }
 
 // ndpTable maps IPv6 addresses to MACs and drives solicitations. Entries reuse
-// arpEntry: the lifecycle (pending/resolved/failed, TTLs, tries) is identical.
+// neighborEntry: the lifecycle (pending/resolved/failed, TTLs, tries) is identical.
 type ndpTable struct {
-	ourMAC [6]byte
+	neighborTable[[16]byte]
 
-	entries map[[16]byte]*arpEntry
+	ourMAC  [6]byte
 	replies []ndpReply
 
 	// Router solicitation state: emit sends up to ndpRSTries while no RA has
@@ -65,137 +64,35 @@ type ndpTable struct {
 }
 
 func newNDPTable(ourMAC [6]byte, now int64) *ndpTable {
-	return &ndpTable{ourMAC: ourMAC, entries: make(map[[16]byte]*arpEntry), rsDue: now}
-}
-
-// tick, resolve, peek, noAnswer, learn, and refresh mirror arp.go exactly; the
-// shared arpEntry keeps the two machines honest about staying identical.
-
-func (t *ndpTable) tick(ip [16]byte, e *arpEntry, now int64) bool {
-	switch e.state {
-	case arpPending:
-	case arpResolved:
-		if !e.static && now-e.born >= arpEntryTTL {
-			delete(t.entries, ip)
-			return false
-		}
-	case arpFailed:
-		if now-e.born >= arpFailTTL {
-			delete(t.entries, ip)
-			return false
-		}
+	return &ndpTable{
+		neighborTable: newNeighborTable[[16]byte](ndpCacheCap),
+		ourMAC:        ourMAC,
+		rsDue:         now,
 	}
-	return true
 }
 
 func (t *ndpTable) resolve(ip [16]byte, now int64) (mac [6]byte, ok bool) {
-	if e, exists := t.entries[ip]; exists && t.tick(ip, e, now) {
-		if e.state == arpResolved {
-			return e.mac, true
-		}
-		return mac, false
-	}
-	if !t.makeRoom(now) {
+	mac, ok, refused := t.neighborTable.resolve(ip, now)
+	if refused {
 		t.cnt.FullDrop++
-		return mac, false
 	}
-	t.entries[ip] = &arpEntry{state: arpPending, due: now}
-	return mac, false
-}
-
-func (t *ndpTable) makeRoom(now int64) bool {
-	if len(t.entries) < ndpCacheCap {
-		return true
-	}
-	t.sweepExpired(now)
-	for len(t.entries) >= ndpCacheCap {
-		if !t.evictResolved() {
-			return false
-		}
-	}
-	return true
-}
-
-func (t *ndpTable) sweepExpired(now int64) {
-	for ip, e := range t.entries {
-		t.tick(ip, e, now)
-	}
-}
-
-func (t *ndpTable) evictResolved() bool {
-	for ip, e := range t.entries {
-		if e.state == arpResolved && !e.static {
-			delete(t.entries, ip)
-			return true
-		}
-	}
-	return false
-}
-
-func (t *ndpTable) peek(ip [16]byte, now int64) (mac [6]byte, ok bool) {
-	if e, exists := t.entries[ip]; exists && t.tick(ip, e, now) && e.state == arpResolved {
-		return e.mac, true
-	}
-	return mac, false
-}
-
-func (t *ndpTable) noAnswer(ip [16]byte, now int64) bool {
-	e, exists := t.entries[ip]
-	if !exists {
-		return t.fullLocked(now)
-	}
-	return t.tick(ip, e, now) && e.state == arpFailed
-}
-
-func (t *ndpTable) fullLocked(now int64) bool {
-	if len(t.entries) < ndpCacheCap {
-		return false
-	}
-	t.sweepExpired(now)
-	evictable := 0
-	for _, e := range t.entries {
-		if e.state == arpResolved && !e.static {
-			evictable++
-		}
-	}
-	return len(t.entries)-evictable >= ndpCacheCap
+	return mac, ok
 }
 
 func (t *ndpTable) learn(ip [16]byte, mac [6]byte, now int64) (wokePending bool) {
-	e, exists := t.entries[ip]
-	if !exists || !t.tick(ip, e, now) {
-		if len(t.entries) >= ndpCacheCap {
-			t.sweepExpired(now)
-			if len(t.entries) >= ndpCacheCap {
-				t.cnt.LearnDrop++
-				return false
-			}
-		}
-		t.entries[ip] = &arpEntry{mac: mac, state: arpResolved, born: now}
-		return false
+	woke, dropped := t.neighborTable.learn(ip, mac, now)
+	if dropped {
+		t.cnt.LearnDrop++
 	}
-	switch {
-	case e.state == arpPending:
-		e.state = arpResolved
-		e.mac = mac
-		e.born = now
-		return true
-	case e.state == arpResolved && !e.static && e.mac == mac:
-		e.born = now
-	}
-	return false
+	return woke
 }
 
-func (t *ndpTable) refresh(ip [16]byte, mac [6]byte, now int64) {
-	e, exists := t.entries[ip]
-	if !exists || !t.tick(ip, e, now) || e.state != arpResolved || e.static {
-		return
-	}
-	if e.mac != mac {
+func (t *ndpTable) refresh(ip [16]byte, mac [6]byte, now int64) bool {
+	refreshed, changed := t.neighborTable.refresh(ip, mac, now)
+	if changed {
 		t.cnt.MACChanged++
-		e.mac = mac
 	}
-	e.born = now
+	return refreshed
 }
 
 // ---- receive side; the stack validated hop limit 255 and the checksum ----
@@ -222,12 +119,33 @@ func (t *ndpTable) recvNS(f ICMPv6Frame, src, dst [16]byte, srcHW [6]byte, ours 
 		}
 		return true
 	})
+	if !valid {
+		t.cnt.BadNDP++
+		return
+	}
+	// RFC 4861 §7.1.1: target is a usable unicast address.
+	if isZero6(target) || isMulticast6(target) || isLoopback6(target) || isIPv4Mapped6(target) ||
+		!validUnicastMAC(srcHW) {
+		t.cnt.BadNDP++
+		return
+	}
 	dad := isZero6(src)
-	if !valid || isZero6(target) || isMulticast6(target) || isLoopback6(target) || isIPv4Mapped6(target) ||
-		!validUnicastMAC(srcHW) || (dad && (hasSrc || dst != solicitedNode(target))) ||
-		(!dad && (!validIngressSource6(src) || (dst != target && dst != solicitedNode(target)))) ||
-		(hasSrc && (!validUnicastMAC(srcMAC) || srcMAC != srcHW)) ||
-		(!dad && isMulticast6(dst) && !hasSrc) {
+	// RFC 4861 §7.1.1: DAD has no SLLA and targets the corresponding
+	// solicited-node group from the unspecified source.
+	if dad && (hasSrc || dst != solicitedNode(target)) {
+		t.cnt.BadNDP++
+		return
+	}
+	// RFC 4861 §§4.3, 7.1.1: an ordinary NS comes from unicast, is sent to the
+	// target or its solicited-node group, and multicast solicitation carries SLLA.
+	if !dad && (!validIngressSource6(src) || (dst != target && dst != solicitedNode(target)) ||
+		(isMulticast6(dst) && !hasSrc)) {
+		t.cnt.BadNDP++
+		return
+	}
+	// LEAN profile: an advertised link-layer address must exactly describe the
+	// Ethernet sender. Proxy-ND and virtual-router indirection are unsupported.
+	if hasSrc && (!validUnicastMAC(srcMAC) || srcMAC != srcHW) {
 		t.cnt.BadNDP++
 		return
 	}
@@ -278,24 +196,32 @@ func (t *ndpTable) recvNA(f ICMPv6Frame, src, dst [16]byte, srcHW [6]byte, now i
 		}
 		return true
 	})
+	if !valid {
+		t.cnt.BadNDP++
+		return false
+	}
+	// RFC 4861 §7.1.2: source and target are unicast and a solicited NA has a
+	// unicast destination.
 	solicited := body[0]&0x40 != 0
-	if !valid || !validIngressSource6(src) || !validIngressSource6(target) ||
-		!validUnicastMAC(srcHW) || (solicited && isMulticast6(dst)) ||
-		(hasMAC && (!validUnicastMAC(mac) || mac != srcHW)) {
+	if !validIngressSource6(src) || !validIngressSource6(target) ||
+		!validUnicastMAC(srcHW) || (solicited && isMulticast6(dst)) {
+		t.cnt.BadNDP++
+		return false
+	}
+	// LEAN profile: TLLA must be the Ethernet sender, just like SLLA above.
+	if hasMAC && (!validUnicastMAC(mac) || mac != srcHW) {
 		t.cnt.BadNDP++
 		return false
 	}
 	if !hasMAC {
 		return false // an advertisement without a link-layer address teaches nothing here
 	}
-	if e, exists := t.entries[target]; exists && t.tick(target, e, now) && e.state == arpPending {
-		e.state = arpResolved
-		e.mac = mac
-		e.born = now
+	if t.resolvePending(target, mac, now) {
 		return true
 	}
-	t.refresh(target, mac, now)
-	t.cnt.Ignored++
+	if !t.refresh(target, mac, now) {
+		t.cnt.Ignored++
+	}
 	return false
 }
 
@@ -311,7 +237,7 @@ type ndpEmit struct {
 
 // emit yields one queued advertisement, due solicitation, or router
 // solicitation. The caller loops until false. buf backs the body.
-func (t *ndpTable) emit(buf []byte, ourLL [16]byte, now int64) (e ndpEmit, ok bool) {
+func (t *ndpTable) emit(buf []byte, now int64) (e ndpEmit, ok bool) {
 	if len(t.replies) > 0 {
 		r := t.replies[0]
 		copy(t.replies, t.replies[1:])
@@ -331,18 +257,9 @@ func (t *ndpTable) emit(buf []byte, ourLL [16]byte, now int64) (e ndpEmit, ok bo
 		copy(body[22:28], t.ourMAC[:])
 		return ndpEmit{icmpType: icmp6NeighborAdvert, dstIP: r.dst, dstMAC: r.hw, body: body}, true
 	}
-	for ip, entry := range t.entries {
-		if !t.tick(ip, entry, now) || entry.state != arpPending || now < entry.due {
-			continue
-		}
-		if entry.tries >= arpQueryTries {
-			entry.state = arpFailed
-			entry.born = now
-			t.cnt.GaveUp++
-			continue
-		}
-		entry.tries++
-		entry.due = now + arpRetryIval
+	ip, query, gaveUp := t.poll(now)
+	t.cnt.GaveUp += gaveUp
+	if query {
 		// NS body: reserved(4) target(16) + source LLA option, to the
 		// target's solicited-node group (RFC 4861 §7.2.2).
 		body := buf[:28]
@@ -365,7 +282,6 @@ func (t *ndpTable) emit(buf []byte, ourLL [16]byte, now int64) (e ndpEmit, ok bo
 		}
 		body[4], body[5] = ndpOptSourceLLA, 1
 		copy(body[6:12], t.ourMAC[:])
-		_ = ourLL
 		return ndpEmit{icmpType: icmp6RouterSolicit, dstIP: allRouters6, dstMAC: multicastMAC6(allRouters6), body: body}, true
 	}
 	return ndpEmit{}, false
@@ -373,14 +289,7 @@ func (t *ndpTable) emit(buf []byte, ourLL [16]byte, now int64) (e ndpEmit, ok bo
 
 // nextDeadline mirrors arp entries plus the router-solicitation timer.
 func (t *ndpTable) nextDeadline(add func(int64)) {
-	for _, e := range t.entries {
-		switch e.state {
-		case arpPending:
-			add(e.due)
-		case arpFailed:
-			add(e.born + arpFailTTL)
-		}
-	}
+	t.neighborTable.nextDeadline(add)
 	if !t.rsDone && t.rsTries < ndpRSTries {
 		add(t.rsDue)
 	}
