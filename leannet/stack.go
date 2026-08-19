@@ -386,6 +386,16 @@ func (s *Stack) ingressLocked(eth EthFrame, now int64) {
 		if err != nil {
 			return // extension headers and truncations are noise, not faults
 		}
+		// Promiscuous/all-multicast NICs pass more than our subscriptions.
+		// IPv6 unicast must target this interface and multicast must carry
+		// the exact RFC 2464 mapping for its IP destination.
+		if dst := ip.Dst(); isMulticast6(dst) {
+			if [6]byte(eth.Dst()) != multicastMAC6(dst) {
+				return
+			}
+		} else if !toUs {
+			return
+		}
 		if !s.v6.acceptDst6(ip.Dst()) {
 			return
 		}
@@ -874,7 +884,7 @@ func (s *Stack) sendEthLocked(dst [6]byte, etherType uint16, payloadLen int) err
 		}
 	}
 	// Frames to our own MAC enter local ingress rather than the wire, providing
-	// loopback semantics on this stack's only address.
+	// loopback semantics for every IPv4 or IPv6 address this interface owns.
 	//
 	// Copy because txBuf is reused immediately. Overflow drops and TCP retransmits.
 	if dst == s.cfg.MAC {

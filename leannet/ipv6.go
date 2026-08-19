@@ -1,6 +1,6 @@
 package leannet
 
-// ipv6.go adds an opt-in IPv6 lane to the one-address stack, sized for what
+// ipv6.go adds an opt-in IPv6 lane beside the one-identity IPv4 stack, sized for what
 // needs it: Matter and mDNS on the local link. UDP and ICMPv6 only — no TCP
 // over v6, no extension headers, no DHCPv6, no global prefixes beyond one
 // SLAAC address. The lane does not exist until the first v6 socket or group
@@ -139,27 +139,33 @@ func (s *Stack) recvIPv6(ip IPv6Frame, srcMAC [6]byte, now int64) {
 		}
 		switch f.Type() {
 		case icmp6NeighborSolicit:
-			v6.ndp.recvNS(f, src, v6.ourAddr6, now)
+			v6.ndp.recvNS(f, src, ip.Dst(), srcMAC, v6.ourAddr6, now)
 			s.notify() // a queued advertisement may be ready
 		case icmp6NeighborAdvert:
-			if v6.ndp.recvNA(f, now) {
+			if v6.ndp.recvNA(f, src, ip.Dst(), srcMAC, now) {
 				s.notify() // a route waiter can proceed
 			}
 		case icmp6RouterAdvert:
-			if r, ok := v6.ndp.recvRA(f, src, s.cfg.MAC, now); ok {
-				s.applyRALocked(r)
+			if r, ok := v6.ndp.recvRA(f, src, ip.Dst(), srcMAC, s.cfg.MAC); ok {
+				s.applyRALocked(r, now)
 				s.notify()
 			}
 		case icmp6EchoRequest:
 			// Mirror the IPv4 echo: the free field diagnostic. Unicast only —
 			// answering multicast pings is how a link gets storms.
-			if !v6.ourAddr6(ip.Dst()) || len(s.out6) >= outQueueCap {
+			if f.Code() != 0 || len(f) < 8 || len(f) > ipv6MinimumMTU-sizeIPv6 || !validIngressSource6(src) ||
+				!v6.ourAddr6(ip.Dst()) || len(s.out6) >= outQueueCap {
 				if len(s.out6) >= outQueueCap {
 					s.stats.DropReplyFull++
 				}
+				if f.Code() != 0 || len(f) < 8 || len(f) > ipv6MinimumMTU-sizeIPv6 || !validIngressSource6(src) {
+					s.stats.DropBadFrame++
+				}
 				return
 			}
-			v6.ndp.learn(src, srcMAC, now)
+			if !v6.ourAddr6(src) && v6.onLink6(src) && validUnicastMAC(srcMAC) {
+				v6.ndp.learn(src, srcMAC, now)
+			}
 			reply := append([]byte(nil), f...)
 			reply[0] = icmp6EchoReply
 			reply[2], reply[3] = 0, 0
@@ -169,6 +175,10 @@ func (s *Stack) recvIPv6(ip IPv6Frame, srcMAC [6]byte, now int64) {
 			s.notify()
 		}
 	case ProtoUDP:
+		if !validIngressSource6(src) {
+			s.stats.DropBadFrame++
+			return
+		}
 		f, err := ParseUDP(ip.Payload())
 		if err != nil || !f.ChecksumOK6(src, ip.Dst()) {
 			s.stats.DropBadFrame++
@@ -176,7 +186,8 @@ func (s *Stack) recvIPv6(ip IPv6Frame, srcMAC [6]byte, now int64) {
 		}
 		// Learn only from unicast addressed to us, after checksum validation,
 		// mirroring the IPv4 discipline.
-		if v6.ourAddr6(ip.Dst()) && v6.ndp.learn(src, srcMAC, now) {
+		if v6.ourAddr6(ip.Dst()) && !v6.ourAddr6(src) && v6.onLink6(src) &&
+			validUnicastMAC(srcMAC) && v6.ndp.learn(src, srcMAC, now) {
 			s.notify()
 		}
 		if !v6.udp.deliver6(f.DstPort(), src, f.SrcPort(), f.Payload()) {
@@ -188,8 +199,12 @@ func (s *Stack) recvIPv6(ip IPv6Frame, srcMAC [6]byte, now int64) {
 }
 
 // applyRALocked folds one advertisement into the address and route state.
-func (s *Stack) applyRALocked(r raResult) {
+func (s *Stack) applyRALocked(r raResult, now int64) {
 	v6 := s.v6
+	v6.ndp.rsDone = true // any completely valid RA ends solicitation
+	if r.hasMAC {
+		v6.ndp.learn(r.router, r.mac, now)
+	}
 	if r.hasLifetime {
 		v6.router = r.router
 		v6.hasRouter = true
@@ -202,36 +217,63 @@ func (s *Stack) applyRALocked(r raResult) {
 		v6.global = r.slaac
 		v6.hasGlobal = true
 	}
-	for _, p := range r.onLink {
-		if len(v6.prefixes) >= ndpPrefixCap {
-			break
-		}
-		known := false
-		for _, have := range v6.prefixes {
-			if have == p {
-				known = true
+	for _, action := range r.prefixes {
+		found := -1
+		for i, have := range v6.prefixes {
+			if have == action.prefix {
+				found = i
 				break
 			}
 		}
-		if !known {
-			v6.prefixes = append(v6.prefixes, p)
+		if action.withdraw {
+			if found >= 0 {
+				copy(v6.prefixes[found:], v6.prefixes[found+1:])
+				v6.prefixes = v6.prefixes[:len(v6.prefixes)-1]
+			}
+			continue
+		}
+		if found < 0 && len(v6.prefixes) < ndpPrefixCap {
+			v6.prefixes = append(v6.prefixes, action.prefix)
 		}
 	}
-	for _, rt := range r.routes {
-		if len(v6.routes) >= ndpRouteCap {
-			break
-		}
-		known := false
-		for _, have := range v6.routes {
-			if have == rt {
-				known = true
+	for _, action := range r.routes {
+		found := -1
+		for i, have := range v6.routes {
+			if have.prefix == action.route.prefix && have.bits == action.route.bits {
+				found = i
 				break
 			}
 		}
-		if !known {
-			v6.routes = append(v6.routes, rt)
+		if action.withdraw {
+			// A late withdrawal from an old router must not erase the newer
+			// next hop that already replaced it for this prefix.
+			if found >= 0 && v6.routes[found].router == action.route.router {
+				copy(v6.routes[found:], v6.routes[found+1:])
+				v6.routes = v6.routes[:len(v6.routes)-1]
+			}
+			continue
+		}
+		if found >= 0 {
+			v6.routes[found] = action.route
+		} else if len(v6.routes) < ndpRouteCap {
+			v6.routes = append(v6.routes, action.route)
 		}
 	}
+}
+
+// onLink6 is the passive-learning boundary. A routed peer's Ethernet source
+// is its router, so caching the remote IPv6 address against that MAC would turn
+// a later route change into a stale direct-neighbor shortcut.
+func (v *v6State) onLink6(a [16]byte) bool {
+	if isLinkLocal6(a) {
+		return true
+	}
+	for _, p := range v.prefixes {
+		if prefixMatch6(a, p.prefix, p.bits) {
+			return true
+		}
+	}
+	return false
 }
 
 // nextHop6Locked mirrors nextHopLocked: which address's NDP state governs dst.
@@ -283,6 +325,9 @@ func (s *Stack) route6Locked(dst [16]byte, now int64, query bool) ([6]byte, bool
 
 // sendIPv6Locked wraps payload in IPv6+Ethernet from txBuf and transmits.
 func (s *Stack) sendIPv6Locked(dstMAC [6]byte, src, dst [16]byte, next, hopLimit byte, payload []byte) error {
+	if sizeIPv6+len(payload) > ipv6MinimumMTU {
+		return errors.New("leannet: IPv6 packet exceeds fixed 1280-byte ceiling")
+	}
 	off := EthernetHeaderSize
 	copy(s.txBuf[off+sizeIPv6:], payload)
 	PutIPv6(s.txBuf[off:], next, hopLimit, src, dst, len(payload))
@@ -311,12 +356,12 @@ func (s *Stack) drain6Locked(now int64) {
 	}
 	for _, o := range s.out6 {
 		if mac, ok := s.route6Locked(o.dst, now, false); ok {
-			src, _ := v6.srcAddr6For(o.dst)
-			hop := byte(hopLimitDefault)
-			if o.next == ProtoICMPv6 {
-				hop = hopLimitNDP // echo replies mirror ping's expectations
+			src, routable := v6.srcAddr6For(o.dst)
+			if !routable {
+				continue
 			}
-			s.sendIPv6Locked(mac, src, o.dst, o.next, hop, o.pkt)
+			// Only NDP uses hop limit 255. Echo is ordinary unicast traffic.
+			s.sendIPv6Locked(mac, src, o.dst, o.next, hopLimitDefault, o.pkt)
 		}
 	}
 	s.out6 = s.out6[:0]
@@ -373,6 +418,9 @@ func (s *Stack) ListenUDP6(port uint16) (*udpSock, error) {
 
 // DialUDP6 binds an ephemeral v6 port connected to one peer.
 func (s *Stack) DialUDP6(raddr [16]byte, rport uint16) (*udpSock, error) {
+	if rport == 0 || !validUDP6Remote(raddr) {
+		return nil, errInvalidUDP6Remote
+	}
 	u, err := s.ListenUDP6(0)
 	if err != nil {
 		return nil, err
@@ -389,11 +437,11 @@ func (u *udpSock) writeUDP6(p []byte, dst [16]byte, dport uint16) (int, error) {
 	if err := u.s.closedFirst(func() bool { return u.port.closed }); err != nil {
 		return 0, err
 	}
-	if isMulticast6(dst) && !isLinkScopedMulticast6(dst) {
-		return 0, errNotLinkMcast6
+	if !validAppDst6(dst) || dport == 0 {
+		return 0, errInvalidUDP6Remote
 	}
-	if len(p) > MTU-sizeIPv6-sizeUDP {
-		return 0, errors.New("leannet: udp datagram exceeds mtu")
+	if len(p) > maxUDP6Payload {
+		return 0, errors.New("leannet: udp6 datagram exceeds fixed 1280-byte ceiling")
 	}
 	s := u.s
 	var sent int
@@ -407,6 +455,11 @@ func (u *udpSock) writeUDP6(p []byte, dst [16]byte, dport uint16) (int, error) {
 				return false, errV6Disabled
 			}
 			src, routable := v6.srcAddr6For(dst)
+			if !routable {
+				// A cached router MAC does not make a link-local source usable
+				// off-link. Check this before the cache-hit send path.
+				return false, errNoRoute6
+			}
 			now := s.now()
 			if mac, ok := s.route6Locked(dst, now, true); ok {
 				off := EthernetHeaderSize + sizeIPv6
@@ -429,11 +482,6 @@ func (u *udpSock) writeUDP6(p []byte, dst [16]byte, dport uint16) (int, error) {
 			hop, ok := s.nextHop6Locked(dst)
 			if !ok {
 				return false, errNoRoute6 // no router: an answer, not a wait
-			}
-			if !routable && !isLinkLocal6(dst) {
-				// Off-link with only a link-local source cannot be answered;
-				// fail now instead of after five silent solicitations.
-				return false, errNoRoute6
 			}
 			if v6.ndp.noAnswer(hop, now) {
 				return false, errUnreachable6

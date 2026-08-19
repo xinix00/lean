@@ -7,7 +7,7 @@ package leannet
 //
 // Deliberately absent, like the rest of this stack: extension headers and
 // fragmentation. Matter and mDNS on a home link use neither; a packet that
-// carries one is dropped and counted, never silently half-parsed.
+// carries one is rejected by the parser and never silently half-parsed.
 
 import (
 	"encoding/binary"
@@ -27,6 +27,14 @@ const ProtoICMPv6 byte = 58
 
 // sizeIPv6 is the fixed IPv6 header: no options, extensions are next-headers.
 const sizeIPv6 = 40
+
+// ipv6MinimumMTU is also this stack's fixed transmit ceiling. Without
+// fragmentation or Packet Too Big handling, emitting anything larger would
+// make a successful UDP write depend on a path property we do not measure.
+const (
+	ipv6MinimumMTU = 1280
+	maxUDP6Payload = ipv6MinimumMTU - sizeIPv6 - sizeUDP
+)
 
 // hopLimitNDP is mandatory on every NDP packet (RFC 4861 §3): a hop limit
 // below 255 proves the packet crossed a router and must be discarded.
@@ -126,12 +134,12 @@ func (f UDPFrame) ChecksumOK6(src, dst [16]byte) bool {
 
 // ICMPv6 types handled by this stack.
 const (
-	icmp6EchoRequest      byte = 128
-	icmp6EchoReply        byte = 129
-	icmp6RouterSolicit    byte = 133
-	icmp6RouterAdvert     byte = 134
-	icmp6NeighborSolicit  byte = 135
-	icmp6NeighborAdvert   byte = 136
+	icmp6EchoRequest     byte = 128
+	icmp6EchoReply       byte = 129
+	icmp6RouterSolicit   byte = 133
+	icmp6RouterAdvert    byte = 134
+	icmp6NeighborSolicit byte = 135
+	icmp6NeighborAdvert  byte = 136
 )
 
 // NDP option types.
@@ -156,12 +164,13 @@ func ParseICMPv6(b []byte, src, dst [16]byte) (ICMPv6Frame, error) {
 }
 
 func (f ICMPv6Frame) Type() byte   { return f[0] }
+func (f ICMPv6Frame) Code() byte   { return f[1] }
 func (f ICMPv6Frame) Body() []byte { return f[4:] }
 
 // ndpOptions walks the TLV options that follow an NDP body. Each visit gets
 // the type and the full option (including its two header bytes). A zero
 // length octet is a mandated discard of the whole packet (RFC 4861 §4.6).
-func ndpOptions(b []byte, visit func(typ byte, opt []byte)) bool {
+func ndpOptions(b []byte, visit func(typ byte, opt []byte) bool) bool {
 	for len(b) > 0 {
 		if len(b) < 2 || b[1] == 0 {
 			return false
@@ -170,7 +179,9 @@ func ndpOptions(b []byte, visit func(typ byte, opt []byte)) bool {
 		if n > len(b) {
 			return false
 		}
-		visit(b[0], b[:n])
+		if !visit(b[0], b[:n]) {
+			return false
+		}
 		b = b[n:]
 	}
 	return true
@@ -236,6 +247,60 @@ func isLinkScopedMulticast6(a [16]byte) bool { return a[0] == 0xff && a[1] == 0x
 
 // isZero6 reports the unspecified address (::).
 func isZero6(a [16]byte) bool { return a == ([16]byte{}) }
+
+// isLoopback6 reports ::1. It is not one of this stack's owned addresses and
+// accepting it on Ethernet would manufacture a second loopback model.
+func isLoopback6(a [16]byte) bool {
+	return a == ([16]byte{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1})
+}
+
+// isIPv4Mapped6 reports ::ffff:a.b.c.d. The IPv4 and IPv6 socket spaces are
+// deliberately separate; mapped addresses must not bridge them implicitly.
+func isIPv4Mapped6(a [16]byte) bool {
+	return a[0] == 0 && a[1] == 0 && a[2] == 0 && a[3] == 0 &&
+		a[4] == 0 && a[5] == 0 && a[6] == 0 && a[7] == 0 &&
+		a[8] == 0 && a[9] == 0 && a[10] == 0xff && a[11] == 0xff
+}
+
+// validAppDst6 is the single public-send address policy used by the direct
+// and SocketFunc seams. Link-scoped multicast is an application destination;
+// unspecified, loopback, mapped, and wider multicast addresses are not.
+func validAppDst6(a [16]byte) bool {
+	if isZero6(a) || isLoopback6(a) || isIPv4Mapped6(a) {
+		return false
+	}
+	return !isMulticast6(a) || isLinkScopedMulticast6(a)
+}
+
+// validIngressSource6 is stricter: multicast is never a valid IPv6 source.
+// The sole unspecified-source exception (a passive-DAD NS) is admitted by the
+// NDP validator, not by application traffic.
+func validIngressSource6(a [16]byte) bool {
+	return validAppDst6(a) && !isMulticast6(a)
+}
+
+func validUnicastMAC(mac [6]byte) bool {
+	return mac != ([6]byte{}) && mac[0]&1 == 0
+}
+
+// canonicalPrefix6 zeros all bits outside a prefix. RA identity, replacement,
+// and withdrawal must not depend on ignored host bits supplied by a router.
+func canonicalPrefix6(a [16]byte, bits int) [16]byte {
+	if bits < 0 || bits > 128 {
+		return [16]byte{}
+	}
+	n := bits / 8
+	if n < len(a) {
+		if r := bits % 8; r != 0 {
+			a[n] &= byte(0xff << (8 - r))
+			n++
+		}
+		for i := n; i < len(a); i++ {
+			a[i] = 0
+		}
+	}
+	return a
+}
 
 // prefixMatch6 reports whether a and b share their first bits bits.
 func prefixMatch6(a, b [16]byte, bits int) bool {

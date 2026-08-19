@@ -4,24 +4,24 @@ Outstanding work by package. [README.md](README.md) defines the rule for new
 packages; new features in existing packages follow the same rule: a measurement
 must show that their absence has a cost.
 
-## leannet — complete, but not tested on hardware
+## leannet — bounded profile, with hardware gates still open
 
 Built on 2026-08-11/12 to replace lneto+go-net in HopOS. See
 [leannet/DESIGN.md](leannet/DESIGN.md) for the design, trade-offs, and deliberate
 omissions.
 
-Status: the full test suite, including `-race`, passes; the stack compiles with
-the tamago toolchain for riscv64 and arm64. HopOS runs entirely on it in QEMU
-(agent + leader, SNTP, DNS, a TLS download from GitHub, 20/20 slot-demo markers,
-200 clean connection churn cycles, and 8 held connections plus a fresh one 200
-times).
+Status: the release gate requires regular tests, the race detector, vet, and
+TamaGo builds. HopOS has run the IPv4 chain in QEMU
+(agent + leader, SNTP, DNS, a TLS download from GitHub, slot demos, connection
+churn, and listener-pressure scenarios). QEMU is not evidence for the physical
+NIC behavior required by native IPv6.
 
 **Flaky test fixed on 2026-08-12.** `TestStackBudgetRecovery` failed once during
 a full `-race` run (an assertion, not a data race). The server closed immediately
 after Accept, so whether the slot was still occupied depended on TIME-WAIT
 (~1 s) expiring before the second dial. The race detector made that timing more
-likely. The server now holds the connection until the test releases it. Six
-isolated `-race` runs and two full `-race` runs passed.
+likely. The server now holds the connection until the test releases it; the
+normal race gate protects that lifecycle.
 
 **Built after v0.2.0 (2026-08-12) — two gaps found by hardware:**
 
@@ -32,7 +32,7 @@ isolated `-race` runs and two full `-race` runs passed.
       update, hiding the cause five layers away. `routeLocked` now returns the
       local MAC for the local IP, `sendEthLocked` queues those frames for
       loopback, and the pump passes them through the normal ingress demux
-      (`ingressLocked`). Covered for TCP and UDP by three regression tests.
+      (`ingressLocked`). Covered for TCP and UDP by regression tests.
 - [x] **RST for a closed port** (RFC 9293 §3.10.7.1). Previously every dial to
       an unused port waited for its deadline instead of returning
       `connection refused`. An RST never elicits another RST; the storm case is
@@ -46,13 +46,29 @@ isolated `-race` runs and two full `-race` runs passed.
       ARP. DHCP rebinding needs this path. Inbound broadcast remains disabled;
       DESIGN.md explains why.
 
-**First, and the only material open question:**
+**IPv6 profile added for Matter (2026-08-18):**
+
+The lane is opt-in on the first IPv6 UDP socket or `JoinGroup6`. It carries
+UDP6 plus bounded ICMPv6/NDP, one EUI-64 link-local address, the first SLAAC
+identity from an autonomous `/64`, and capped PIO/RIO/default-router state.
+Sockets are wildcard-bound and v6-only; output stops at the 1280-byte IPv6
+minimum MTU (1232-byte UDP payload). TCPv6, DHCPv6, extension headers,
+fragmentation/PMTUD, wider multicast, full NUD, and automatic renumbering are
+deliberately outside the KAM.
+
+**Open hardware evidence:**
 
 - [ ] **Verify on hardware.** Test a LicheeRV Nano (RISC-V, 100 Mbit dwmac) and
       Radxa Zero 3E. The previous stack set the bar at RX ≥ 8.84 MB/s without
       drops and survival past 250 seconds. QEMU cannot answer this: slirp
       terminates TCP on the host, giving the guest microsecond RTTs and hiding
       real window and DMA-chain behavior.
+- [ ] **Run the staged IPv6 hardware gate from [KAM.md](KAM.md).** First prove
+      slot-to-slot link-local UDP6 echo. Then prove one real Thread border
+      router exchange from RA through SLAAC and RIO to UDP `:5540` and back,
+      plus an explicit `ff02::fb` join. Every NIC advertised for this path must
+      pass relevant `33:33` multicast and synthetic slot-MAC unicast, or be
+      explicitly excluded from the IPv6 hardware scope.
 - [ ] **Run a netmeter A/B** using the bench that judged the previous two stack
       changes (`hop-os/metal/cmd/netmeter`). Compare RX/TX ceilings,
       allocations per phase, and GC pressure with lneto.
@@ -78,8 +94,11 @@ isolated `-race` runs and two full `-race` runs passed.
       racy reads of exported counters.
 
 **Deliberately absent** (see DESIGN.md): congestion control, out-of-order
-reassembly/SACK, IPv6/NDP, IPv4 fragmentation, TCP timestamps/PAWS, Nagle,
-SYN cookies, stack logging, and a second global buffer pool.
+reassembly/SACK, TCPv6, DHCPv6, IPv4-mapped dual-family sockets, full NUD,
+active DAD, multiple/privacy IPv6 addresses, automatic renumbering, IPv4/IPv6
+fragmentation, IPv6 extension headers, ICMPv6 redirect/error and PMTUD state,
+MLD/IGMP and wider multicast, TCP timestamps/PAWS, Nagle, SYN cookies, stack
+logging, and a second global buffer pool.
 
 ## leanhttp — extended on 2026-08-12 for browser basics
 
@@ -92,7 +111,7 @@ a real bug.
       callers such as leanhttps compose the two.
 - [x] **Keep-alive client** — one pool per host. A connection returns to the
       pool only after its body is read to EOF; otherwise the next request would
-      parse the previous response tail as its status line. Tests cover ten
+      parse the previous response tail as its status line. Tests cover repeated
       requests over one connection and partial bodies without desynchronizing.
 - [x] **Transparent gzip** — callers control `Accept-Encoding` (default:
       `identity`), and `Response.Encoding` reports the result. `compress/gzip`
@@ -193,9 +212,9 @@ HTTPS requires leantls's server half and is outside the current KAM.
 
 ## leandhcp — both items completed on 2026-08-12, now tested
 
-The package previously had no tests. It now has 30 tests, 95% coverage, and a
-clean `-race` run. The complete DORA handshake and lease lifecycle run against
-a fake NIC and socket in microseconds rather than hours.
+The package previously had no tests. Its regular and race gates now exercise
+the complete DORA handshake and lease lifecycle against a fake NIC and socket
+in microseconds rather than hours.
 
 - [x] **Separate `StateRenewing` and `StateRebinding`.** `KeepAlive` previously
       tried six unicast renewals 30 seconds apart, unrelated to the lease. When
@@ -211,8 +230,8 @@ a fake NIC and socket in microseconds rather than hours.
       In the worst case, the server had assigned the IP to this MAC while the
       node reported `no server answered` and booted offline. The clock is now
       checked only while the bounded ring is empty. REQUEST also gets a minimum
-      window because it binds state whereas DISCOVER does not. Two tests fail
-      reliably against the old code.
+      window because it binds state whereas DISCOVER does not. The regressions
+      fail reliably against the old code.
 - [x] Also fixed: DHCPNAK was ignored; it now returns `errRefused` and stops with
       `HOPOS_DHCP_NAK`. A sparse ACK could reset `LeaseSecs` to zero and silently
       disable maintenance; `merge` now preserves timers too.
@@ -249,7 +268,7 @@ a fake NIC and socket in microseconds rather than hours.
       development wiring only. Use the pinned Go 1.26.4 toolchain; consumer CI
       must not remain on Go 1.24.
 
-- [x] This repository is tagged through v0.6.0.
-- [ ] **Next tag:** only after the two KAM release gates above. Then update and
-      test consumers standalone in dependency order; temporary workspace and
-      `replace` wiring is not evidence.
+- [ ] **Next tag:** only after every relevant KAM release gate, including the
+      IPv6 source and hardware gates for any IPv6 path advertised as released.
+      Then update and test consumers standalone in dependency order; temporary
+      workspace and `replace` wiring is not release evidence.

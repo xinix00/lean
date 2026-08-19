@@ -41,6 +41,8 @@ const (
 	tcpBacklog = 8
 )
 
+var errInvalidUDP6Remote = errors.New("leannet: invalid IPv6 UDP remote address")
+
 // waitCtx waits for notification, deadline, or context cancellation. ctx may be
 // nil; that hot path avoids unnecessary select machinery when no deadline exists.
 //
@@ -602,10 +604,14 @@ func (u *udpSock) WriteTo(p []byte, addr net.Addr) (int, error) {
 	if u.v6 {
 		// The families never mix on one socket: a v6 socket writes v6 only,
 		// exactly like a kernel socket bound with IPV6_V6ONLY.
-		if ua.IP.To4() != nil || len(ua.IP.To16()) != 16 {
+		if ua.IP.To4() != nil || len(ua.IP.To16()) != net.IPv6len {
 			return 0, errors.New("leannet: WriteTo on a v6 socket needs an IPv6 *net.UDPAddr")
 		}
-		return u.writeUDP6(p, [16]byte(ua.IP.To16()), uint16(ua.Port))
+		dst := [16]byte(ua.IP.To16())
+		if !validUDP6Remote(dst) {
+			return 0, errInvalidUDP6Remote
+		}
+		return u.writeUDP6(p, dst, uint16(ua.Port))
 	}
 	dst, dport, ok := addrPort(addr)
 	if !ok {
@@ -691,8 +697,10 @@ func (u *udpSock) Close() error {
 
 func (u *udpSock) LocalAddr() net.Addr {
 	if u.v6 {
-		ll := llAddrFromMAC(u.s.cfg.MAC)
-		return &net.UDPAddr{IP: append(net.IP(nil), ll[:]...), Port: int(u.lport)}
+		// The socket is wildcard-bound. Source selection happens for each
+		// destination in writeUDP6; reporting one owned address here would
+		// falsely promise that the caller selected it as the bind identity.
+		return &net.UDPAddr{IP: append(net.IP(nil), net.IPv6zero...), Port: int(u.lport)}
 	}
 	return udpAddr(u.s.cfg.IP, u.lport)
 }
@@ -796,18 +804,12 @@ func (s *Stack) socket6(ctx context.Context, network string, sotype int, laddr, 
 		return nil, errors.New("leannet: unsupported local address")
 	}
 	if !isZero6(lip) {
-		// The lane owns two addresses at most (link-local and one SLAAC);
-		// wildcard binds cover both, and anything else is a caller bug.
-		s.mu.Lock()
-		v6 := s.enableV6Locked()
-		ours := v6.ourAddr6(lip)
-		s.mu.Unlock()
-		if !ours {
-			return nil, errors.New("leannet: local address is not this stack's address")
-		}
+		// The v6 lane deliberately exposes wildcard binds only. It chooses its
+		// link-local or SLAAC source per destination when writing.
+		return nil, errors.New("leannet: IPv6 local address must be wildcard")
 	}
 	rip, rport, okR := addrPort6(raddr)
-	if raddr != nil && (!okR || rport == 0) {
+	if raddr != nil && (!okR || rport == 0 || !validUDP6Remote(rip)) {
 		return nil, errors.New("leannet: unsupported remote address")
 	}
 	if raddr != nil {
@@ -817,6 +819,12 @@ func (s *Stack) socket6(ctx context.Context, network string, sotype int, laddr, 
 		return s.DialUDP6(rip, rport)
 	}
 	return s.ListenUDP6(lport)
+}
+
+// validUDP6Remote gives the socket seam one name for the shared IPv6
+// application-destination policy used by Socket, WriteTo, and DialUDP6.
+func validUDP6Remote(ip [16]byte) bool {
+	return validAppDst6(ip)
 }
 
 // addrPort6 extracts a v6 address and port; a v4 or v4-mapped address is not ok.

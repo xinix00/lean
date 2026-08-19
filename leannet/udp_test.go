@@ -3,9 +3,23 @@ package leannet
 import (
 	"bytes"
 	"testing"
+	"unsafe"
 )
 
 var udpTestSrc = [4]byte{10, 0, 0, 9}
+
+func TestUDPDatagramBudgetChargeCoversDescriptor(t *testing.T) {
+	wantDescriptorSize := uintptr(48)
+	if unsafe.Sizeof(uintptr(0)) == 4 {
+		wantDescriptorSize = 32
+	}
+	if got := unsafe.Sizeof(udpDatagram{}); got != wantDescriptorSize {
+		t.Fatalf("sizeof(udpDatagram) = %d, want %d; revisit its queue charge", got, wantDescriptorSize)
+	}
+	if udpDGramOverhead != 64 || uintptr(udpDGramOverhead) < wantDescriptorSize {
+		t.Fatalf("udpDGramOverhead = %d, want an honest 64-byte charge", udpDGramOverhead)
+	}
+}
 
 func TestUDPBindCloseRebind(t *testing.T) {
 	tab := newUDPTable()

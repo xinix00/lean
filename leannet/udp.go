@@ -19,9 +19,9 @@ var (
 	errUDPBudget    = errors.New("leannet: udp bind exceeds budget")
 )
 
-// udpDGramOverhead approximates the actual 64-bit heap cost of the descriptor
-// and allocation rounding. Wire overhead would undercount memory use.
-const udpDGramOverhead = 48
+// udpDGramOverhead charges the 48-byte 64-bit descriptor plus allocator
+// rounding for its private payload. Wire overhead would undercount memory use.
+const udpDGramOverhead = 64
 
 // udpDatagram stores one received datagram and its sender. The source is wide
 // enough for both families: IPv4 lives in the first four bytes with is6 false.

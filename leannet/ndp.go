@@ -22,10 +22,10 @@ import "encoding/binary"
 const (
 	ndpReplyQueueCap = 8
 	ndpCacheCap      = 128
-	ndpRSTries       = 3                     // solicitations before waiting for an unsolicited RA
-	ndpRSIval        = int64(4_000_000_000)  // RFC 4861 §6.3.7: 4s between RS
-	ndpPrefixCap     = 4                     // on-link prefixes retained from PIOs
-	ndpRouteCap      = 8                     // specific routes retained from RIOs
+	ndpRSTries       = 3                    // solicitations before waiting for an unsolicited RA
+	ndpRSIval        = int64(4_000_000_000) // RFC 4861 §6.3.7: 4s between RS
+	ndpPrefixCap     = 4                    // on-link prefixes retained from PIOs
+	ndpRouteCap      = 8                    // specific routes retained from RIOs
 )
 
 // NDPStats mirrors ARPStats for the v6 neighbor machine.
@@ -200,30 +200,41 @@ func (t *ndpTable) refresh(ip [16]byte, mac [6]byte, now int64) {
 
 // ---- receive side; the stack validated hop limit 255 and the checksum ----
 
-// recvNS handles a neighbor solicitation for one of our addresses: learn the
-// solicitor and queue a solicited advertisement (RFC 4861 §7.2.4).
-func (t *ndpTable) recvNS(f ICMPv6Frame, src [16]byte, ours func([16]byte) bool, now int64) {
+// recvNS handles a neighbor solicitation for one of our addresses. Every
+// supported invariant is checked before either the neighbor table or reply
+// queue changes (RFC 4861 §§7.1.1, 7.2.4).
+func (t *ndpTable) recvNS(f ICMPv6Frame, src, dst [16]byte, srcHW [6]byte, ours func([16]byte) bool, now int64) {
 	body := f.Body()
-	if len(body) < 20 {
+	if f.Code() != 0 || len(body) < 20 {
 		t.cnt.BadNDP++
 		return
 	}
 	target := [16]byte(body[4:20])
-	if !ours(target) {
-		return
-	}
 	var srcMAC [6]byte
 	hasSrc := false
-	if !ndpOptions(body[20:], func(typ byte, opt []byte) {
-		if typ == ndpOptSourceLLA && len(opt) == 8 {
+	valid := ndpOptions(body[20:], func(typ byte, opt []byte) bool {
+		if typ == ndpOptSourceLLA {
+			if hasSrc || len(opt) != 8 {
+				return false
+			}
 			copy(srcMAC[:], opt[2:8])
 			hasSrc = true
 		}
-	}) {
+		return true
+	})
+	dad := isZero6(src)
+	if !valid || isZero6(target) || isMulticast6(target) || isLoopback6(target) || isIPv4Mapped6(target) ||
+		!validUnicastMAC(srcHW) || (dad && (hasSrc || dst != solicitedNode(target))) ||
+		(!dad && (!validIngressSource6(src) || (dst != target && dst != solicitedNode(target)))) ||
+		(hasSrc && (!validUnicastMAC(srcMAC) || srcMAC != srcHW)) ||
+		(!dad && isMulticast6(dst) && !hasSrc) {
 		t.cnt.BadNDP++
 		return
 	}
-	if isZero6(src) {
+	if !ours(target) {
+		return
+	}
+	if dad {
 		// Someone else's DAD probe for an address we own: a duplicate MAC
 		// (see the header note). Advertise to all-nodes so they back off.
 		if len(t.replies) >= ndpReplyQueueCap {
@@ -233,38 +244,44 @@ func (t *ndpTable) recvNS(f ICMPv6Frame, src [16]byte, ours func([16]byte) bool,
 		t.replies = append(t.replies, ndpReply{hw: multicastMAC6(allNodes6), dst: allNodes6, target: target})
 		return
 	}
-	if hasSrc {
+	if hasSrc && !ours(src) {
 		t.learn(src, srcMAC, now)
-	}
-	mac, ok := t.peek(src, now)
-	if !ok {
-		return // no link-layer address to answer to; the solicitor will retry
 	}
 	if len(t.replies) >= ndpReplyQueueCap {
 		t.cnt.ReplyDrop++
 		return
 	}
-	t.replies = append(t.replies, ndpReply{hw: mac, dst: src, target: target, solicited: true})
+	// The Ethernet source is already validated against SLLA when present, and
+	// also lets us answer a valid unicast NS whose option was omitted.
+	t.replies = append(t.replies, ndpReply{hw: srcHW, dst: src, target: target, solicited: true})
 }
 
 // recvNA resolves a pending query or refreshes an entry (RFC 4861 §7.2.5).
 // Only the target address may gain state; unsolicited advertisements refresh
 // but never create, mirroring ARP's poisoning rule.
-func (t *ndpTable) recvNA(f ICMPv6Frame, now int64) (wokePending bool) {
+func (t *ndpTable) recvNA(f ICMPv6Frame, src, dst [16]byte, srcHW [6]byte, now int64) (wokePending bool) {
 	body := f.Body()
-	if len(body) < 20 {
+	if f.Code() != 0 || len(body) < 20 {
 		t.cnt.BadNDP++
 		return false
 	}
 	target := [16]byte(body[4:20])
 	var mac [6]byte
 	hasMAC := false
-	if !ndpOptions(body[20:], func(typ byte, opt []byte) {
-		if typ == ndpOptTargetLLA && len(opt) == 8 {
+	valid := ndpOptions(body[20:], func(typ byte, opt []byte) bool {
+		if typ == ndpOptTargetLLA {
+			if hasMAC || len(opt) != 8 {
+				return false
+			}
 			copy(mac[:], opt[2:8])
 			hasMAC = true
 		}
-	}) {
+		return true
+	})
+	solicited := body[0]&0x40 != 0
+	if !valid || !validIngressSource6(src) || !validIngressSource6(target) ||
+		!validUnicastMAC(srcHW) || (solicited && isMulticast6(dst)) ||
+		(hasMAC && (!validUnicastMAC(mac) || mac != srcHW)) {
 		t.cnt.BadNDP++
 		return false
 	}
@@ -384,6 +401,18 @@ type v6route struct {
 	router [16]byte // link-local address of the advertising router
 }
 
+// RA actions retain explicit zero-lifetime withdrawals until ipv6.go commits
+// the fully validated advertisement. They are not stored in the route tables.
+type raPrefix struct {
+	prefix   v6prefix
+	withdraw bool
+}
+
+type raRoute struct {
+	route    v6route
+	withdraw bool
+}
+
 // raResult is what one router advertisement taught the stack; ipv6.go applies
 // it to the address and route state under the same lock.
 type raResult struct {
@@ -391,16 +420,20 @@ type raResult struct {
 	hasLifetime bool     // router lifetime > 0: usable as default router
 	slaac       [16]byte // address formed from the first autonomous prefix
 	hasSLAAC    bool
-	onLink      []v6prefix
-	routes      []v6route
+	prefixes    []raPrefix
+	routes      []raRoute
+	hasMAC      bool
+	mac         [6]byte
 }
 
-// recvRA parses an advertisement, learns the router's MAC, and reports what it
-// carried. Lifetimes are deliberately not tracked per entry: home routers
-// re-advertise every few minutes, far inside ARP-style TTLs, and a vanished
-// router fails visibly at the neighbor layer when its entry expires.
-func (t *ndpTable) recvRA(f ICMPv6Frame, src [16]byte, ourMAC [6]byte, now int64) (r raResult, ok bool) {
-	if !isLinkLocal6(src) {
+// recvRA parses an advertisement without changing any table. The caller
+// commits r only after this function has validated the complete option list,
+// so a malformed suffix cannot leave a learned MAC or partial route behind.
+// Wall-clock lifetimes are deliberately absent, but explicit zero values are
+// retained as withdrawal actions.
+func (t *ndpTable) recvRA(f ICMPv6Frame, src, dst [16]byte, srcHW, ourMAC [6]byte) (r raResult, ok bool) {
+	if f.Code() != 0 || !isLinkLocal6(src) || !validUnicastMAC(srcHW) ||
+		(isMulticast6(dst) && dst != allNodes6) {
 		t.cnt.BadNDP++
 		return r, false // RFC 4861 §6.1.2: routers advertise from link-local
 	}
@@ -411,30 +444,45 @@ func (t *ndpTable) recvRA(f ICMPv6Frame, src [16]byte, ourMAC [6]byte, now int64
 	}
 	r.router = src
 	r.hasLifetime = binary.BigEndian.Uint16(body[2:4]) > 0
-	valid := ndpOptions(body[12:], func(typ byte, opt []byte) {
+	valid := ndpOptions(body[12:], func(typ byte, opt []byte) bool {
 		switch typ {
 		case ndpOptSourceLLA:
-			if len(opt) == 8 {
-				var mac [6]byte
-				copy(mac[:], opt[2:8])
-				t.learn(src, mac, now)
+			if r.hasMAC || len(opt) != 8 {
+				return false
+			}
+			copy(r.mac[:], opt[2:8])
+			r.hasMAC = true
+			if !validUnicastMAC(r.mac) || r.mac != srcHW {
+				return false
 			}
 		case ndpOptPrefixInfo:
 			if len(opt) != 32 {
-				return
+				return false
 			}
 			bits := int(opt[2])
 			flags := opt[3]
 			validLife := binary.BigEndian.Uint32(opt[4:8])
-			if bits > 128 || validLife == 0 {
-				return
+			preferredLife := binary.BigEndian.Uint32(opt[8:12])
+			if bits > 128 || preferredLife > validLife {
+				return false
 			}
-			prefix := [16]byte(opt[16:32])
+			prefix := canonicalPrefix6([16]byte(opt[16:32]), bits)
+			// RFC 4861 excludes link-local prefixes from PIO processing; a
+			// multicast prefix can never describe on-link unicast or SLAAC.
+			if isLinkLocal6(prefix) || isMulticast6(prefix) {
+				return false
+			}
+			key := v6prefix{prefix: prefix, bits: bits}
+			for _, have := range r.prefixes {
+				if have.prefix == key {
+					return false
+				}
+			}
 			if flags&0x80 != 0 { // L: on-link
-				r.onLink = append(r.onLink, v6prefix{prefix: prefix, bits: bits})
+				r.prefixes = append(r.prefixes, raPrefix{prefix: key, withdraw: validLife == 0})
 			}
 			// A: autonomous — form one SLAAC address from the first /64.
-			if flags&0x40 != 0 && bits == 64 && !r.hasSLAAC {
+			if flags&0x40 != 0 && bits == 64 && validLife > 0 && !r.hasSLAAC {
 				addr := prefix
 				iid := llAddrFromMAC(ourMAC)
 				copy(addr[8:], iid[8:])
@@ -442,23 +490,39 @@ func (t *ndpTable) recvRA(f ICMPv6Frame, src [16]byte, ourMAC [6]byte, now int64
 				r.hasSLAAC = true
 			}
 		case ndpOptRouteInfo:
-			if len(opt) < 8 {
-				return
+			if len(opt) != 8 && len(opt) != 16 && len(opt) != 24 {
+				return false
 			}
 			bits := int(opt[2])
-			lifetime := binary.BigEndian.Uint32(opt[4:8])
-			if bits > 128 || lifetime == 0 {
-				return
+			// RFC 4191 allows a longer Prefix field than strictly needed;
+			// reject only a length too short to carry the declared bits.
+			if bits > 128 || (len(opt) == 8 && bits != 0) ||
+				(len(opt) == 16 && bits > 64) || opt[3]&0x18 == 0x10 {
+				return false
 			}
+			lifetime := binary.BigEndian.Uint32(opt[4:8])
 			var prefix [16]byte
 			copy(prefix[:], opt[8:])
-			r.routes = append(r.routes, v6route{prefix: prefix, bits: bits, router: src})
+			prefix = canonicalPrefix6(prefix, bits)
+			if bits > 0 && (isLinkLocal6(prefix) || isMulticast6(prefix)) {
+				return false
+			}
+			key := v6prefix{prefix: prefix, bits: bits}
+			for _, have := range r.routes {
+				if have.route.prefix == key.prefix && have.route.bits == key.bits {
+					return false
+				}
+			}
+			r.routes = append(r.routes, raRoute{
+				route:    v6route{prefix: prefix, bits: bits, router: src},
+				withdraw: lifetime == 0,
+			})
 		}
+		return true
 	})
 	if !valid {
 		t.cnt.BadNDP++
 		return raResult{}, false
 	}
-	t.rsDone = true // any valid RA ends soliciting
 	return r, true
 }

@@ -33,8 +33,8 @@ The stack supports this concrete chain:
 - an HTTP client for API calls and artifact downloads, optionally through
   `leanhttps`, with sequential keep-alive per connection;
 - a SigV4 S3 client for the object operations Hop and HopOS actually use;
-- an IPv4/TCP/UDP stack plus an opt-in, UDP-only IPv6 lane for bare-metal
-  nodes, with one bounded buffer pool.
+- an IPv4/TCP/UDP stack plus an opt-in IPv6 lane with UDP as its only
+  application transport for bare-metal nodes, with one bounded buffer pool.
 
 “Multiple things over one channel” means **sequential requests and responses
 over a keep-alive connection**. Speculative HTTP pipelining and multiplexing are
@@ -280,7 +280,7 @@ multicast for one IPv4 identity; plus an opt-in IPv6 UDP/ICMPv6 lane. It
 implements `net.Conn`, `net.Listener`, `net.PacketConn`, and the Tamago socket
 seam only for the combinations named below.
 
-Multicast MUST:
+IPv4 multicast MUST:
 
 - accept joins for 224.0.0.0/24 only (RFC 5771 link-local — the block routers
   never forward), idempotent, capped (`maxGroups`), for the stack's lifetime
@@ -315,8 +315,8 @@ The IPv6 lane MUST:
   autonomous `/64`; use a link-local source only for link-local unicast and
   `ff02::/16`, and require the SLAAC source for every routed packet;
 - implement only the ICMPv6 control needed by this path: bounded RS/RA and
-  NS/NA plus unicast echo; validate checksum, hop limit, code, addresses,
-  targets, and options completely before rejected input can mutate state;
+  NS/NA plus unicast echo; validate every invariant of those supported forms
+  before rejected input can mutate state;
 - retain bounded on-link PIO prefixes and bounded RIO routes, prefer the
   longest RIO match, replace the next hop for a repeated prefix, remove an
   explicitly withdrawn PIO or RIO, and use one advertised default router only
@@ -327,8 +327,9 @@ The IPv6 lane MUST:
 - require a nonzero UDP checksum and emit no IPv6 packet larger than the
   IPv6-minimum MTU of 1280 bytes; without fragmentation or PMTUD, an emitted
   UDPv6 payload is therefore at most 1232 bytes;
-- reject unspecified, loopback, multicast-source, and IPv4-mapped traffic at
-  the applicable public or ingress boundary; the stack's own link-local or
+- reject unspecified, loopback, multicast-source, and IPv4-mapped application
+  traffic at the applicable public or ingress boundary; the one unspecified
+  source exception is a valid passive-DAD NS, and the stack's own link-local or
   SLAAC address is the only supported local loopback destination;
 - fail immediately when no usable source or route exists, fail after bounded
   NDP resolution when a neighbor is unreachable, and wake blocked operations
@@ -457,7 +458,13 @@ integration, not release proof. The gate includes:
 - a Tamago compile check of Hop's alternative HTTP files:
   `go test -run '^$' -tags tamago ./pkg/hophttp`;
 - regular tests, race tests, and `go vet` for HopOS `metal/net/hopswitch`
-  against the candidate Lean when IPv6 routing or multicast changes;
+  against the candidate Lean when IPv6 routing or multicast changes; these
+  prove that direct synthetic slot-MAC delivery accepts IPv6 only and cannot
+  bypass the IPv4 NAT/publication boundary;
+- a TamaGo test compile of `metal/app/applib/appnet` against the candidate Lean,
+  including its native `ff02::fb` join regression. The package imports the
+  TamaGo runtime and therefore cannot honestly count as a host-executed test;
+  family dispatch and `JoinGroup6` behavior execute in Lean's host suite;
 - regular tests, race tests, and `go vet` for surfserve against local Lean;
 - exactly two surfserve regressions: `GET /stream` with a non-empty
   `Content-Length` returns 4xx and leaves the server usable; a bodyless non-GET
@@ -533,18 +540,20 @@ the CI configuration.
 
 Before tagging, no publishable `go.mod` contains local-path `replace`
 directives. Publish Lean first, then update consumers in dependency order and
-rebuild them standalone. Hardware, netmeter, and 64 MiB OOM validation for
-`leannet` remains deployment evidence in [`TODO.md`](TODO.md); passing host
-tests cannot replace it.
+rebuild them standalone. TCP throughput, netmeter, and 64 MiB OOM validation
+for `leannet` remains deployment evidence in [`TODO.md`](TODO.md); passing host
+tests cannot replace it. IPv6 has the separate consumer hardware gate below.
 
 The IPv6 hardware gate first proves slot-to-slot link-local UDP6 echo. Before
 SLAAC/RIO and IPv6 application multicast count as released consumer paths, it
 also proves one real Thread-border-router exchange—RA to SLAAC to RIO to UDP
 `:5540` and back—and an explicit `ff02::fb` join. Every advertised NIC either
 passes relevant `33:33` multicast and synthetic slot-MAC unicast or is excluded
-from the IPv6 hardware scope. The app or switch test also proves that a bound
-UDPv6 port has the intended exposure policy; IPv4 NAT tests are not evidence
-for native IPv6.
+from the IPv6 hardware scope. Until that evidence exists, DWMAC1000/LicheeRV is
+the only candidate external-IPv6 carrier; DWMAC4, GENET, GEM, and IGB remain
+explicitly outside that scope rather than inheriting support from a shared
+interface. The app or switch test also proves that a bound UDPv6 port has the
+intended exposure policy; IPv4 NAT tests are not evidence for native IPv6.
 
 ## Change rule
 
