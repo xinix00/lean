@@ -20,7 +20,12 @@ import (
 
 // maxDepth bounds nesting. Valid pages need depth three; this headroom turns
 // malicious open-tag streams into errors rather than unbounded slices.
-const maxDepth = 32
+const (
+	maxDepth        = 32
+	maxListPageKeys = 1000
+	maxS3KeyBytes   = 1024
+	maxListToken    = 16 << 10
+)
 
 // parseListPage reads the fields needed by [Client.List]. It matches local name
 // and position: IsTruncated and NextContinuationToken under the root, and Key
@@ -179,8 +184,17 @@ func zet(out *listBucketResult, stack []string, waarde string) error {
 			return fmt.Errorf("leans3: IsTruncated is %q, not a boolean", waarde)
 		}
 	case len(stack) == 2 && stack[1] == "NextContinuationToken":
+		if len(waarde) > maxListToken {
+			return fmt.Errorf("leans3: continuation token exceeds %d bytes", maxListToken)
+		}
 		out.NextContinuationToken = waarde
 	case len(stack) == 3:
+		if len(waarde) > maxS3KeyBytes {
+			return fmt.Errorf("leans3: object key exceeds %d bytes", maxS3KeyBytes)
+		}
+		if len(out.Contents) == maxListPageKeys {
+			return fmt.Errorf("leans3: LIST page exceeds %d keys", maxListPageKeys)
+		}
 		out.Contents = append(out.Contents, listEntry{Key: waarde})
 	}
 	return nil

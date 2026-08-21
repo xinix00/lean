@@ -2,6 +2,7 @@ package leanhttp
 
 import (
 	"bufio"
+	"context"
 	"fmt"
 	"io"
 	"net"
@@ -61,6 +62,115 @@ func TestKeepAliveHergebruikt(t *testing.T) {
 	}
 	if got := conns.n.Load(); got != 1 {
 		t.Errorf("%d verbindingen voor 10 verzoeken, want 1", got)
+	}
+}
+
+type grownTestConn struct{ net.Conn }
+
+func (grownTestConn) Grown() bool { return true }
+
+func TestGrownVerbindingKomtNietInPool(t *testing.T) {
+	client, server := net.Pipe()
+	defer server.Close()
+	serverDone := make(chan struct{})
+	go func() {
+		defer close(serverDone)
+		br := bufio.NewReader(server)
+		for {
+			line, err := br.ReadString('\n')
+			if err != nil {
+				return
+			}
+			if line == "\r\n" {
+				break
+			}
+		}
+		_, _ = io.WriteString(server, "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+		_, _ = io.Copy(io.Discard, br)
+	}()
+
+	cl := &Client{DialContext: func(context.Context, string, string) (net.Conn, error) {
+		return grownTestConn{client}, nil
+	}}
+	resp, err := cl.Do(Call{URL: "http://grown.test/"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := resp.Body.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if n := cl.idleCount(); n != 0 {
+		t.Fatalf("Grown-verbinding kwam met %d entries in pool", n)
+	}
+	<-serverDone
+}
+
+type gatedCloseConn struct {
+	net.Conn
+	started chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (c *gatedCloseConn) Close() error {
+	var err error
+	c.once.Do(func() {
+		close(c.started)
+		<-c.release
+		err = c.Conn.Close()
+	})
+	return err
+}
+
+func TestContextCancelEnBodyClosePoolenNietTijdensCallback(t *testing.T) {
+	client, server := net.Pipe()
+	defer server.Close()
+	gated := &gatedCloseConn{Conn: client, started: make(chan struct{}), release: make(chan struct{})}
+	go func() {
+		br := bufio.NewReader(server)
+		for {
+			line, err := br.ReadString('\n')
+			if err != nil {
+				return
+			}
+			if line == "\r\n" {
+				break
+			}
+		}
+		_, _ = io.WriteString(server, "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+		_, _ = io.Copy(io.Discard, br)
+	}()
+
+	cl := &Client{DialContext: func(context.Context, string, string) (net.Conn, error) {
+		return gated, nil
+	}}
+	ctx, cancel := context.WithCancel(context.Background())
+	resp, err := cl.Do(Call{URL: "http://cancel-race.test/", Context: ctx})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cancel()
+	select {
+	case <-gated.started:
+	case <-time.After(time.Second):
+		t.Fatal("context-callback begon de transport-close niet")
+	}
+	closed := make(chan error, 1)
+	go func() { closed <- resp.Body.Close() }()
+	select {
+	case err := <-closed:
+		t.Fatalf("Body.Close passeerde een actieve context-callback: %v", err)
+	case <-time.After(30 * time.Millisecond):
+	}
+	if n := cl.idleCount(); n != 0 {
+		t.Fatalf("context-geannuleerde verbinding stond tijdens callback in pool: %d", n)
+	}
+	close(gated.release)
+	if err := <-closed; err != nil {
+		t.Fatal(err)
+	}
+	if n := cl.idleCount(); n != 0 {
+		t.Fatalf("context-geannuleerde verbinding eindigde alsnog in pool: %d", n)
 	}
 }
 

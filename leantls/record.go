@@ -49,32 +49,48 @@ func aeadFor(k trafficKeys) cipher.AEAD {
 	return g
 }
 
+// writeFull performs exactly one underlying Write and rejects a short success.
+// It deliberately does not retry: resuming a partial TLS record would corrupt
+// the wire stream.
+func writeFull(w io.Writer, p []byte) error {
+	n, err := w.Write(p)
+	if err == nil && n != len(p) {
+		return io.ErrShortWrite
+	}
+	return err
+}
+
 // writeRecord sends plaintext before keys exist and encrypted
-// TLSInnerPlaintext afterward.
+// TLSInnerPlaintext afterward. Before Client returns the handshake owns the
+// connection exclusively; afterward callers hold wmu. Every failure is sticky:
+// its record sequence has been consumed and ciphertext may be partial.
 func (c *Conn) writeRecord(typ byte, data []byte) error {
-	if c.wAEAD == nil {
-		hdr := [5]byte{typ, 3, 3, byte(len(data) >> 8), byte(len(data))}
-		if _, err := c.conn.Write(append(hdr[:], data...)); err != nil {
-			return err
-		}
-		return nil
+	if c.writeErr != nil {
+		return c.writeErr
 	}
 
-	// TLSInnerPlaintext is content followed by its type. §5.4 padding is optional
-	// and omitted to avoid bandwidth cost on small nodes.
-	inner := make([]byte, 0, len(data)+1)
-	inner = append(inner, data...)
-	inner = append(inner, typ)
+	var wire []byte
+	if c.wAEAD == nil {
+		hdr := [5]byte{typ, 3, 3, byte(len(data) >> 8), byte(len(data))}
+		wire = append(hdr[:], data...)
+	} else {
+		// TLSInnerPlaintext is content followed by its type. §5.4 padding is
+		// optional and omitted to avoid bandwidth cost on small nodes.
+		inner := make([]byte, 0, len(data)+1)
+		inner = append(inner, data...)
+		inner = append(inner, typ)
 
-	hdr := [5]byte{recAppData, 3, 3, 0, 0}
-	binary.BigEndian.PutUint16(hdr[3:], uint16(len(inner)+c.wAEAD.Overhead()))
+		hdr := [5]byte{recAppData, 3, 3, 0, 0}
+		binary.BigEndian.PutUint16(hdr[3:], uint16(len(inner)+c.wAEAD.Overhead()))
 
-	out := make([]byte, 0, len(hdr)+len(inner)+c.wAEAD.Overhead())
-	out = append(out, hdr[:]...)
-	out = c.wAEAD.Seal(out, nonce(c.wKeys.iv, c.wSeq), inner, hdr[:])
-	c.wSeq++
-	_, err := c.conn.Write(out)
-	return err
+		wire = make([]byte, 0, len(hdr)+len(inner)+c.wAEAD.Overhead())
+		wire = append(wire, hdr[:]...)
+		wire = c.wAEAD.Seal(wire, nonce(c.wKeys.iv, c.wSeq), inner, hdr[:])
+		c.wSeq++
+	}
+
+	c.writeErr = writeFull(c.conn, wire)
+	return c.writeErr
 }
 
 // readRecord returns one record's actual content type and payload. For encrypted

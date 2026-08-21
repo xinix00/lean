@@ -57,13 +57,25 @@ const (
 
 	tcpTimeWaitDur = int64(time.Second) // embedded targets cannot afford a four-minute 2MSL
 
-	// Bound FIN-WAIT-2 after full socket Close so a peer that never closes cannot
-	// retain the connection's floor budget indefinitely.
+	// Full socket Close gets one absolute grace period for pending data, FIN, and
+	// TIME-WAIT together. ACKs and window updates deliberately cannot renew it:
+	// after the owner has released the socket, a cooperative close is useful but
+	// retaining its tuple and buffers forever is not.
+	tcpFullCloseDur = int64(20 * time.Second)
+
+	// FIN-WAIT-2 has the same bound for machine users that only half-close and
+	// therefore do not arm tcpFullCloseDur through abandonRead.
 	tcpFinWait2Dur = int64(20 * time.Second)
-	tcpDefaultMSS  = 536
+
+	// CLOSE-WAIT means the peer has finished sending. Preserve tail reads and
+	// response writes, but reap an application that forgets the connection. Real
+	// application I/O and ACK progress refresh this idle bound.
+	tcpCloseWaitDur = int64(2 * time.Minute)
+	tcpDefaultMSS   = 536
 
 	// Retry limits count RTOs without a valid ACK. Any valid ACK resets them, so
-	// a live zero-window peer survives while silent half-open floods do not.
+	// a live zero-window peer survives while the application owns the socket;
+	// tcpFullCloseDur takes over once that ownership ends.
 	tcpMaxRetriesHandshake = 5  // roughly 6 seconds without a SYN response
 	tcpMaxRetriesData      = 12 // minutes for a vanished established peer
 )
@@ -135,6 +147,10 @@ type tcpConn struct {
 	// appClosed marks full socket close. Incoming promised data is counted and
 	// discarded so ACK/FIN can progress after the receive ring is released.
 	appClosed bool
+
+	// closeDeadline is renewable while an application owns a CLOSE-WAIT socket.
+	// Full socket Close overwrites it with one absolute, nonrenewable bound.
+	closeDeadline int64
 
 	// rst holds at most one reset and its exact form. Abort uses RST|ACK; an ACK
 	// that does not acknowledge our SYN uses bare <SEQ=SEG.ACK>. emit sends it
@@ -217,12 +233,35 @@ func (c *tcpConn) close() error {
 // abandonRead marks full socket close, unlike machine close's write half-close.
 // It releases unread receive storage while appClosed still advances and ACKs
 // incoming data so the peer can deliver FIN.
-func (c *tcpConn) abandonRead() {
-	c.appClosed = true
+func (c *tcpConn) abandonRead(now int64) {
+	// Duplicate net.Conn.Close calls must not extend the absolute cleanup bound.
+	if !c.appClosed {
+		c.appClosed = true
+		c.closeDeadline = now + tcpFullCloseDur
+	}
 	if c.pot != nil {
 		c.pot.release(c.rx.size())
 		c.rx = ring{}
 	}
+}
+
+// touchCloseWait preserves a legitimately active half-closed connection while
+// still bounding an abandoned one. Full Close has its own absolute, nonrenewable
+// deadline and therefore ignores later activity.
+func (c *tcpConn) touchCloseWait(now int64) {
+	if c.state == tcpCloseWait && !c.appClosed {
+		c.closeDeadline = now + tcpCloseWaitDur
+	}
+}
+
+// lifecycleExpired is separate from emit so the stack can reap an ownerless
+// connection even when neighbor resolution cannot produce a route for its RST.
+func (c *tcpConn) lifecycleExpired(now int64) bool {
+	if c.state == tcpClosed {
+		return false
+	}
+	return (c.appClosed || c.state == tcpCloseWait) && c.closeDeadline != 0 &&
+		now >= c.closeDeadline
 }
 
 // pendingRST stores the queued reset described by tcpConn.rst.
@@ -698,6 +737,7 @@ func (c *tcpConn) processAck(seg tcpSeg, now int64) (accept bool) {
 	c.dupacks = 0
 	c.retries = 0 // real progress proves liveness
 	c.persistBackoff = 0
+	c.touchCloseWait(now) // cumulative progress is activity, duplicate ACKs are not
 
 	// Shrink after updating accounting because this final ACK may empty an idle
 	// pooled connection. An in-flight FIN uses sequence, not ring, space.
@@ -832,6 +872,7 @@ fin:
 		switch c.state {
 		case tcpEstablished:
 			c.state = tcpCloseWait
+			c.closeDeadline = now + tcpCloseWaitDur
 		case tcpFinWait1:
 			// Our FIN remains unacknowledged: simultaneous close.
 			c.state = tcpClosing
@@ -850,6 +891,11 @@ func (c *tcpConn) emit(buf []byte, now int64) (seg tcpSeg, ok bool) {
 	if seg, ok := c.takeRST(); ok {
 		// A queued abort or invalid-ACK reset precedes all other output.
 		return seg, true
+	}
+	// A full socket Close is an ownership boundary, not a liveness hint. Neither
+	// persist ACKs nor later close-state transitions may move this deadline.
+	if c.lifecycleExpired(now) {
+		return c.abortWithRST()
 	}
 	switch c.state {
 	case tcpClosed:
@@ -1090,16 +1136,24 @@ func (c *tcpConn) armTimer(now int64) {
 	}
 }
 
-// nextDeadline centralizes retransmission, FIN-WAIT-2, and TIME-WAIT scheduling.
-// Retransmission wins if timers ever overlap.
+// nextDeadline centralizes retransmission and connection-lifecycle scheduling.
 func (c *tcpConn) nextDeadline() int64 {
-	switch {
-	case c.timerOn:
-		return c.deadline
-	case c.state == tcpTimeWait, c.state == tcpFinWait2:
-		return c.twDeadline
+	var d int64
+	add := func(candidate int64) {
+		if candidate != 0 && (d == 0 || candidate < d) {
+			d = candidate
+		}
 	}
-	return 0
+	if c.timerOn {
+		add(c.deadline)
+	}
+	if c.state == tcpTimeWait || c.state == tcpFinWait2 {
+		add(c.twDeadline)
+	}
+	if (c.state == tcpCloseWait || c.appClosed) && c.state != tcpClosed {
+		add(c.closeDeadline)
+	}
+	return d
 }
 
 func (c *tcpConn) currentRTO() time.Duration {

@@ -29,10 +29,26 @@ var (
 	errV6Disabled    = errors.New("leannet: IPv6 lane is not enabled")
 )
 
+// raLeaseMax is a local ownership bound, not an RFC wire limit. Even an RA
+// lifetime of 0xffffffff must be renewed within this interval: a router that
+// disappeared may not pin the finite PIO/RIO tables or suppress RS forever.
+const raLeaseMax = 2 * time.Hour
+
+func raLifetimeDeadline(now int64, seconds uint32) int64 {
+	if max := uint32(raLeaseMax / time.Second); seconds > max {
+		seconds = max
+	}
+	return now + int64(seconds)*int64(time.Second)
+}
+
+func raDeadlineExpired(until, now int64) bool {
+	return now >= until
+}
+
 // v6State is the whole IPv6 lane; nil on stacks that never use v6.
 type v6State struct {
 	ll        [16]byte // link-local, from the MAC; always present
-	global    [16]byte // one SLAAC address, from the first autonomous /64
+	global    [16]byte // the one active SLAAC address
 	hasGlobal bool
 
 	ndp *ndpTable
@@ -42,15 +58,17 @@ type v6State struct {
 	// our own addresses are computed, not stored.
 	groups map[[16]byte]struct{}
 
-	router    [16]byte // default router (link-local), from the last RA
-	hasRouter bool
+	router      [16]byte // default router (link-local), from the last live RA
+	hasRouter   bool
+	routerUntil int64
 
-	prefixes []v6prefix // on-link prefixes from PIOs, capped
-	routes   []v6route  // specific routes from RIOs, capped
+	prefixes []v6prefix // live PIO state (on-link and/or autonomous), capped
+	routes   []v6route  // live specific routes from RIOs, capped
 }
 
 // out6 mirrors outPkt for connectionless v6 replies (echo).
 type outPkt6 struct {
+	src  [16]byte // original local destination; echo replies must preserve it
 	dst  [16]byte
 	next byte
 	pkt  []byte
@@ -178,7 +196,7 @@ func (s *Stack) recvIPv6(ip IPv6Frame, srcMAC [6]byte, now int64) {
 			reply[2], reply[3] = 0, 0
 			csum := pseudoChecksum6(ProtoICMPv6, ip.Dst(), src, reply)
 			reply[2], reply[3] = byte(csum>>8), byte(csum)
-			s.out6 = append(s.out6, outPkt6{dst: src, next: ProtoICMPv6, pkt: reply})
+			s.out6 = append(s.out6, outPkt6{src: ip.Dst(), dst: src, next: ProtoICMPv6, pkt: reply})
 			s.notify()
 		}
 	case ProtoUDP:
@@ -203,63 +221,234 @@ func (s *Stack) recvIPv6(ip IPv6Frame, srcMAC [6]byte, now int64) {
 // applyRALocked folds one advertisement into the address and route state.
 func (s *Stack) applyRALocked(r raResult, now int64) {
 	v6 := s.v6
-	v6.ndp.rsDone = true // any completely valid RA ends solicitation
+	v6.expireRA(now)
 	if r.hasMAC {
 		v6.ndp.learn(r.router, r.mac, now)
 	}
-	if r.hasLifetime {
+	if r.routerLifetime > 0 {
 		v6.router = r.router
 		v6.hasRouter = true
+		v6.routerUntil = raLifetimeDeadline(now, uint32(r.routerLifetime))
 	} else if v6.hasRouter && v6.router == r.router {
 		v6.hasRouter = false // the router resigned (lifetime zero)
-	}
-	if r.hasSLAAC && !v6.hasGlobal {
-		// One address is enough for a Matter controller; the first autonomous
-		// prefix wins and later renumbering waits for a stack restart.
-		v6.global = r.slaac
-		v6.hasGlobal = true
+		v6.routerUntil = 0
 	}
 	for _, action := range r.prefixes {
 		found := -1
 		for i, have := range v6.prefixes {
-			if have == action.prefix {
+			if have.prefix == action.prefix && have.bits == action.bits {
 				found = i
 				break
 			}
 		}
-		if action.withdraw {
-			if found >= 0 {
-				copy(v6.prefixes[found:], v6.prefixes[found+1:])
-				v6.prefixes = v6.prefixes[:len(v6.prefixes)-1]
+		if found < 0 {
+			// A withdrawal for unknown state is a no-op. Positive PIO state
+			// shares one cap whether it drives on-link routing, SLAAC, or both.
+			if action.validLife == 0 {
+				continue
 			}
-			continue
+			if len(v6.prefixes) >= ndpPrefixCap {
+				v6.ndp.cnt.PrefixDrop++
+				continue
+			}
+			v6.prefixes = append(v6.prefixes, v6prefix{prefix: action.prefix, bits: action.bits})
+			found = len(v6.prefixes) - 1
 		}
-		if found < 0 && len(v6.prefixes) < ndpPrefixCap {
-			v6.prefixes = append(v6.prefixes, action.prefix)
+		p := &v6.prefixes[found]
+		if action.onLink {
+			p.onLink = action.validLife > 0
+			if p.onLink {
+				p.onLinkUntil = raLifetimeDeadline(now, action.validLife)
+			} else {
+				p.onLinkUntil = 0
+			}
+		}
+		if action.autonomous {
+			p.autonomous = action.validLife > 0
+			if p.autonomous {
+				p.validUntil = raLifetimeDeadline(now, action.validLife)
+				p.preferredUntil = raLifetimeDeadline(now, action.preferredLife)
+			} else {
+				p.validUntil, p.preferredUntil = 0, 0
+			}
+		}
+		if !p.onLink && !p.autonomous {
+			copy(v6.prefixes[found:], v6.prefixes[found+1:])
+			v6.prefixes = v6.prefixes[:len(v6.prefixes)-1]
 		}
 	}
 	for _, action := range r.routes {
 		found := -1
 		for i, have := range v6.routes {
-			if have.prefix == action.route.prefix && have.bits == action.route.bits {
+			if have.prefix == action.prefix && have.bits == action.bits {
 				found = i
 				break
 			}
 		}
-		if action.withdraw {
+		if action.lifetime == 0 {
 			// A late withdrawal from an old router must not erase the newer
 			// next hop that already replaced it for this prefix.
-			if found >= 0 && v6.routes[found].router == action.route.router {
+			if found >= 0 && v6.routes[found].router == action.router {
 				copy(v6.routes[found:], v6.routes[found+1:])
 				v6.routes = v6.routes[:len(v6.routes)-1]
 			}
 			continue
 		}
-		if found >= 0 {
-			v6.routes[found] = action.route
-		} else if len(v6.routes) < ndpRouteCap {
-			v6.routes = append(v6.routes, action.route)
+		route := v6route{
+			prefix: action.prefix, bits: action.bits, router: action.router,
+			until: raLifetimeDeadline(now, action.lifetime),
 		}
+		if found >= 0 {
+			v6.routes[found] = route
+		} else if len(v6.routes) < ndpRouteCap {
+			v6.routes = append(v6.routes, route)
+		} else {
+			v6.ndp.cnt.RouteDrop++
+		}
+	}
+	v6.selectGlobal(now)
+	v6.syncRouterSolicitation(now)
+}
+
+// expireRA removes state at its monotonic deadline. It is called by the pump,
+// ingress, and synchronous route lookup so no stale state is usable between a
+// deadline firing and the next packet-driven wakeup.
+func (v *v6State) expireRA(now int64) (changed bool) {
+	oldGlobal, oldHasGlobal := v.global, v.hasGlobal
+	oldRSDone, oldRSTries, oldRSDue := v.ndp.rsDone, v.ndp.rsTries, v.ndp.rsDue
+	if v.hasRouter && raDeadlineExpired(v.routerUntil, now) {
+		v.hasRouter = false
+		v.routerUntil = 0
+		changed = true
+	}
+	for i := 0; i < len(v.prefixes); {
+		p := &v.prefixes[i]
+		if p.onLink && raDeadlineExpired(p.onLinkUntil, now) {
+			p.onLink = false
+			p.onLinkUntil = 0
+			changed = true
+		}
+		if p.autonomous && raDeadlineExpired(p.validUntil, now) {
+			p.autonomous = false
+			p.validUntil, p.preferredUntil = 0, 0
+			changed = true
+		}
+		// Deprecation is a one-shot transition. Consume its deadline while the
+		// address remains valid, otherwise the aggregator would keep rearming an
+		// already-expired timestamp until valid-lifetime expiry.
+		if p.autonomous && raDeadlineExpired(p.preferredUntil, now) {
+			p.preferredUntil = 0
+		}
+		if p.onLink || p.autonomous {
+			i++
+			continue
+		}
+		copy(v.prefixes[i:], v.prefixes[i+1:])
+		v.prefixes = v.prefixes[:len(v.prefixes)-1]
+	}
+	for i := 0; i < len(v.routes); {
+		if !raDeadlineExpired(v.routes[i].until, now) {
+			i++
+			continue
+		}
+		copy(v.routes[i:], v.routes[i+1:])
+		v.routes = v.routes[:len(v.routes)-1]
+		changed = true
+	}
+	v.selectGlobal(now)
+	v.syncRouterSolicitation(now)
+	return changed || oldGlobal != v.global || oldHasGlobal != v.hasGlobal ||
+		oldRSDone != v.ndp.rsDone || oldRSTries != v.ndp.rsTries || oldRSDue != v.ndp.rsDue
+}
+
+// expireRALocked expires RA ownership and wakes every route/NDP waiter when
+// that changes the answer it may observe. s.mu must be held.
+func (s *Stack) expireRALocked(now int64) bool {
+	if s.v6 == nil || !s.v6.expireRA(now) {
+		return false
+	}
+	s.notify()
+	return true
+}
+
+func (v *v6State) slaacAddress(p *v6prefix) [16]byte {
+	addr := p.prefix
+	copy(addr[8:], v.ll[8:])
+	return addr
+}
+
+// selectGlobal keeps one valid address stable while it is preferred. Once it
+// is deprecated, a different preferred candidate may replace it; withdrawal
+// or valid-lifetime expiry selects another retained candidate immediately.
+func (v *v6State) selectGlobal(now int64) {
+	current := -1
+	for i := range v.prefixes {
+		p := &v.prefixes[i]
+		if p.autonomous && v.hasGlobal && v.slaacAddress(p) == v.global {
+			current = i
+			break
+		}
+	}
+	preferred := func(p *v6prefix) bool {
+		return p.autonomous && !raDeadlineExpired(p.preferredUntil, now)
+	}
+	if current >= 0 && preferred(&v.prefixes[current]) {
+		return
+	}
+	for i := range v.prefixes {
+		if preferred(&v.prefixes[i]) {
+			v.global = v.slaacAddress(&v.prefixes[i])
+			v.hasGlobal = true
+			return
+		}
+	}
+	if current >= 0 { // deprecated but still valid, with no better candidate
+		return
+	}
+	for i := range v.prefixes {
+		if v.prefixes[i].autonomous {
+			v.global = v.slaacAddress(&v.prefixes[i])
+			v.hasGlobal = true
+			return
+		}
+	}
+	v.global = [16]byte{}
+	v.hasGlobal = false
+}
+
+func (v *v6State) hasRAConfig() bool {
+	return v.hasRouter || len(v.prefixes) != 0 || len(v.routes) != 0
+}
+
+func (v *v6State) syncRouterSolicitation(now int64) {
+	if v.hasRAConfig() {
+		v.ndp.rsDone = true
+		return
+	}
+	if v.ndp.rsDone {
+		v.ndp.rsDone = false
+		v.ndp.rsTries = 0
+		v.ndp.rsDue = now
+	}
+}
+
+func (v *v6State) nextDeadline(add func(int64)) {
+	v.ndp.nextDeadline(add)
+	if v.hasRouter {
+		add(v.routerUntil)
+	}
+	for i := range v.prefixes {
+		p := &v.prefixes[i]
+		if p.onLink {
+			add(p.onLinkUntil)
+		}
+		if p.autonomous {
+			add(p.validUntil)
+			add(p.preferredUntil)
+		}
+	}
+	for i := range v.routes {
+		add(v.routes[i].until)
 	}
 }
 
@@ -271,7 +460,7 @@ func (v *v6State) onLink6(a [16]byte) bool {
 		return true
 	}
 	for _, p := range v.prefixes {
-		if prefixMatch6(a, p.prefix, p.bits) {
+		if p.onLink && prefixMatch6(a, p.prefix, p.bits) {
 			return true
 		}
 	}
@@ -285,7 +474,7 @@ func (s *Stack) nextHop6Locked(dst [16]byte) (hop [16]byte, ok bool) {
 		return dst, true
 	}
 	for _, p := range v6.prefixes {
-		if prefixMatch6(dst, p.prefix, p.bits) {
+		if p.onLink && prefixMatch6(dst, p.prefix, p.bits) {
 			return dst, true
 		}
 	}
@@ -309,6 +498,7 @@ func (s *Stack) nextHop6Locked(dst [16]byte) (hop [16]byte, ok bool) {
 // route6Locked resolves dst to a next-hop MAC; query=false only peeks.
 func (s *Stack) route6Locked(dst [16]byte, now int64, query bool) ([6]byte, bool) {
 	v6 := s.v6
+	s.expireRALocked(now)
 	if v6.ourAddr6(dst) {
 		return s.cfg.MAC, true // loopback via sendEthLocked's own-MAC path
 	}
@@ -356,22 +546,25 @@ func (s *Stack) drain6Locked(now int64) {
 	if v6 == nil {
 		return
 	}
+	s.expireRALocked(now)
 	for _, o := range s.out6 {
+		// Echo replies belong to the address that received the request. A
+		// renumber/expiry before drain cancels the queued reply.
+		if !v6.ourAddr6(o.src) {
+			continue
+		}
 		if mac, ok := s.route6Locked(o.dst, now, false); ok {
-			src, routable := v6.srcAddr6For(o.dst)
-			if !routable {
-				continue
-			}
 			// Only NDP uses hop limit 255. Echo is ordinary unicast traffic.
-			s.sendIPv6Locked(mac, src, o.dst, o.next, hopLimitDefault, o.pkt)
+			s.sendIPv6Locked(mac, o.src, o.dst, o.next, hopLimitDefault, o.pkt)
 		}
 	}
+	clear(s.out6) // release reply payloads retained by the reusable backing array
 	s.out6 = s.out6[:0]
 
 	gaveUpBefore := v6.ndp.cnt.GaveUp
 	var body [64]byte
 	for {
-		e, ok := v6.ndp.emit(body[:], now)
+		e, ok := v6.ndp.emitOwned(body[:], now, v6.ourAddr6)
 		if !ok {
 			break
 		}
@@ -456,13 +649,14 @@ func (u *udpSock) writeUDP6(p []byte, dst [16]byte, dport uint16) (int, error) {
 			if v6 == nil {
 				return false, errV6Disabled
 			}
+			now := s.now()
+			s.expireRALocked(now)
 			src, routable := v6.srcAddr6For(dst)
 			if !routable {
 				// A cached router MAC does not make a link-local source usable
 				// off-link. Check this before the cache-hit send path.
 				return false, errNoRoute6
 			}
-			now := s.now()
 			if mac, ok := s.route6Locked(dst, now, true); ok {
 				off := EthernetHeaderSize + sizeIPv6
 				copy(s.txBuf[off+sizeUDP:], p)

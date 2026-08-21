@@ -39,6 +39,11 @@ const (
 	// Completed handshakes awaiting Accept. Overflow gets RST rather than
 	// retaining an invisible connection slot.
 	tcpBacklog = 8
+
+	// A completed handshake has no application owner until Accept returns it.
+	// Bound that handoff independently of peer traffic so an abandoned listener
+	// cannot retain the backlog's tuples and floor buffers forever.
+	tcpBacklogWaitDur = int64(30 * time.Second)
 )
 
 var errInvalidUDP6Remote = errors.New("leannet: invalid IPv6 UDP remote address")
@@ -234,6 +239,7 @@ func (l *tcpListener) offer(c *sconn) {
 		l.s.reap(c.key, c)
 		return
 	}
+	l.pruneStaleLocked()
 	select {
 	case l.backlog <- c:
 	default:
@@ -242,12 +248,56 @@ func (l *tcpListener) offer(c *sconn) {
 	}
 }
 
+// pruneStaleLocked physically removes stale channel entries before applying
+// the backlog cap. Reap removes the connection from Stack.conns immediately,
+// but a channel reference otherwise occupies its slot until an Accept happens.
+// l.s.mu must be held; Accept may concurrently consume but no other sender can
+// run while this method rotates the bounded queue.
+func (l *tcpListener) pruneStaleLocked() {
+	var keep [tcpBacklog]*sconn
+	nkeep := 0
+	n := len(l.backlog)
+drain:
+	for range n {
+		select {
+		case c := <-l.backlog:
+			if l.s.conns[c.key] == c {
+				keep[nkeep] = c
+				nkeep++
+			}
+		default:
+			break drain
+		}
+	}
+	for _, c := range keep[:nkeep] {
+		l.backlog <- c
+	}
+}
+
 func (l *tcpListener) Accept() (net.Conn, error) {
-	select {
-	case c := <-l.backlog:
-		return &tcpSock{s: l.s, c: c}, nil
-	case <-l.done:
-		return nil, net.ErrClosed
+	for {
+		select {
+		case c := <-l.backlog:
+			// A peer may reset, or a CLOSE-WAIT lifecycle timer may reap the
+			// connection while it is queued. Never hand that stale backlog
+			// reference to the application.
+			l.s.mu.Lock()
+			live := l.s.conns[c.key] == c
+			if live {
+				c.handoffDeadline = 0
+				c.listener = nil
+				c.tcp.touchCloseWait(l.s.now())
+				// Recalculate the protocol timer after removing the handoff bound.
+				l.s.notify()
+			}
+			l.s.mu.Unlock()
+			if !live {
+				continue
+			}
+			return &tcpSock{s: l.s, c: c}, nil
+		case <-l.done:
+			return nil, net.ErrClosed
+		}
 	}
 }
 
@@ -276,7 +326,7 @@ func (l *tcpListener) closeLocked() {
 			// Abort in-progress embryos immediately rather than retaining their
 			// budget through handshake backoff against a closed listener.
 			for key, c := range l.s.conns {
-				if c.listener == l && !c.accepted {
+				if c.listener == l && c.handoffDeadline == 0 {
 					c.tcp.abort()
 					l.s.reap(key, c)
 				}
@@ -357,6 +407,7 @@ func (s *Stack) dialTCP(ctx context.Context, raddr [4]byte, rport uint16, deadli
 			case c.tcp.state == tcpEstablished || c.tcp.state == tcpCloseWait:
 				// A peer may send data and FIN before this waiter wakes, moving
 				// through ESTABLISHED into a still-usable CLOSE-WAIT.
+				c.tcp.touchCloseWait(s.now())
 				return true, nil
 			case hopViaARP && s.arp.noAnswer(hop, s.now()):
 				// Only ARP-governed routes can fail here. Check before tcpClosed
@@ -400,6 +451,7 @@ func (t *tcpSock) Read(p []byte) (int, error) {
 			n, err := t.c.tcp.read(p)
 			if n > 0 {
 				total = n
+				t.c.tcp.touchCloseWait(t.s.now())
 				t.s.notify() // reading may have opened the receive window
 				return true, nil
 			}
@@ -425,6 +477,9 @@ func (t *tcpSock) Write(p []byte) (int, error) {
 				}
 				n, err := t.c.tcp.write(p[total:])
 				total += n
+				if n > 0 {
+					t.c.tcp.touchCloseWait(t.s.now())
+				}
 				if err != nil {
 					return false, err
 				}
@@ -446,10 +501,10 @@ func (t *tcpSock) Close() error {
 	s := t.s
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	t.closed = true       // blocked I/O observes this on wake
-	_ = t.c.tcp.close()   // duplicate socket close is not an error
-	t.c.tcp.abandonRead() // full close may release the receive ring
-	s.notify()            // send FIN and wake waiters
+	t.closed = true              // blocked I/O observes this on wake
+	_ = t.c.tcp.close()          // duplicate socket close is not an error
+	t.c.tcp.abandonRead(s.now()) // full close releases RX and arms absolute cleanup
+	s.notify()                   // send FIN and wake waiters
 	return nil
 }
 

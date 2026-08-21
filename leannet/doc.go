@@ -6,13 +6,14 @@
 // address, or timer state.
 //
 // The IPv6 lane is deliberately UDP-only. It provides unicast ICMPv6 echo and
-// the bounded NDP control needed for RS/RA and NS/NA, an EUI-64 link-local address,
-// the first SLAAC address from an autonomous /64, capped PIO/RIO route state,
-// and explicitly joined ff02::/16 multicast. IPv4 and IPv6 UDP ports are
-// separate. IPv6 sockets are v6-only and wildcard-bound, report "[::]:port" as
-// their local bind, and select the link-local or SLAAC wire source from the
-// destination. A write that needs an RA before one has arrived fails with an
-// explicit no-route error so the caller can retry. Unspecified, loopback,
+// the bounded NDP control needed for RS/RA and NS/NA, an EUI-64 link-local
+// address, one active SLAAC address from autonomous /64 PIO state, capped
+// expiring PIO/RIO route state, and explicitly joined ff02::/16 multicast.
+// IPv4 and IPv6 UDP ports are separate. IPv6 sockets are v6-only and
+// wildcard-bound, report "[::]:port" as their local bind, and select the
+// link-local or SLAAC wire source from the destination. A write that needs an
+// RA before one has arrived fails with an explicit no-route error so the caller
+// can retry. Unspecified, loopback,
 // multicast-source, and IPv4-mapped application traffic is rejected; a valid
 // unspecified-source neighbor solicitation for passive DAD is the sole
 // unspecified-source exception.
@@ -20,12 +21,29 @@
 // IPv6 output is capped at its 1280-byte minimum MTU, leaving at most 1232 bytes
 // for a UDP payload. TCPv6, DHCPv6, IPv4-mapped dual-family sockets, extension
 // headers, fragmentation, PMTUD, MLD, wider multicast, full NUD, active DAD,
-// ICMPv6 redirect/error state, multiple or temporary addresses, and automatic
-// renumbering are outside the profile and fail rather than being half-supported.
+// ICMPv6 redirect/error state, simultaneous multiple or temporary addresses,
+// and multi-address renumbering are outside the profile and fail rather than
+// being half-supported. The single active SLAAC identity does follow PIO
+// preferred and valid lifetimes and can move to a retained preferred prefix.
+// Every positive RA lifetime is locally capped to a renewable two-hour lease;
+// periodic advertisements refresh it, while a disappeared router cannot retain
+// route or address ownership indefinitely.
 //
 // The socket layer supplies net.Conn, net.Listener, and net.PacketConn to
 // net.SocketFunc for the supported combinations. The package uses only the
 // standard library.
+//
+// TCP connection ownership follows net.Conn: an idle ESTABLISHED connection
+// has no automatic idle reaper once Accept or Dial hands it to a caller. A
+// completed inbound handshake still waiting for Accept has no owner and gets an
+// absolute 30-second handoff bound that peer traffic cannot renew. After a peer
+// FIN, an inactive CLOSE-WAIT connection is reset after two minutes;
+// application I/O or cumulative ACK progress refreshes that idle interval. A
+// full socket Close instead starts one absolute 20-second grace period for
+// queued data, FIN, and TIME-WAIT together. Peer ACKs and window updates cannot
+// extend that bound. Each Stack owns one sleeping pump until its caller invokes
+// Stack.Close. Close snapshots counters and releases all dynamic protocol tables,
+// queues, buffers, and its Device reference immediately.
 //
 // The previous stack allocated by configuration rather than use: 2 MiB per
 // listener up front and 256 KiB per outgoing dial. On a 64 MiB HopOS target this

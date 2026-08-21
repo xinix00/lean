@@ -148,6 +148,23 @@ func TestParseWeigert(t *testing.T) {
 	}
 }
 
+func TestParseWeigertTeVeelKeysEnTeLangeKey(t *testing.T) {
+	if _, err := parseListPage([]byte(veelKeys(maxListPageKeys + 1))); err == nil ||
+		!strings.Contains(err.Error(), "page exceeds") {
+		t.Fatalf("te veel keys gaf %v", err)
+	}
+	doc := `<ListBucketResult><Contents><Key>` + strings.Repeat("k", maxS3KeyBytes+1) +
+		`</Key></Contents></ListBucketResult>`
+	if _, err := parseListPage([]byte(doc)); err == nil || !strings.Contains(err.Error(), "key exceeds") {
+		t.Fatalf("te lange key gaf %v", err)
+	}
+	doc = `<ListBucketResult><NextContinuationToken>` + strings.Repeat("t", maxListToken+1) +
+		`</NextContinuationToken></ListBucketResult>`
+	if _, err := parseListPage([]byte(doc)); err == nil || !strings.Contains(err.Error(), "token exceeds") {
+		t.Fatalf("te lange continuation token gaf %v", err)
+	}
+}
+
 func TestAfgekaptAntwoordIsAltijdEenFout(t *testing.T) {
 	for i := 1; i < len(echtAntwoord); i++ {
 		half := echtAntwoord[:i]

@@ -5,9 +5,9 @@ package leannet
 // layer knows about goroutines and locks.
 //
 // One mutex protects all machine state. One pump goroutine transmits frames and
-// observes RTO, ARP, and TIME-WAIT timers. It sleeps until the earliest deadline
-// or a notification, so an idle stack consumes no CPU. Blocking socket calls
-// wait on the same notifications with their own deadlines.
+// observes protocol timers until explicit Stack.Close. It sleeps without a timer
+// when no work or deadline remains. Blocking socket calls wait on the same
+// notifications with their own deadlines.
 //
 // The transmit pump belongs here because HopOS has no separate transmit loop.
 
@@ -165,7 +165,9 @@ func (s *Stack) Stats() Stats {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	st := s.stats
-	st.ARP = s.arp.cnt
+	if s.arp != nil {
+		st.ARP = s.arp.cnt
+	}
 	if s.v6 != nil {
 		st.NDP = s.v6.ndp.cnt
 	}
@@ -225,7 +227,6 @@ func (s *Stack) Close() {
 		return
 	}
 	s.closed = true
-	s.groups = nil
 	for key, c := range s.conns {
 		c.tcp.abort()
 		s.reap(key, c)
@@ -243,8 +244,28 @@ func (s *Stack) Close() {
 		for _, u := range s.v6.udp.ports {
 			u.close()
 		}
-		s.v6.groups = nil
 	}
+
+	// Preserve telemetry while dropping every dynamically retained protocol
+	// object. The pump observes closed before draining, so without this explicit
+	// teardown a queued reply, loopback buffer, neighbor cache, or RA lease would
+	// remain attached to a deliberately retained closed Stack.
+	s.stats.ARP = s.arp.cnt
+	if s.v6 != nil {
+		s.stats.NDP = s.v6.ndp.cnt
+	}
+	s.arp = nil
+	s.v6 = nil
+	s.udp = nil
+	s.conns = nil
+	s.listeners = nil
+	s.groups = nil
+	s.out = nil
+	s.out6 = nil
+	s.loopback = nil
+	s.lbFree = nil
+	s.txBuf = nil
+	s.dev = nil
 	s.notify()
 }
 
@@ -253,6 +274,9 @@ func (s *Stack) Close() {
 func (s *Stack) SeedNeighbor(ip [4]byte, mac [6]byte) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.closed {
+		return errStackClosed
+	}
 	if ip == s.cfg.GW {
 		s.gwMAC, s.hasGwMAC = mac, true
 		// A static gateway makes any pending query obsolete; wake its waiters
@@ -386,6 +410,9 @@ func (s *Stack) ingressLocked(eth EthFrame, now int64) {
 		if err != nil {
 			return // extension headers and truncations are noise, not faults
 		}
+		// Address, prefix, and route ownership ends at the advertised
+		// monotonic deadline even if this packet races the pump wakeup.
+		s.expireRALocked(now)
 		// Promiscuous/all-multicast NICs pass more than our subscriptions.
 		// IPv6 unicast must target this interface and multicast must carry
 		// the exact RFC 2464 mapping for its IP destination.
@@ -476,7 +503,7 @@ func (s *Stack) recvTCP(f TCPFrame, src [4]byte, now int64) {
 	key := connKey{lport: f.DstPort(), rip: src, rport: f.SrcPort()}
 	if c, exists := s.conns[key]; exists {
 		c.tcp.recv(seg, now)
-		s.maybeAccept(c)
+		s.maybeAccept(c, now)
 		s.reap(key, c)
 		s.notify()
 		return
@@ -526,12 +553,12 @@ func (s *Stack) recvTCP(f TCPFrame, src [4]byte, now int64) {
 
 // maybeAccept offers a newly established embryo to its listener. The handshake
 // completes on receive and need not produce an outgoing segment.
-func (s *Stack) maybeAccept(c *sconn) {
+func (s *Stack) maybeAccept(c *sconn, now int64) {
 	// Include CLOSE-WAIT because the final handshake ACK may also carry data and
 	// FIN, passing through ESTABLISHED within one receive.
-	if c.listener != nil && !c.accepted &&
+	if c.listener != nil && c.handoffDeadline == 0 &&
 		(c.tcp.state == tcpEstablished || c.tcp.state == tcpCloseWait) {
-		c.accepted = true
+		c.handoffDeadline = now + tcpBacklogWaitDur
 		c.listener.offer(c)
 	}
 }
@@ -541,7 +568,7 @@ func (s *Stack) maybeAccept(c *sconn) {
 // Move any pending RST to the connectionless queue first, or abort-and-reap can
 // delete it before the pump sees it.
 func (s *Stack) reap(key connKey, c *sconn) {
-	if c.tcp.state != tcpClosed || c.reaped {
+	if c.tcp.state != tcpClosed || s.conns[key] != c {
 		return
 	}
 	if r := c.tcp.rst; r.set {
@@ -549,7 +576,6 @@ func (s *Stack) reap(key connKey, c *sconn) {
 		c.tcp.rst = pendingRST{}
 		s.queueRSTLocked(key.rip, key.lport, key.rport, r.seq, r.ack, r.withAck)
 	}
-	c.reaped = true
 	delete(s.conns, key)
 	s.pot.release(c.tcp.rx.size() + c.tcp.tx.size())
 	// Wake blocked operations when a timer, rather than ingress, killed the connection.
@@ -567,7 +593,7 @@ func (s *Stack) newConnLocked(key connKey) (*sconn, error) {
 	if !s.pot.reserve(tcpFloorRing) {
 		return nil, errNoBudget
 	}
-	c := &sconn{stack: s, key: key}
+	c := &sconn{key: key}
 	c.tcp.rx = ring{buf: make([]byte, tcpFloorRx)}
 	c.tcp.tx = txRing{ring: ring{buf: make([]byte, tcpFloorTx)}}
 	c.tcp.pot = &s.pot
@@ -616,7 +642,7 @@ func (s *Stack) tcpPortInUse(p uint16) bool {
 // ---- egress pump ----
 
 // pump sleeps until the earliest deadline or notification, then drains all
-// ready output.
+// ready output. Stack.Close is its sole terminal condition.
 func (s *Stack) pump() {
 	for {
 		s.mu.Lock()
@@ -624,7 +650,12 @@ func (s *Stack) pump() {
 			s.mu.Unlock()
 			return
 		}
+		wakeBeforeDrain := s.wake
 		again := s.drainLocked()
+		// drainLocked may notify socket waiters while also queueing work late in
+		// its pass (for example a route-failure RST). That notification cannot
+		// wake this goroutine while it owns mu, so consume it as one more pass.
+		again = again || s.wake != wakeBeforeDrain
 		deadline := s.nextDeadlineLocked()
 		ch := s.wake
 		s.mu.Unlock()
@@ -658,6 +689,7 @@ func (s *Stack) drainLocked() (again bool) {
 			s.sendIPv4Locked(mac, o.dst, o.proto, o.pkt)
 		}
 	}
+	clear(s.out) // release payloads retained by the reusable backing array
 	s.out = s.out[:0]
 
 	// Wake route waiters when an ARP query gives up in this drain cycle.
@@ -684,6 +716,13 @@ func (s *Stack) drainLocked() (again bool) {
 	// Drain each TCP connection when its route is available. emit is lazy, so a
 	// missing MAC consumes no sequence state while ARP resolution runs.
 	for key, c := range s.conns {
+		// Lifecycle ownership bounds do not depend on reachability. Reap first;
+		// the queued RST remains best-effort if the route has disappeared.
+		if (c.handoffDeadline != 0 && now >= c.handoffDeadline) || c.tcp.lifecycleExpired(now) {
+			c.tcp.abort()
+			s.reap(key, c)
+			continue
+		}
 		mac, ok := s.routeLocked(key.rip, now, true)
 		if !ok {
 			// Abort once ARP gave up or routing has no gateway. Otherwise emit never
@@ -741,10 +780,11 @@ func (s *Stack) nextDeadlineLocked() int64 {
 	}
 	for _, c := range s.conns {
 		add(c.tcp.nextDeadline())
+		add(c.handoffDeadline)
 	}
 	s.arp.nextDeadline(add)
 	if s.v6 != nil {
-		s.v6.ndp.nextDeadline(add)
+		s.v6.nextDeadline(add)
 	}
 	return d
 }
@@ -932,12 +972,14 @@ type wireSeg struct {
 
 // sconn combines a TCP machine with stack identity.
 type sconn struct {
-	stack    *Stack
 	key      connKey
 	tcp      tcpConn
 	listener *tcpListener // set on embryos and cleared by accept
-	accepted bool
-	reaped   bool
+
+	// handoffDeadline bounds an established connection while it is queued for
+	// Accept and has no application owner. It is absolute and peer traffic never
+	// renews it; Accept clears it under the stack lock.
+	handoffDeadline int64
 
 	optsBuf [8]byte
 }

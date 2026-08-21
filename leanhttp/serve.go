@@ -21,6 +21,7 @@ package leanhttp
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -106,6 +107,10 @@ type Request struct {
 	doneOnce  sync.Once
 	done      chan struct{}
 	keepAlive bool
+
+	// ctx, when set by WithContext, overrides the connection-derived lifetime
+	// that Context builds from Done.
+	ctx context.Context
 }
 
 // PathValue returns a matched wildcard value, or "" when absent.
@@ -157,6 +162,54 @@ func (r *Request) Done() <-chan struct{} {
 		}()
 	})
 	return r.done
+}
+
+// Context is the request's lifetime as a context: it is cancelled when the
+// client goes away, which is what a long-lived stream watches to stop
+// producing. It carries no deadline and no values.
+//
+// It is built on [Request.Done] and shares its cost and its rules: asking for
+// the lifetime claims the connection's read side, so the connection is not
+// reused afterwards. Only ask for it in a handler that streams — a handler
+// that answers and returns should not — and ask before the first Flush.
+func (r *Request) Context() context.Context {
+	switch {
+	case r.ctx != nil:
+		return r.ctx
+	case r.done != nil || r.c != nil:
+		return connContext{done: r.Done()}
+	}
+	return context.Background()
+}
+
+// WithContext narrows the request's lifetime to ctx and returns r. Unlike
+// net/http's method of the same name it does NOT copy the request (the struct
+// carries per-request state that must not be duplicated); middleware that
+// wraps a handler for one request owns that request and may narrow it in
+// place.
+func (r *Request) WithContext(ctx context.Context) *Request {
+	r.ctx = ctx
+	return r
+}
+
+// connContext is a lifetime with nothing but an end: no deadline, no values.
+// It bridges the transport's done-channel to the context every caller of
+// [Request.Context] expects.
+type connContext struct {
+	done <-chan struct{}
+}
+
+func (connContext) Deadline() (time.Time, bool) { return time.Time{}, false }
+func (c connContext) Done() <-chan struct{}     { return c.done }
+func (connContext) Value(any) any               { return nil }
+
+func (c connContext) Err() error {
+	select {
+	case <-c.done:
+		return context.Canceled
+	default:
+		return nil
+	}
 }
 
 // Serve accepts until the listener closes and serves each connection in a goroutine.
@@ -426,7 +479,7 @@ func readRequest(c *conn) (*Request, error) {
 	r.keepAlive = !connectionHas(hdr.Get("Connection"), "close")
 
 	// Reject all Expect values with 417, which RFC 9110 §10.1.1 permits. No
-	// internal caller needs the 100-Continue state machine. Do not drain because
+	// server consumer needs the 100-Continue state machine. Do not drain because
 	// an Expect client is waiting before sending its body.
 	if hdr.Get("Expect") != "" {
 		return nil, parseError{StatusExpectationFailed,
@@ -816,6 +869,8 @@ func statusText(status int) string {
 		return "OK"
 	case StatusCreated:
 		return "Created"
+	case StatusAccepted:
+		return "Accepted"
 	case StatusNoContent:
 		return "No Content"
 	case 205:
@@ -834,6 +889,10 @@ func statusText(status int) string {
 		return "Not Found"
 	case StatusMethodNotAllowed:
 		return "Method Not Allowed"
+	case StatusNotAcceptable:
+		return "Not Acceptable"
+	case StatusConflict:
+		return "Conflict"
 	case 411:
 		return "Length Required"
 	case StatusRequestEntityTooLarge:
@@ -844,6 +903,10 @@ func statusText(status int) string {
 		return "Internal Server Error"
 	case 501:
 		return "Not Implemented"
+	case StatusBadGateway:
+		return "Bad Gateway"
+	case StatusServiceUnavailable:
+		return "Service Unavailable"
 	case 505:
 		return "HTTP Version Not Supported"
 	}

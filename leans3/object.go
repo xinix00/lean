@@ -14,6 +14,8 @@ import (
 	"github.com/xinix00/lean/leanhttp"
 )
 
+const maxBufferedGetBytes int64 = 4 << 20
+
 // PutOptions contains one PUT's conditions and metadata. Nil means an
 // unconditional application/octet-stream write. IfMatch and IfNoneMatch are raw
 // header values because providers disagree about quoted ETag forms.
@@ -35,8 +37,8 @@ type DeleteOptions struct {
 	IfMatch string
 }
 
-// Get returns an object's bytes and ETag, or [ErrNotFound]. It buffers the full
-// object; use [Client.GetTo] for data larger than configuration or state.
+// Get returns an object's bytes and ETag, or [ErrNotFound]. It buffers at most
+// 4 MiB; use [Client.GetTo] for larger objects.
 func (c *Client) Get(ctx context.Context, key string) ([]byte, string, error) {
 	u, err := c.URLFor(key)
 	if err != nil {
@@ -53,9 +55,17 @@ func (c *Client) Get(ctx context.Context, key string) ([]byte, string, error) {
 	if resp.StatusCode != leanhttp.StatusOK {
 		return nil, "", c.fail(methodGet, key, resp)
 	}
-	data, err := io.ReadAll(resp.Body)
+	if resp.Length > maxBufferedGetBytes {
+		return nil, "", fmt.Errorf("%w: GET %s is %d bytes; limit is %d",
+			ErrObjectTooLarge, key, resp.Length, maxBufferedGetBytes)
+	}
+	data, err := io.ReadAll(io.LimitReader(resp.Body, maxBufferedGetBytes+1))
 	if err != nil {
 		return nil, "", fmt.Errorf("leans3: read GET %s body: %w", key, err)
+	}
+	if int64(len(data)) > maxBufferedGetBytes {
+		return nil, "", fmt.Errorf("%w: GET %s exceeds %d bytes",
+			ErrObjectTooLarge, key, maxBufferedGetBytes)
 	}
 	return data, resp.Header.Get("ETag"), nil
 }
@@ -249,10 +259,13 @@ type listEntry struct {
 }
 
 // List returns keys with prefix in S3 lexical order and follows pagination.
-// Positive max bounds the result and sets truncated when reached; non-positive
-// max is unbounded and may consume memory proportional to the bucket. It
-// deliberately omits sizes and dates because current consumers need a key map.
+// max must be positive and bounds the returned slice. The result sets truncated
+// when max is reached. Sizes and dates are omitted because current consumers need
+// only a key map.
 func (c *Client) List(ctx context.Context, prefix string, max int) (keys []string, truncated bool, err error) {
+	if max <= 0 {
+		return nil, false, errors.New("leans3: List max must be positive")
+	}
 	token := ""
 	for {
 		page, err := c.listPage(ctx, prefix, token)
@@ -260,10 +273,13 @@ func (c *Client) List(ctx context.Context, prefix string, max int) (keys []strin
 			return nil, false, err
 		}
 		for _, item := range page.Contents {
-			if max > 0 && len(keys) >= max {
+			if len(keys) >= max {
 				return keys, true, nil
 			}
 			keys = append(keys, item.Key)
+		}
+		if len(keys) == max && page.IsTruncated {
+			return keys, true, nil
 		}
 		if !page.IsTruncated {
 			return keys, false, nil
@@ -271,7 +287,14 @@ func (c *Client) List(ctx context.Context, prefix string, max int) (keys []strin
 		if page.NextContinuationToken == "" {
 			return nil, false, fmt.Errorf("leans3: LIST %s: truncated page without a continuation token", prefix)
 		}
-		token = page.NextContinuationToken
+		if len(page.Contents) == 0 {
+			return nil, false, fmt.Errorf("leans3: LIST %s: truncated page made no key progress", prefix)
+		}
+		next := page.NextContinuationToken
+		if next == token {
+			return nil, false, fmt.Errorf("leans3: LIST %s: continuation token did not advance", prefix)
+		}
+		token = next
 	}
 }
 
@@ -304,9 +327,12 @@ func (c *Client) listPage(ctx context.Context, prefix, token string) (*listBucke
 	// A valid page has at most 1,000 keys of at most 1 KiB. Bound reads before
 	// parsing so a stalled or hostile response cannot grow the heap indefinitely.
 	const maxPage = 4 << 20
-	body, err := io.ReadAll(io.LimitReader(resp.Body, maxPage))
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxPage+1))
 	if err != nil {
 		return nil, fmt.Errorf("leans3: read LIST %s body: %w", prefix, err)
+	}
+	if len(body) > maxPage {
+		return nil, fmt.Errorf("leans3: LIST %s response exceeds %d bytes", prefix, maxPage)
 	}
 	page, err := parseListPage(body)
 	if err != nil {

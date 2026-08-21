@@ -23,16 +23,18 @@ const (
 	ndpCacheCap      = 128
 	ndpRSTries       = 3                    // solicitations before waiting for an unsolicited RA
 	ndpRSIval        = int64(4_000_000_000) // RFC 4861 §6.3.7: 4s between RS
-	ndpPrefixCap     = 4                    // on-link prefixes retained from PIOs
+	ndpPrefixCap     = 4                    // PIO identities retained for on-link/SLAAC state
 	ndpRouteCap      = 8                    // specific routes retained from RIOs
 )
 
 // NDPStats mirrors ARPStats for the v6 neighbor machine.
 type NDPStats struct {
 	GaveUp     int // queries that exhausted their tries
-	LearnDrop  int // passive learns refused by the cap
-	FullDrop   int // resolutions refused because the table was full
+	LearnDrop  int // passive learns refused by the neighbor cap
+	FullDrop   int // resolutions refused because the neighbor table was full
 	ReplyDrop  int // NA replies dropped by the queue cap
+	PrefixDrop int // new PIO identities refused by ndpPrefixCap
+	RouteDrop  int // new RIO routes refused by ndpRouteCap
 	MACChanged int // resolved entries whose MAC changed
 	Ignored    int // advertisements that matched no refreshable entry
 	BadNDP     int // NDP packets that failed validation (hop limit, options)
@@ -54,8 +56,9 @@ type ndpTable struct {
 	ourMAC  [6]byte
 	replies []ndpReply
 
-	// Router solicitation state: emit sends up to ndpRSTries while no RA has
-	// arrived; the first valid RA stops it.
+	// Router solicitation state: emit sends up to ndpRSTries while no usable
+	// RA configuration exists. Losing the last live router/prefix/route starts
+	// a fresh bounded solicitation cycle.
 	rsTries int
 	rsDue   int64
 	rsDone  bool
@@ -238,10 +241,19 @@ type ndpEmit struct {
 // emit yields one queued advertisement, due solicitation, or router
 // solicitation. The caller loops until false. buf backs the body.
 func (t *ndpTable) emit(buf []byte, now int64) (e ndpEmit, ok bool) {
-	if len(t.replies) > 0 {
+	return t.emitOwned(buf, now, nil)
+}
+
+// emitOwned is the wire-facing form. A queued NA is discarded if ownership of
+// its target disappeared between ingress and drain (for example SLAAC expiry).
+func (t *ndpTable) emitOwned(buf []byte, now int64, owns func([16]byte) bool) (e ndpEmit, ok bool) {
+	for len(t.replies) > 0 {
 		r := t.replies[0]
 		copy(t.replies, t.replies[1:])
 		t.replies = t.replies[:len(t.replies)-1]
+		if owns != nil && !owns(r.target) {
+			continue
+		}
 		// NA body: flags(4) target(16) + target LLA option.
 		body := buf[:28]
 		for i := range body {
@@ -297,10 +309,18 @@ func (t *ndpTable) nextDeadline(add func(int64)) {
 
 // ---- router advertisements (RFC 4861 §6, RFC 4191 routes) ----
 
-// v6prefix is one on-link prefix learned from a PIO.
+// v6prefix is one canonical PIO identity. The L and A flags have independent
+// lifetimes because a later PIO that omits one flag makes no statement about
+// the state previously learned through that flag.
 type v6prefix struct {
 	prefix [16]byte
 	bits   int
+
+	onLink         bool
+	onLinkUntil    int64
+	autonomous     bool
+	validUntil     int64
+	preferredUntil int64
 }
 
 // v6route is one specific route from a RIO: traffic for prefix goes via router.
@@ -308,39 +328,44 @@ type v6route struct {
 	prefix [16]byte
 	bits   int
 	router [16]byte // link-local address of the advertising router
+	until  int64
 }
 
-// RA actions retain explicit zero-lifetime withdrawals until ipv6.go commits
-// the fully validated advertisement. They are not stored in the route tables.
+// RA actions retain lifetimes until ipv6.go atomically commits the completely
+// validated advertisement. A zero valid lifetime is an explicit withdrawal.
 type raPrefix struct {
-	prefix   v6prefix
-	withdraw bool
+	prefix        [16]byte
+	bits          int
+	onLink        bool
+	autonomous    bool
+	validLife     uint32
+	preferredLife uint32
 }
 
 type raRoute struct {
-	route    v6route
-	withdraw bool
+	prefix   [16]byte
+	bits     int
+	router   [16]byte
+	lifetime uint32
 }
 
 // raResult is what one router advertisement taught the stack; ipv6.go applies
 // it to the address and route state under the same lock.
 type raResult struct {
-	router      [16]byte // the RA's source (link-local)
-	hasLifetime bool     // router lifetime > 0: usable as default router
-	slaac       [16]byte // address formed from the first autonomous prefix
-	hasSLAAC    bool
-	prefixes    []raPrefix
-	routes      []raRoute
-	hasMAC      bool
-	mac         [6]byte
+	router         [16]byte // the RA's source (link-local)
+	routerLifetime uint16
+	prefixes       []raPrefix
+	routes         []raRoute
+	hasMAC         bool
+	mac            [6]byte
 }
 
 // recvRA parses an advertisement without changing any table. The caller
 // commits r only after this function has validated the complete option list,
 // so a malformed suffix cannot leave a learned MAC or partial route behind.
-// Wall-clock lifetimes are deliberately absent, but explicit zero values are
-// retained as withdrawal actions.
-func (t *ndpTable) recvRA(f ICMPv6Frame, src, dst [16]byte, srcHW, ourMAC [6]byte) (r raResult, ok bool) {
+// Lifetimes remain relative seconds here and become monotonic deadlines only
+// when the caller commits the result with its single captured `now` value.
+func (t *ndpTable) recvRA(f ICMPv6Frame, src, dst [16]byte, srcHW, _ [6]byte) (r raResult, ok bool) {
 	if f.Code() != 0 || !isLinkLocal6(src) || !validUnicastMAC(srcHW) ||
 		(isMulticast6(dst) && dst != allNodes6) {
 		t.cnt.BadNDP++
@@ -352,7 +377,7 @@ func (t *ndpTable) recvRA(f ICMPv6Frame, src, dst [16]byte, srcHW, ourMAC [6]byt
 		return r, false
 	}
 	r.router = src
-	r.hasLifetime = binary.BigEndian.Uint16(body[2:4]) > 0
+	r.routerLifetime = binary.BigEndian.Uint16(body[2:4])
 	valid := ndpOptions(body[12:], func(typ byte, opt []byte) bool {
 		switch typ {
 		case ndpOptSourceLLA:
@@ -381,22 +406,18 @@ func (t *ndpTable) recvRA(f ICMPv6Frame, src, dst [16]byte, srcHW, ourMAC [6]byt
 			if isLinkLocal6(prefix) || isMulticast6(prefix) {
 				return false
 			}
-			key := v6prefix{prefix: prefix, bits: bits}
+			key := raPrefix{prefix: prefix, bits: bits}
 			for _, have := range r.prefixes {
-				if have.prefix == key {
+				if have.prefix == key.prefix && have.bits == key.bits {
 					return false
 				}
 			}
-			if flags&0x80 != 0 { // L: on-link
-				r.prefixes = append(r.prefixes, raPrefix{prefix: key, withdraw: validLife == 0})
-			}
-			// A: autonomous — form one SLAAC address from the first /64.
-			if flags&0x40 != 0 && bits == 64 && validLife > 0 && !r.hasSLAAC {
-				addr := prefix
-				iid := llAddrFromMAC(ourMAC)
-				copy(addr[8:], iid[8:])
-				r.slaac = addr
-				r.hasSLAAC = true
+			key.onLink = flags&0x80 != 0
+			key.autonomous = flags&0x40 != 0 && bits == 64
+			key.validLife = validLife
+			key.preferredLife = preferredLife
+			if key.onLink || key.autonomous {
+				r.prefixes = append(r.prefixes, key)
 			}
 		case ndpOptRouteInfo:
 			if len(opt) != 8 && len(opt) != 16 && len(opt) != 24 {
@@ -416,16 +437,13 @@ func (t *ndpTable) recvRA(f ICMPv6Frame, src, dst [16]byte, srcHW, ourMAC [6]byt
 			if bits > 0 && (isLinkLocal6(prefix) || isMulticast6(prefix)) {
 				return false
 			}
-			key := v6prefix{prefix: prefix, bits: bits}
+			key := raRoute{prefix: prefix, bits: bits, router: src, lifetime: lifetime}
 			for _, have := range r.routes {
-				if have.route.prefix == key.prefix && have.route.bits == key.bits {
+				if have.prefix == key.prefix && have.bits == key.bits {
 					return false
 				}
 			}
-			r.routes = append(r.routes, raRoute{
-				route:    v6route{prefix: prefix, bits: bits, router: src},
-				withdraw: lifetime == 0,
-			})
+			r.routes = append(r.routes, key)
 		}
 		return true
 	})

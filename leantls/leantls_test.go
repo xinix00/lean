@@ -251,6 +251,216 @@ func TestCloseSendsCloseNotify(t *testing.T) {
 	}
 }
 
+// blockedWriteConn models the adversarial case Close must resolve: the peer
+// stopped reading, so a transport Write does not return until the transport is
+// closed. It intentionally ignores write deadlines as a belt-and-suspenders
+// check that Close's fallback timer still reaches the transport.
+type blockedWriteConn struct {
+	writeStarted chan struct{}
+	closed       chan struct{}
+	startOnce    sync.Once
+	closeOnce    sync.Once
+
+	mu            sync.Mutex
+	closeCalls    int
+	writeDeadline time.Time
+}
+
+func newBlockedWriteConn() *blockedWriteConn {
+	return &blockedWriteConn{
+		writeStarted: make(chan struct{}),
+		closed:       make(chan struct{}),
+	}
+}
+
+func (c *blockedWriteConn) Read([]byte) (int, error) {
+	<-c.closed
+	return 0, net.ErrClosed
+}
+
+func (c *blockedWriteConn) Write([]byte) (int, error) {
+	c.startOnce.Do(func() { close(c.writeStarted) })
+	<-c.closed
+	return 0, net.ErrClosed
+}
+
+func (c *blockedWriteConn) Close() error {
+	c.mu.Lock()
+	c.closeCalls++
+	c.mu.Unlock()
+	c.closeOnce.Do(func() { close(c.closed) })
+	return nil
+}
+
+func (c *blockedWriteConn) LocalAddr() net.Addr  { return nil }
+func (c *blockedWriteConn) RemoteAddr() net.Addr { return nil }
+func (c *blockedWriteConn) SetDeadline(t time.Time) error {
+	return c.SetWriteDeadline(t)
+}
+func (c *blockedWriteConn) SetReadDeadline(time.Time) error { return nil }
+func (c *blockedWriteConn) SetWriteDeadline(t time.Time) error {
+	c.mu.Lock()
+	c.writeDeadline = t
+	c.mu.Unlock()
+	return nil
+}
+
+func (c *blockedWriteConn) state() (int, time.Time) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.closeCalls, c.writeDeadline
+}
+
+func encryptedConnForCloseTest(raw net.Conn) *Conn {
+	c := &Conn{conn: raw}
+	c.setWrite(trafficKeys{key: make([]byte, keyLen), iv: make([]byte, ivLen)})
+	return c
+}
+
+type recordTimeoutError struct{}
+
+func (*recordTimeoutError) Error() string   { return "record write timed out" }
+func (*recordTimeoutError) Timeout() bool   { return true }
+func (*recordTimeoutError) Temporary() bool { return true }
+
+var errRecordWriteTimeout = &recordTimeoutError{}
+
+// failSecondRecordConn accepts one complete TLS record and fails the next. A
+// third Write would prove that application-level progress retry resumed a TLS
+// stream after its record sequence/ciphertext became ambiguous.
+type failSecondRecordConn struct {
+	mu     sync.Mutex
+	writes int
+	closed bool
+}
+
+func (*failSecondRecordConn) Read([]byte) (int, error) { return 0, io.EOF }
+func (c *failSecondRecordConn) Write(p []byte) (int, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.writes++
+	if c.writes == 2 {
+		return 0, errRecordWriteTimeout
+	}
+	return len(p), nil
+}
+func (c *failSecondRecordConn) Close() error {
+	c.mu.Lock()
+	c.closed = true
+	c.mu.Unlock()
+	return nil
+}
+func (*failSecondRecordConn) LocalAddr() net.Addr              { return nil }
+func (*failSecondRecordConn) RemoteAddr() net.Addr             { return nil }
+func (*failSecondRecordConn) SetDeadline(time.Time) error      { return nil }
+func (*failSecondRecordConn) SetReadDeadline(time.Time) error  { return nil }
+func (*failSecondRecordConn) SetWriteDeadline(time.Time) error { return nil }
+func (c *failSecondRecordConn) state() (writes int, closed bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.writes, c.closed
+}
+
+func TestRecordWriteErrorIsPermanentAcrossApplicationRetry(t *testing.T) {
+	raw := &failSecondRecordConn{}
+	c := encryptedConnForCloseTest(raw)
+	payload := make([]byte, maxPlain+1) // two TLS records
+
+	n, err := c.Write(payload)
+	if n != maxPlain || !errors.Is(err, errRecordWriteTimeout) {
+		t.Fatalf("multi-record Write = %d, %v; wil %d bytes plus timeout", n, err, maxPlain)
+	}
+	seqAfterFailure := c.wSeq
+	n, err = c.Write(payload[maxPlain:])
+	if n != 0 || !errors.Is(err, errRecordWriteTimeout) {
+		t.Fatalf("retry na recordfout = %d, %v; wil 0 plus dezelfde permanente fout", n, err)
+	}
+	if c.wSeq != seqAfterFailure {
+		t.Fatalf("retry verbruikte TLS-recordsequentie %d -> %d", seqAfterFailure, c.wSeq)
+	}
+	if writes, _ := raw.state(); writes != 2 {
+		t.Fatalf("retry schreef een derde record naar de corrupte stream: %d writes", writes)
+	}
+	if err := c.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if writes, closed := raw.state(); writes != 2 || !closed {
+		t.Fatalf("Close na permanente writefout: writes=%d closed=%v", writes, closed)
+	}
+}
+
+func TestCloseUnblocksConcurrentWrite(t *testing.T) {
+	raw := newBlockedWriteConn()
+	c := encryptedConnForCloseTest(raw)
+
+	writeDone := make(chan error, 1)
+	go func() {
+		_, err := c.Write([]byte("peer leest dit niet"))
+		writeDone <- err
+	}()
+	select {
+	case <-raw.writeStarted:
+	case <-time.After(time.Second):
+		t.Fatal("Write begon niet")
+	}
+
+	const closers = 8
+	closeDone := make(chan error, closers)
+	for range closers {
+		go func() { closeDone <- c.Close() }()
+	}
+	select {
+	case <-raw.closed:
+	case <-time.After(time.Second):
+		t.Fatal("Close bereikte het transport niet achter een geblokkeerde Write")
+	}
+	for range closers {
+		if err := <-closeDone; err != nil {
+			t.Errorf("Close: %v", err)
+		}
+	}
+	if err := <-writeDone; !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("geblokkeerde Write eindigde met %v, wil net.ErrClosed", err)
+	}
+	if calls, _ := raw.state(); calls != 1 {
+		t.Fatalf("onderliggende Close is %d keer aangeroepen, wil 1", calls)
+	}
+}
+
+func TestBlockedCloseNotifyStillClosesTransport(t *testing.T) {
+	raw := newBlockedWriteConn()
+	c := encryptedConnForCloseTest(raw)
+
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- c.Close() }()
+	select {
+	case <-raw.writeStarted:
+	case <-time.After(time.Second):
+		t.Fatal("close_notify werd niet geprobeerd")
+	}
+	select {
+	case <-raw.closed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("geblokkeerde close_notify verhinderde de transport-close")
+	}
+	if err := <-closeDone; err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	calls, deadline := raw.state()
+	if calls != 1 {
+		t.Fatalf("onderliggende Close is %d keer aangeroepen, wil 1", calls)
+	}
+	if deadline.IsZero() {
+		t.Fatal("close_notify kreeg geen begrensde write-deadline")
+	}
+	if err := c.Close(); err != nil {
+		t.Fatalf("tweede Close: %v", err)
+	}
+	if calls, _ := raw.state(); calls != 1 {
+		t.Fatalf("tweede Close bereikte transport opnieuw: %d calls", calls)
+	}
+}
+
 func TestConcurrentWrites(t *testing.T) {
 	addr, pin := testServer(t, tls.VersionTLS13, tls.VersionTLS13, echo)
 	conn, err := Dial("tcp", addr, &Config{PeerKey: pin})

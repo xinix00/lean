@@ -4,15 +4,202 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
+
+func TestCallContextAnnuleertDial(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	dialStarted := make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		_, err := Do(Call{
+			URL:     "http://cancel-dial.test/",
+			Context: ctx,
+			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+				close(dialStarted)
+				<-ctx.Done()
+				return nil, ctx.Err()
+			},
+		})
+		done <- err
+	}()
+
+	select {
+	case <-dialStarted:
+	case <-time.After(time.Second):
+		t.Fatal("DialContext werd niet gestart")
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("Do na bare Context-cancel tijdens dial = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("bare Call.Context maakte DialContext niet los")
+	}
+}
+
+func TestCallContextAnnuleertActieveIO(t *testing.T) {
+	client, server := net.Pipe()
+	defer server.Close()
+	requestSeen := make(chan struct{})
+	go func() {
+		br := bufio.NewReader(server)
+		for {
+			line, err := br.ReadString('\n')
+			if err != nil {
+				return
+			}
+			if line == "\r\n" {
+				close(requestSeen)
+				_, _ = io.Copy(io.Discard, br)
+				return
+			}
+		}
+	}()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		_, err := Do(Call{
+			URL:     "http://context.test/",
+			Context: ctx,
+			DialContext: func(context.Context, string, string) (net.Conn, error) {
+				return client, nil
+			},
+		})
+		done <- err
+	}()
+
+	select {
+	case <-requestSeen:
+	case <-time.After(time.Second):
+		t.Fatal("request bereikte de peer niet")
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("Do na cancel = %v, wil context.Canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("context-cancel maakte geblokkeerde response-read niet los")
+	}
+}
+
+func TestCallContextStoptCallbackVoorPoolReuse(t *testing.T) {
+	client, server := net.Pipe()
+	defer server.Close()
+	requests := make(chan struct{}, 2)
+	go func() {
+		br := bufio.NewReader(server)
+		for range 2 {
+			for {
+				line, err := br.ReadString('\n')
+				if err != nil {
+					return
+				}
+				if line == "\r\n" {
+					break
+				}
+			}
+			requests <- struct{}{}
+			_, _ = io.WriteString(server, "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+		}
+	}()
+
+	var dials atomic.Int32
+	cl := &Client{DialContext: func(context.Context, string, string) (net.Conn, error) {
+		dials.Add(1)
+		return client, nil
+	}}
+	defer cl.CloseIdle()
+	ctx, cancel := context.WithCancel(context.Background())
+	resp, err := cl.Do(Call{URL: "http://pool.test/een", Context: ctx})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := resp.Body.Close(); err != nil {
+		t.Fatal(err)
+	}
+	cancel() // must no longer be able to close the pooled connection
+
+	resp, err = cl.Do(Call{URL: "http://pool.test/twee"})
+	if err != nil {
+		t.Fatalf("tweede call gebruikte een door oude context gesloten poolconn: %v", err)
+	}
+	if err := resp.Body.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if got := dials.Load(); got != 1 {
+		t.Fatalf("dials = %d, wil 1 hergebruikte connection", got)
+	}
+	if len(requests) != 2 {
+		t.Fatalf("server zag %d requests, wil 2", len(requests))
+	}
+}
+
+func TestCallContextAnnuleertResponseBody(t *testing.T) {
+	client, server := net.Pipe()
+	defer server.Close()
+	bodyStarted := make(chan struct{})
+	go func() {
+		br := bufio.NewReader(server)
+		for {
+			line, err := br.ReadString('\n')
+			if err != nil {
+				return
+			}
+			if line == "\r\n" {
+				break
+			}
+		}
+		_, _ = io.WriteString(server, "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nx")
+		close(bodyStarted)
+		_, _ = io.Copy(io.Discard, br)
+	}()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	resp, err := Do(Call{
+		URL:     "http://body-context.test/",
+		Context: ctx,
+		DialContext: func(context.Context, string, string) (net.Conn, error) {
+			return client, nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	<-bodyStarted
+	done := make(chan error, 1)
+	go func() {
+		_, err := io.ReadAll(resp.Body)
+		done <- err
+	}()
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("body-read na cancel = %v, wil context.Canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("context-cancel maakte geblokkeerde body-read niet los")
+	}
+	if err := resp.Body.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
 
 func lees(t *testing.T, r *Response) []byte {
 	t.Helper()

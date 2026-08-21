@@ -96,7 +96,7 @@ func (cl *Client) CloseIdle() {
 }
 
 // dial returns a pooled connection or creates one through the normalized
-// dialer. The context carries the call's overall deadline.
+// dialer. The context carries call cancellation and its earliest total deadline.
 //
 // Sweep before dialing: expired pooled connections may exhaust the network
 // budget and make the dial fail, so a sweep in put would never be reached.

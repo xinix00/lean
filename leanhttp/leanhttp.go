@@ -66,18 +66,36 @@ const (
 )
 
 // Status codes named by this package, without duplicating net/http's full list.
+// A code belongs here once a consumer of this package sends it.
 const (
 	StatusOK                    = 200
 	StatusCreated               = 201
+	StatusAccepted              = 202
 	StatusNoContent             = 204
 	StatusFound                 = 302
 	StatusBadRequest            = 400
+	StatusUnauthorized          = 401
 	StatusNotFound              = 404
 	StatusMethodNotAllowed      = 405
+	StatusNotAcceptable         = 406
+	StatusConflict              = 409
 	StatusRequestEntityTooLarge = 413
 	StatusExpectationFailed     = 417
 	StatusInternalServerError   = 500
 	StatusNotImplemented        = 501
+	StatusBadGateway            = 502
+	StatusServiceUnavailable    = 503
+)
+
+// Request methods, so route tables and handlers name them without magic
+// strings. Method tokens are case-sensitive (RFC 9110 §9.1).
+const (
+	MethodGet    = "GET"
+	MethodHead   = "HEAD"
+	MethodPost   = "POST"
+	MethodPut    = "PUT"
+	MethodPatch  = "PATCH"
+	MethodDelete = "DELETE"
 )
 
 // Header is a field collection. Get, Set, and Del are case-insensitive while
@@ -129,6 +147,12 @@ type Call struct {
 	Body    []byte        // nil means no body
 	Timeout time.Duration // total deadline including body reads; zero means none
 
+	// Context cancels dialing and active request/response I/O. Cancellation closes
+	// this call's exclusively-owned connection; the callback is stopped before a
+	// completed response connection may return to a pool. It cannot interrupt an
+	// arbitrary BodyReader blocked inside its own Read method. Nil means Background.
+	Context context.Context
+
 	// HeaderTimeout bounds only response-header waiting, not body transfer. This
 	// lets large downloads remain unbounded while rejecting silent servers.
 	HeaderTimeout time.Duration
@@ -143,12 +167,22 @@ type Call struct {
 
 	// DialContext overrides plain tcp4 setup for proxies, test doubles, or TLS
 	// such as leanhttps.DialerContext. addr retains the hostname for SNI and
-	// changes across redirects. ctx carries the total deadline over all hops.
+	// changes across redirects. ctx carries Context cancellation and the earliest
+	// Context/Timeout deadline over all hops.
 	DialContext func(ctx context.Context, network, addr string) (net.Conn, error)
 
 	// NoFollow returns 3xx to the caller. Cookie-jar users must follow manually
 	// because each hop may set cookies needed by the next.
 	NoFollow bool
+}
+
+// SetHeader sets one header on the call, allocating the map if needed. Saves
+// every caller the nil check.
+func (c *Call) SetHeader(key, value string) {
+	if c.Header == nil {
+		c.Header = make(Header, 2)
+	}
+	c.Header.Set(key, value)
 }
 
 // Response is one reply. Body is unread response data and must be closed.
@@ -179,7 +213,8 @@ type Response struct {
 // 200 with Content-Length. Use [Do] for other response forms.
 func Get(raw string) (*Response, error) { return GetCall(Call{URL: raw}) }
 
-// GetCall is Get with Call controls such as headers, deadlines, and DialContext.
+// GetCall is Get with Call controls such as headers, Context, deadlines, and
+// DialContext.
 func GetCall(c Call) (*Response, error) {
 	resp, err := Do(c)
 	if err != nil {
@@ -214,13 +249,30 @@ func Do(c Call) (*Response, error) { return doVia(c, nil) }
 // nil. Keeping transport separate prevents pool state masquerading as per-call
 // configuration.
 func doVia(c Call, via *Client) (*Response, error) {
-	// One absolute deadline covers dial and every redirect hop.
+	ctx := c.Context
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	// One absolute deadline covers dial and every redirect hop. A context deadline
+	// and Timeout combine by earliest expiry.
 	var total time.Time
+	if deadline, ok := ctx.Deadline(); ok {
+		total = deadline
+	}
 	if c.Timeout > 0 {
-		total = time.Now().Add(c.Timeout)
+		deadline := time.Now().Add(c.Timeout)
+		if total.IsZero() || deadline.Before(total) {
+			total = deadline
+		}
 	}
 	loc := c.URL
 	for range maxRedirects + 1 {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		resp, err := do(c, via, loc, total)
 		if err != nil && errors.Is(err, errStalePooled) && c.BodyReader == nil &&
 			(c.Method == "" || c.Method == "GET" || c.Method == "HEAD") &&
@@ -274,7 +326,8 @@ func doVia(c Call, via *Client) (*Response, error) {
 	return nil, fmt.Errorf("leanhttp: too many redirects (>%d) starting at %s", maxRedirects, c.URL)
 }
 
-// Internally, DialContext is the only dialer form and carries the total deadline.
+// Internally, DialContext is the only dialer form and carries call cancellation
+// plus the earliest total deadline.
 
 // normalizeDial returns dc or a standard-library dialer whose own timeout and
 // context deadline combine by earliest expiry.
@@ -336,12 +389,18 @@ func do(c Call, via *Client, raw string, total time.Time) (_ *Response, err erro
 		return nil, err
 	}
 
-	// Carry the total deadline through every dial path, including pool misses.
-	ctx := context.Background()
+	// Carry call cancellation and the total deadline through every dial path,
+	// including pool misses.
+	ctx := c.Context
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if !total.IsZero() {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithDeadline(ctx, total)
-		defer cancel()
+		if deadline, ok := ctx.Deadline(); !ok || total.Before(deadline) {
+			var cancel context.CancelFunc
+			ctx, cancel = context.WithDeadline(ctx, total)
+			defer cancel()
+		}
 	}
 	var dial func(ctx context.Context, network, addr string) (net.Conn, error)
 	if c.DialContext == nil && via != nil {
@@ -356,11 +415,35 @@ func do(c Call, via *Client, raw string, total time.Time) (_ *Response, err erro
 	if conn == nil {
 		return nil, fmt.Errorf("leanhttp: DialContext returned no connection and no error for %s", addr)
 	}
+	// Pooled readers stay attached to their connection.
+	var br *bufio.Reader
+	if pc, ok := conn.(*pooledConn); ok {
+		br = pc.br
+	}
+	if br == nil {
+		br = bufio.NewReaderSize(conn, bufSize)
+	}
+	// Socket deadlines cover Timeout. A bare context cancellation has no deadline,
+	// so close this call's connection to wake any blocked Read or Write. AfterFunc
+	// creates no goroutine while the context remains healthy.
+	var cancelStop func() bool
+	var cancelDone chan struct{}
+	if c.Context != nil && c.Context.Done() != nil {
+		cancelDone = make(chan struct{})
+		cancelStop = context.AfterFunc(c.Context, func() {
+			_ = conn.Close()
+			close(cancelDone)
+		})
+	}
 	// Every later failure closes; success transfers ownership through Body.
 	handedOff := false
 	defer func() {
 		if !handedOff {
+			stopContextClose(cancelStop, cancelDone)
 			conn.Close()
+		}
+		if err != nil && c.Context != nil && c.Context.Err() != nil {
+			err = c.Context.Err()
 		}
 	}()
 	// total covers all I/O and redirects. HeaderTimeout may shorten only the
@@ -371,14 +454,6 @@ func do(c Call, via *Client, raw string, total time.Time) (_ *Response, err erro
 			return nil, fmt.Errorf("leanhttp: set deadline: %w", err)
 		}
 	}
-	// Expect needs a reader before any streamed body byte is sent.
-	var br *bufio.Reader
-	if pc, ok := conn.(*pooledConn); ok {
-		br = pc.br // Pooling preserves the reader with the connection.
-	} else {
-		br = bufio.NewReaderSize(conn, bufSize)
-	}
-
 	// A reused connection failing before any response byte is safely retryable.
 	_, pooled := conn.(*pooledConn)
 	stale := func(err error) error {
@@ -581,7 +656,8 @@ func do(c Call, via *Client, raw string, total time.Time) (_ *Response, err erro
 		!connectionHas(connHdr, "close") && bodySent
 
 	handedOff = true
-	b := body{r: rd, c: conn, deadline: total}
+	b := body{r: rd, c: conn, deadline: total, ctx: c.Context,
+		cancelStop: cancelStop, cancelDone: cancelDone}
 	// Proven-empty bodies are complete immediately; chunked completes only after
 	// its zero chunk.
 	if bodyless || (!chunked && length == 0) {
@@ -827,6 +903,13 @@ type body struct {
 
 	// deadline also covers bufio read-ahead, which bypasses socket deadlines.
 	deadline time.Time
+	ctx      context.Context
+
+	// cancelStop unregisters Context's connection-close callback before pooling.
+	// When stopping loses the race, cancelDone lets Close wait until the callback
+	// has finished touching the connection.
+	cancelStop func() bool
+	cancelDone <-chan struct{}
 
 	// mu protects Read completion against concurrent Close cancellation.
 	mu   sync.Mutex
@@ -835,10 +918,18 @@ type body struct {
 }
 
 func (b *body) Read(p []byte) (int, error) {
+	if b.ctx != nil {
+		if err := b.ctx.Err(); err != nil {
+			return 0, err
+		}
+	}
 	if !b.deadline.IsZero() && time.Now().After(b.deadline) {
 		return 0, os.ErrDeadlineExceeded
 	}
 	n, err := b.r.Read(p)
+	if err != nil && b.ctx != nil && b.ctx.Err() != nil {
+		err = b.ctx.Err()
+	}
 	if err == io.EOF {
 		// Only a proven framed end enables pooling. Incomplete framing returns
 		// io.ErrUnexpectedEOF; EOF-delimited bodies are never poolable.
@@ -889,6 +980,13 @@ func (b *body) Close() error {
 	b.shut = true
 	done := b.done
 	b.mu.Unlock()
+	cancelled := !stopContextClose(b.cancelStop, b.cancelDone)
+	if b.ctx != nil && b.ctx.Err() != nil {
+		cancelled = true
+	}
+	if cancelled {
+		return b.c.Close()
+	}
 	if !done {
 		// Incomplete means close immediately without inspecting a reader that may
 		// still be active in another goroutine.
@@ -905,6 +1003,19 @@ func (b *body) Close() error {
 		return nil // Connection remains alive in the pool.
 	}
 	return b.c.Close()
+}
+
+// stopContextClose prevents a later cancellation from closing a connection
+// after ownership has returned to a pool. False means cancellation won the race.
+func stopContextClose(stop func() bool, done <-chan struct{}) bool {
+	if stop == nil {
+		return true
+	}
+	if stop() {
+		return true
+	}
+	<-done
+	return false
 }
 
 // chunkReader decodes hexadecimal size, data, and CRLF chunks, ending at the

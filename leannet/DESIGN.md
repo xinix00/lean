@@ -45,7 +45,7 @@ is needed.
 |---|---|---|
 | **Congestion control (cwnd, slow start)** | Senders such as GitHub and Bunny limit our downloads; our uploads are heartbeats and API responses. We have no path that fills a congested link. | When a node sends large uploads over a congested WAN. The send loop already caps on `sndWnd`; cwnd would be a second cap. |
 | **Out-of-order reassembly (SACK, reorder buffer)** | An out-of-order segment is dropped with an immediate duplicate ACK, and the peer recovers through fast retransmit. This is RFC-compliant and removes the half of the state machine where lneto's bugs lived. | When hardware measurements show that reordering, rather than loss, costs throughput. Reordering is rare on our LANs and single-gateway paths. |
-| **General-purpose IPv6** | The measured path needs UDP, link-scoped discovery, and a ULA behind a Thread border router—not a second TCP stack or every IPv6 control plane. The implemented lane therefore stops at ICMPv6/NDP, one SLAAC identity, and bounded PIO/RIO routing. | Extend only for a measured consumer. TCPv6, DHCPv6, IPv4-mapped dual-family sockets, extension headers, fragmentation, PMTUD, MLD, wider multicast, full NUD, active DAD, ICMPv6 redirect/error state, privacy addresses, multiple SLAAC identities, and automatic renumbering are separate features, not implied follow-ups. |
+| **General-purpose IPv6** | The measured path needs UDP, link-scoped discovery, and a ULA behind a Thread border router—not a second TCP stack or every IPv6 control plane. The implemented lane therefore stops at ICMPv6/NDP, one active SLAAC identity, and bounded, expiring PIO/RIO routing. | Extend only for a measured consumer. TCPv6, DHCPv6, IPv4-mapped dual-family sockets, extension headers, fragmentation, PMTUD, MLD, wider multicast, full NUD, active DAD, ICMPv6 redirect/error state, privacy addresses, and multiple simultaneous SLAAC identities are separate features, not implied follow-ups. |
 | **IPv4 fragmentation and options** | Both fail with their own error and counter. Our paths use DF and MTU 1500; options do not occur. Silent acceptance would hide them from metrics. | Only when a measured path sends them. Reassembly brings its full attack surface. |
 | **TCP timestamps / PAWS** | Needed only to prevent sequence wrap within one RTT (sustained >1 Gbit/s) or for finer RTT measurement. Karn's algorithm is enough for our RTO. | At multi-gigabit throughput per connection. |
 | **Nagle** | Disabled. Embedded traffic is small and latency-sensitive; coalescing would add unrequested delay. | Never by default; perhaps as a socket option. |
@@ -82,14 +82,31 @@ happens per datagram: link-local for link-local or `ff02::/16`, and SLAAC for
 routed traffic.
 
 The address model is intentionally finite: one EUI-64 link-local address and
-the first SLAAC address from an autonomous `/64`. Router advertisements can
-install capped on-link PIO prefixes, capped RIO routes, and one default router;
-the longest matching RIO wins and a newer advertisement for the same prefix
-replaces its next hop. Explicit PIO/RIO withdrawals remove routing state, but a
-PIO withdrawal does not silently replace the selected SLAAC identity.
-Wall-clock lifetimes, route preference, and automatic renumbering do not run in
-the stack; that identity lasts until restart. Before a usable RA, an off-link
-write returns no-route immediately and may be retried on the same socket.
+one active SLAAC address selected from at most four PIO identities. Router,
+PIO valid/preferred, and RIO lifetimes become monotonic deadlines serviced by
+the normal pump. Every positive wire lifetime—including `0xffffffff`—is capped
+to a renewable two-hour local lease. Periodic advertisements renew from receipt;
+a router that disappears cannot pin route slots or suppress solicitation
+forever. Expiry and explicit zero-lifetime withdrawal remove state, free its
+capped slot, and wake route/NDP waiters; a new identity refused while a cap is
+occupied increments its NDP drop counter. The current SLAAC address remains
+stable while preferred; after deprecation a retained preferred candidate may
+replace it, and valid-lifetime expiry or autonomous withdrawal selects another
+retained candidate or removes the global address. The stack never owns two
+SLAAC addresses simultaneously.
+
+The longest matching live RIO wins, and a newer advertisement for the same
+prefix replaces its next hop. The most recently advertised live default router
+is the last resort. Losing the last live RA-derived router, PIO, or RIO starts a
+fresh bounded router-solicitation cycle; an empty or lifetime-zero RA alone does
+not permanently suppress solicitation. Route preference and multi-address
+renumbering remain absent. Before a usable RA, an off-link write returns
+no-route immediately and may be retried on the same socket.
+
+Queued control output carries the ownership decision made at ingress. An echo
+reply preserves the exact local address that received its request, and both it
+and a queued neighbor advertisement are discarded if that address expires or
+is withdrawn before wire drain.
 
 Application multicast is explicit and link-scoped. `JoinGroup6` accepts only
 `ff02::/16`, keeps a capped membership for the stack lifetime, and does not
@@ -142,11 +159,14 @@ in tests without protocol sleeps.
 **The stack neither logs nor decides policy.** Refusal is loud—an error or RST
 plus a counter—for exhausted budget, full backlog, or abandoned ARP/NDP. Silent
 retention is the worst state: on August 11, eight abandoned browser connections
-left a listener permanently deaf and killed the console.
+left a listener permanently deaf and killed the console. Completed handshakes
+waiting for `Accept` therefore have an absolute 30-second handoff bound, and
+reaped channel entries are removed before the backlog cap is enforced.
 
-**The pump sleeps until the earliest deadline.** There is no fixed tick. An
-idle stack has no wake time and consumes no CPU, a hard requirement for nodes
-that put their core to sleep (`metal/cpu/idle`). A regression test protects it.
+**The pump has no fixed tick.** One goroutine belongs to a Stack from NewStack
+until explicit Close. It sleeps on notification without a timer when no protocol
+deadline remains, so an idle stack does not wake a core. Close is the ownership
+boundary that stops the goroutine and releases the Stack's dynamic state.
 
 **One mutex protects all state-machine data.** This is not claimed to be the
 fastest choice. It avoids “which lock owns this cache entry?” bugs such as
@@ -185,10 +205,12 @@ RFC 5961 on the state machine without a wire, clock, or goroutine.
   a zero-length option: everything is counted and dropped, with no panic or
   connection.
 - In-memory IPv6 regressions exercise lazy enablement through link-local UDP,
-  joined multicast and loopback, RA-to-SLAAC/RIO source selection, fail-fast
-  writes before RA, NDP validation, and the TamaGo socket boundary. The
-  [KAM](../KAM.md) names the wider source and hardware evidence required before
-  release.
+  joined multicast and loopback, RA-to-SLAAC/RIO source selection, monotonic
+  capped-lifetime expiry and refresh, single-address renumbering, pump-driven
+  solicitation restart and waiter wakeups, stale queued-control-output drops,
+  fail-fast writes before RA, NDP validation, and the TamaGo socket boundary.
+  The [KAM](../KAM.md) names the wider source and hardware evidence required
+  before release.
 - In QEMU it carries the full HopOS chain: agent + leader, SNTP, DNS, TLS to
   GitHub, and the slot demo. The separate hardware gate in the KAM is required
   before external IPv6 routing or multicast is called released.

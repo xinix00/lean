@@ -650,6 +650,129 @@ func TestTCPZeroWindowPeerStaysAlive(t *testing.T) {
 	}
 }
 
+func TestTCPFullCloseDeadlineKanNietWordenVernieuwd(t *testing.T) {
+	w := newTCPPair(t, 8<<10, 8<<10)
+	w.connect()
+	c := w.a
+
+	// Zet de peer in persist en laat data plus FIN achter het dichte venster
+	// wachten. Geldige updates blijven aantonen dat de peer leeft.
+	c.recv(tcpSeg{seq: c.rcvNxt, ack: c.nxt, flags: FlagACK, wnd: 0}, w.now)
+	if _, err := c.write([]byte("blijft achter nul")); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.close(); err != nil {
+		t.Fatal(err)
+	}
+	c.abandonRead(w.now)
+	original := c.closeDeadline
+
+	for i := 0; i < 4; i++ {
+		w.advance(4 * time.Second)
+		w.drain(c)
+		if c.state == tcpClosed {
+			t.Fatalf("full close gaf al na %v op", time.Duration(w.now-(original-tcpFullCloseDur)))
+		}
+		c.recv(tcpSeg{seq: c.rcvNxt, ack: c.una, flags: FlagACK, wnd: 0}, w.now)
+		c.abandonRead(w.now) // een dubbele net.Conn.Close mag de termijn niet rekken
+		if c.closeDeadline != original {
+			t.Fatalf("close-deadline verschoof van %d naar %d", original, c.closeDeadline)
+		}
+	}
+
+	w.advance(time.Duration(original-w.now) + time.Nanosecond)
+	segs := w.drain(c)
+	if c.state != tcpClosed || !c.reset {
+		t.Fatalf("zero-window-peer hield full close voorbij de absolute termijn: state=%s reset=%v", c.state, c.reset)
+	}
+	rst := false
+	for _, seg := range segs {
+		rst = rst || seg.flags.Has(FlagRST)
+	}
+	if !rst {
+		t.Fatal("absolute full-close timeout gaf op zonder RST")
+	}
+}
+
+func TestTCPCloseWaitRuimtAlleenInactiviteitOp(t *testing.T) {
+	w := newTCPPair(t, 8<<10, 8<<10)
+	w.connect()
+	if err := w.b.close(); err != nil {
+		t.Fatal(err)
+	}
+	w.pump()
+	c := w.a
+	if c.state != tcpCloseWait || c.closeDeadline == 0 {
+		t.Fatalf("peer-FIN gaf state=%s deadline=%d, wil begrensde CLOSE-WAIT", c.state, c.closeDeadline)
+	}
+
+	// Een echte app-read/write zou dezelfde touch doen. Activiteit vernieuwt de
+	// idle-termijn; louter tijd en duplicate ACKs doen dat niet.
+	first := c.closeDeadline
+	w.advance(time.Minute)
+	c.touchCloseWait(w.now)
+	if c.closeDeadline <= first {
+		t.Fatal("app-activiteit vernieuwde de CLOSE-WAIT idle-termijn niet")
+	}
+	refreshed := c.closeDeadline
+	c.recv(tcpSeg{seq: c.rcvNxt, ack: c.una, flags: FlagACK, wnd: uint16(c.sndWnd)}, w.now)
+	if c.closeDeadline != refreshed {
+		t.Fatal("duplicate ACK vernieuwde de CLOSE-WAIT idle-termijn")
+	}
+
+	w.advance(time.Duration(refreshed-w.now) + time.Nanosecond)
+	segs := w.drain(c)
+	if c.state != tcpClosed || !c.reset {
+		t.Fatalf("vergeten CLOSE-WAIT werd niet gereapt: state=%s reset=%v", c.state, c.reset)
+	}
+	rst := false
+	for _, seg := range segs {
+		rst = rst || seg.flags.Has(FlagRST)
+	}
+	if !rst {
+		t.Fatal("CLOSE-WAIT timeout gaf op zonder RST")
+	}
+
+	idle := newTCPPair(t, 8<<10, 8<<10)
+	idle.connect()
+	idle.advance(10 * time.Duration(tcpCloseWaitDur))
+	idle.drain(idle.a)
+	if idle.a.state != tcpEstablished || idle.a.nextDeadline() != 0 {
+		t.Fatalf("legitiem idle ESTABLISHED werd geraakt: state=%s deadline=%d", idle.a.state, idle.a.nextDeadline())
+	}
+}
+
+func TestTCPFullCloseVervangtBijnaVerlopenCloseWaitDeadline(t *testing.T) {
+	w := newTCPPair(t, 8<<10, 8<<10)
+	w.connect()
+	if err := w.b.close(); err != nil {
+		t.Fatal(err)
+	}
+	w.pump()
+	c := w.a
+	if c.state != tcpCloseWait {
+		t.Fatalf("peer-FIN gaf state=%s, wil CLOSE-WAIT", c.state)
+	}
+
+	w.advance(time.Duration(c.closeDeadline-w.now) - 5*time.Second)
+	old := c.closeDeadline
+	if err := c.close(); err != nil {
+		t.Fatal(err)
+	}
+	c.abandonRead(w.now)
+	want := w.now + tcpFullCloseDur
+	if c.closeDeadline != want || c.closeDeadline <= old {
+		t.Fatalf("full Close deadline=%d, want verse absolute deadline %d (oude=%d)",
+			c.closeDeadline, want, old)
+	}
+	if c.lifecycleExpired(old + 1) {
+		t.Fatal("oude CLOSE-WAIT deadline verkortte de full-Close grace")
+	}
+	if !c.lifecycleExpired(want) {
+		t.Fatal("verse full-Close deadline werd niet absoluut afgedwongen")
+	}
+}
+
 func TestTCPRSTKillsEmbryo(t *testing.T) {
 	w := newTCPPair(t, 1024, 1024)
 	segs := w.drain(w.a)
@@ -1709,7 +1832,7 @@ func TestTCPFinWait2HoudtGeenBudgetVast(t *testing.T) {
 	if err := w.a.close(); err != nil {
 		t.Fatal(err)
 	}
-	w.a.abandonRead()
+	w.a.abandonRead(w.now)
 	w.pump()
 	if w.a.state != tcpFinWait2 {
 		t.Fatalf("a is %s, wil FIN-WAIT-2", w.a.state)

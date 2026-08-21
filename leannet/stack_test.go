@@ -419,7 +419,7 @@ func TestStackSocketShapes(t *testing.T) {
 	}
 }
 
-func TestStackIdleCostsNothing(t *testing.T) {
+func TestStackIdleHasNoProtocolDeadline(t *testing.T) {
 	da, db := &memDevice{}, &memDevice{}
 	da.peer, db.peer = db, da
 	s := NewStack(da, Config{
@@ -1626,6 +1626,68 @@ func TestStackCloseSluitAlles(t *testing.T) {
 	}
 }
 
+func TestStackCloseLaatGeenDynamischeProtocolopslagHangen(t *testing.T) {
+	dev, peer := &memDevice{}, &memDevice{}
+	dev.peer, peer.peer = peer, dev
+	s := NewStack(dev, Config{
+		IP: [4]byte{10, 0, 0, 1}, Prefix: 24, MAC: [6]byte{2, 0, 0, 0, 0, 1},
+		Budget: 1 << 20,
+	}, 1)
+
+	// Model the bounded high-water state that can still be queued when Close
+	// wins before the pump's final drain.
+	s.mu.Lock()
+	s.arp.cnt.GaveUp = 7
+	s.arp.entries[[4]byte{10, 0, 0, 9}] = &neighborEntry{
+		state: neighborResolved, mac: [6]byte{2, 0, 0, 0, 0, 9},
+	}
+	s.arp.replies = append(s.arp.replies, arpReply{ip: [4]byte{10, 0, 0, 9}})
+	s.groups = map[[4]byte]struct{}{{224, 0, 0, 251}: {}}
+	s.out = append(s.out, outPkt{pkt: make([]byte, 1024)})
+	s.loopback = append(s.loopback, make([]byte, MTU))
+	s.lbFree = append(s.lbFree, make([]byte, MTU))
+
+	v6 := &v6State{
+		ll:       llAddrFromMAC(s.cfg.MAC),
+		ndp:      newNDPTable(s.cfg.MAC, s.now()),
+		udp:      newUDPTable(),
+		groups:   map[[16]byte]struct{}{allNodes6: {}},
+		prefixes: []v6prefix{{prefix: [16]byte{0xfd}, bits: 64, onLink: true}},
+		routes:   []v6route{{prefix: [16]byte{0xfd}, bits: 64}},
+	}
+	v6.ndp.cnt.GaveUp = 11
+	v6.ndp.entries[[16]byte{0xfe, 0x80, 0, 0, 0, 0, 0, 0, 1}] = &neighborEntry{
+		state: neighborResolved, mac: [6]byte{2, 0, 0, 0, 0, 10},
+	}
+	v6.ndp.replies = append(v6.ndp.replies, ndpReply{target: v6.ll})
+	s.v6 = v6
+	s.out6 = append(s.out6, outPkt6{pkt: make([]byte, 1024)})
+	s.mu.Unlock()
+
+	s.Close()
+
+	s.mu.Lock()
+	retained := s.dev != nil || s.arp != nil || s.v6 != nil || s.udp != nil ||
+		s.conns != nil || s.listeners != nil || s.groups != nil || s.out != nil ||
+		s.out6 != nil || s.loopback != nil || s.lbFree != nil || s.txBuf != nil
+	used := s.pot.used
+	s.mu.Unlock()
+	if retained {
+		t.Fatal("gesloten Stack behield dynamische protocolopslag")
+	}
+	if used != 0 {
+		t.Fatalf("gesloten Stack behield %d bytes bufferbudget", used)
+	}
+	stats := s.Stats()
+	if stats.ARP.GaveUp != 7 || stats.NDP.GaveUp != 11 {
+		t.Fatalf("Close verloor telemetry: ARP=%+v NDP=%+v", stats.ARP, stats.NDP)
+	}
+	if err := s.SeedNeighbor([4]byte{10, 0, 0, 9}, [6]byte{2, 0, 0, 0, 0, 9}); !errors.Is(err, errStackClosed) {
+		t.Fatalf("SeedNeighbor na Close gaf %v, wil errStackClosed", err)
+	}
+	s.Close() // teardown remains idempotent after dropping its internal tables
+}
+
 func TestStackListenerCloseRuimtEmbryosOp(t *testing.T) {
 	dev, capture := &memDevice{}, &memDevice{}
 	dev.peer, capture.peer = capture, dev
@@ -1695,6 +1757,116 @@ func TestTCPFinWait2Timeout(t *testing.T) {
 	}
 	if !rst {
 		t.Fatal("geen RST bij het opgeven van FIN-WAIT-2 — de peer hoort te weten dat wij weg zijn")
+	}
+}
+
+func TestTCPFullCloseDeadlineRuimtEndToEndOp(t *testing.T) {
+	a, b := newStackPair(t, 1<<20, 1<<20)
+	l, err := b.Listen(90)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+
+	accepted := make(chan net.Conn, 1)
+	go func() {
+		c, acceptErr := l.Accept()
+		if acceptErr == nil {
+			accepted <- c
+		}
+	}()
+	conn, err := a.DialTCP([4]byte{10, 0, 0, 2}, 90, time.Now().Add(5*time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := <-accepted
+	defer srv.Close()
+
+	client := conn.(*tcpSock)
+	a.mu.Lock()
+	key := client.c.key
+	beforeBudget := a.pot.used
+	// Model a live peer advertising zero without filling its receive buffer.
+	// FIN must then wait in persist, while the peer socket can block in Read.
+	client.c.tcp.sndWnd = 0
+	a.mu.Unlock()
+
+	if err := srv.SetReadDeadline(time.Now().Add(3 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	readStarted := make(chan struct{})
+	readErr := make(chan error, 1)
+	go func() {
+		close(readStarted)
+		_, readErrValue := srv.Read(make([]byte, 1))
+		readErr <- readErrValue
+	}()
+	<-readStarted
+
+	beforeClose := a.now()
+	if err := conn.Close(); err != nil {
+		t.Fatal(err)
+	}
+	afterClose := a.now()
+
+	a.mu.Lock()
+	closeDeadline := client.c.tcp.closeDeadline
+	_, retained := a.conns[key]
+	retainedBudget := a.pot.used
+	a.mu.Unlock()
+	if closeDeadline < beforeClose+tcpFullCloseDur || closeDeadline > afterClose+tcpFullCloseDur {
+		t.Fatalf("full Close deadline %d ligt niet exact %v na Close [%d,%d]",
+			closeDeadline, time.Duration(tcpFullCloseDur), beforeClose, afterClose)
+	}
+	if !retained || retainedBudget != tcpFloorTx || retainedBudget >= beforeBudget {
+		t.Fatalf("voor expiry: retained=%v budget=%d (voor Close %d), wil alleen TX-vloer %d",
+			retained, retainedBudget, beforeBudget, tcpFloorTx)
+	}
+	select {
+	case err := <-readErr:
+		t.Fatalf("peer-Read eindigde vóór de full-Close deadline: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	// Gerichte timerseam: de pure-machine test controleert de volledige 20s en
+	// niet-verlengbaarheid; hier maken we alleen de reeds ingestelde deadline due.
+	// notify must wake the sleeping pump and drive the whole stack path.
+	a.mu.Lock()
+	client.c.tcp.closeDeadline = a.now() - 1
+	a.notify()
+	a.mu.Unlock()
+
+	select {
+	case err := <-readErr:
+		if !errors.Is(err, errTCPReset) {
+			t.Fatalf("geblokkeerde peer-Read na cleanup gaf %v, wil TCP reset", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("RST na de full-Close deadline wekte de peer-Read niet")
+	}
+
+	wallDeadline := time.Now().Add(2 * time.Second)
+	for {
+		a.mu.Lock()
+		_, retained = a.conns[key]
+		retainedBudget = a.pot.used
+		queued := len(a.out)
+		a.mu.Unlock()
+		if !retained && retainedBudget == 0 && queued == 0 {
+			break
+		}
+		if time.Now().After(wallDeadline) {
+			t.Fatalf("na expiry: retained=%v budget=%d queued=%d",
+				retained, retainedBudget, queued)
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	b.mu.Lock()
+	peerConns, peerBudget := len(b.conns), b.pot.used
+	b.mu.Unlock()
+	if peerConns != 0 || peerBudget != 0 {
+		t.Fatalf("peer hield na RST %d verbinding(en) en %d budget vast", peerConns, peerBudget)
 	}
 }
 
@@ -2413,11 +2585,18 @@ func TestAcceptZietSnelleSluiter(t *testing.T) {
 	}
 	defer l.Close()
 
-	c := &sconn{listener: l.(*tcpListener)}
-	c.tcp.state = tcpCloseWait
 	s.mu.Lock()
-	s.maybeAccept(c)
+	key := connKey{lport: 80, rip: [4]byte{10, 0, 0, 2}, rport: 40000}
+	c, err := s.newConnLocked(key)
+	if err == nil {
+		c.listener = l.(*tcpListener)
+		c.tcp.state = tcpCloseWait
+		s.maybeAccept(c, s.now())
+	}
 	s.mu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	got := make(chan error, 1)
 	go func() {
@@ -2431,6 +2610,123 @@ func TestAcceptZietSnelleSluiter(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("Accept zag de snelle sluiter nooit — CLOSE-WAIT telt niet als aangekomen")
+	}
+}
+
+func TestAcceptSlaatGereapteBacklogOver(t *testing.T) {
+	da, db := &memDevice{}, &memDevice{}
+	da.peer, db.peer = db, da
+	s := NewStack(da, Config{
+		IP: [4]byte{10, 0, 0, 1}, Prefix: 24, MAC: [6]byte{2, 0, 0, 0, 0, 1},
+		Budget: 1 << 20,
+	}, 7)
+	t.Cleanup(s.Close)
+	lAny, err := s.Listen(80)
+	if err != nil {
+		t.Fatal(err)
+	}
+	l := lAny.(*tcpListener)
+
+	stale := &sconn{key: connKey{lport: 80, rip: [4]byte{10, 0, 0, 9}, rport: 40000}}
+	liveKey := connKey{lport: 80, rip: [4]byte{10, 0, 0, 2}, rport: 40001}
+	s.mu.Lock()
+	live, err := s.newConnLocked(liveKey)
+	if err == nil {
+		live.tcp.state = tcpEstablished
+	}
+	s.mu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	l.backlog <- stale
+	l.backlog <- live
+
+	conn, err := l.Accept()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := conn.(*tcpSock).c; got != live {
+		t.Fatal("Accept gaf een al gereapte backlog-referentie terug")
+	}
+}
+
+func TestOngeaccepteerdeHandshakeVerlooptEnMaaktBacklogVrij(t *testing.T) {
+	dev, peer := &memDevice{}, &memDevice{}
+	dev.peer, peer.peer = peer, dev
+	s := NewStack(dev, Config{
+		IP: [4]byte{10, 0, 0, 1}, Prefix: 24, MAC: [6]byte{2, 0, 0, 0, 0, 1},
+		Budget: 1 << 20,
+	}, 7)
+	t.Cleanup(s.Close)
+	if err := s.SeedNeighbor([4]byte{10, 0, 0, 2}, [6]byte{2, 0, 0, 0, 0, 2}); err != nil {
+		t.Fatal(err)
+	}
+	lAny, err := s.Listen(80)
+	if err != nil {
+		t.Fatal(err)
+	}
+	l := lAny.(*tcpListener)
+
+	key := connKey{lport: 80, rip: [4]byte{10, 0, 0, 2}, rport: 50000}
+	s.mu.Lock()
+	c, err := s.newConnLocked(key)
+	if err != nil {
+		s.mu.Unlock()
+		t.Fatal(err)
+	}
+	c.listener = l
+	c.tcp.state = tcpEstablished
+	now := s.now()
+	s.maybeAccept(c, now)
+	deadline := c.handoffDeadline
+	// More peer segments revisit maybeAccept but may never renew the ownerless
+	// handoff window.
+	s.maybeAccept(c, now+tcpBacklogWaitDur/2)
+	unchanged := c.handoffDeadline
+	next := s.nextDeadlineLocked()
+	s.notify()
+	s.mu.Unlock()
+	if deadline == 0 || unchanged != deadline || next != deadline {
+		t.Fatalf("handoffdeadline: first=%d na peeractiviteit=%d next=%d", deadline, unchanged, next)
+	}
+
+	// Make the already-installed absolute deadline due without waiting 30 wall
+	// seconds. The real pump must reap the tuple and return its floor budget.
+	s.mu.Lock()
+	c.handoffDeadline = s.now() - 1
+	s.notify()
+	s.mu.Unlock()
+	wallDeadline := time.Now().Add(2 * time.Second)
+	for {
+		s.mu.Lock()
+		_, retained := s.conns[key]
+		used := s.pot.used
+		s.mu.Unlock()
+		if !retained && used == 0 {
+			break
+		}
+		if time.Now().After(wallDeadline) {
+			t.Fatalf("ownerloze backlogverbinding bleef staan: retained=%v used=%d",
+				retained, used)
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	// Reap removed the map entry; offer must also evict its stale channel
+	// reference before applying tcpBacklog, otherwise a full stale queue can
+	// reject healthy handshakes forever.
+	for len(l.backlog) < tcpBacklog {
+		l.backlog <- &sconn{}
+	}
+	replacement := &sconn{}
+	s.mu.Lock()
+	l.offer(replacement)
+	s.mu.Unlock()
+	if len(l.backlog) != 1 {
+		t.Fatalf("offer behield stale backlogslots: len=%d, wil 1", len(l.backlog))
+	}
+	if got := <-l.backlog; got != replacement {
+		t.Fatal("gezonde vervangende handshake kwam niet in de opgeschoonde backlog")
 	}
 }
 

@@ -55,7 +55,7 @@ not as a general capability of this stack. A caller that has a choice uses
 | Mux | method+path, exact/subtree, `{segment}`, `{rest...}`, `GET`→`HEAD`, `404`/`405`+`Allow` | canonical paths or rejection; immutable after start | host routing, `{$}`, escaped/dot routing, slash normalization, net/http compatibility work |
 | HTTP client | outbound HTTP/1.1, inbound 1.0/1.1, GET/HEAD redirects, response framing, deadlines, keep-alive pool | fixed-length streaming upload with a strict Expect decision; compression pass-through | request chunking, automatic decompression, CONNECT/upgrade, general retry state machine |
 | TLS/S3 | explicit trust model, SNI per connection, SigV4 and used object operations | TLS as a dialer composition; signed S3 calls never follow redirects | TLS server, silent skip-verify, multipart, streaming SigV4, SigV4a, presigned URLs, IMDS/IAM |
-| leannet | Ethernet; IPv4 ARP/ICMP/UDP/TCP and link-local multicast; opt-in IPv6 UDP, ICMPv6/NDP, link-scoped multicast, one SLAAC identity, and PIO/RIO routing; deadlines, close, bounded memory | one IPv4 identity; one derived link-local plus one SLAAC IPv6 identity; bounded simplified NDP and route state; fixed 1280-byte IPv6 packet ceiling | TCPv6, DHCPv6, extension headers, fragmentation, PMTUD, MLD/IGMP, wider multicast, dual-family sockets, full NUD and renumbering, congestion control, timestamps, Nagle, SYN cookies, data-path logging |
+| leannet | Ethernet; IPv4 ARP/ICMP/UDP/TCP and link-local multicast; opt-in IPv6 UDP, ICMPv6/NDP, link-scoped multicast, one active SLAAC identity, and expiring PIO/RIO routing; deadlines, close, bounded memory | one IPv4 identity; one derived link-local plus one active SLAAC IPv6 identity; bounded simplified NDP and route state; fixed 1280-byte IPv6 packet ceiling | TCPv6, DHCPv6, extension headers, fragmentation, PMTUD, MLD/IGMP, wider multicast, dual-family sockets, full NUD and multi-address renumbering, congestion control, timestamps, Nagle, SYN cookies, data-path logging |
 
 The table is a summary; the boundaries below are normative.
 
@@ -175,6 +175,8 @@ The client MUST:
 - report a truncated fixed-length body as an error;
 - enforce `Timeout` as one absolute deadline across dial, redirects, headers,
   and body; `HeaderTimeout` applies only to response headers and decisions;
+- bind dial, request I/O, and response-body reads to `Call.Context`; cancellation
+  closes that call's active connection and prevents it from entering the pool;
 - return only a proven fully read response to the pool;
 - bound idle connections both per host and globally, and close them by time;
 - retry one fresh connection after a stale keep-alive failure, only for
@@ -198,8 +200,8 @@ a final response header. Silence, a partial decision, or only other interim
 responses until the deadline is an error and closes the connection. There is no
 “send after one second anyway” fallback. After `100`, the upload clears the
 header deadline and applies a configured `HeaderTimeout` anew to the final
-response. If both `HeaderTimeout` and `Timeout` are zero, that final response—
-like a regular call—deliberately has no deadline.
+response. If `HeaderTimeout` and `Timeout` are both zero and the context has no
+deadline, that final response—like a regular call—deliberately has no deadline.
 
 Compression is pass-through. The default is `identity`; a caller that sets
 `Accept-Encoding` reads `Response.Encoding` and performs decompression itself.
@@ -244,6 +246,11 @@ A nil config and certificate validation against a bare IP address fail loudly.
 overwrites it in a configuration copy with the current dial host. `leanhttps`
 has no server side and adds no HTTP or TLS protocol.
 
+TLS shutdown is best effort: `Close` attempts `close_notify`, but bounds that
+write to 250 milliseconds and always closes the transport. Before shutdown, any
+TLS record write error is terminal for that connection; later writes return the
+stored error and never attempt to continue a partially written record stream.
+
 ### leans3
 
 `leans3` provides SigV4 with static credentials and an optional session token,
@@ -255,7 +262,7 @@ These invariants apply:
 
 - every PUT has a known length and payload hash;
 - `UnsignedPayload` is allowed only for an HTTPS endpoint; replacing the
-  default transport with `Client.DialContext` transfers responsibility for
+  default transport with `Client.Dial` transfers responsibility for
   authenticated encryption and peer validation to the caller;
 - a signed request never follows redirects because origin, target, and headers
   are part of the signature;
@@ -269,14 +276,41 @@ retry. GET/LIST may use leanhttp's single generic stale-keep-alive retry before
 a response; mutating S3 operations are never repeated. Add an operation only
 when a real consumer needs it.
 
-An S3 context is checked before the call, and its deadline becomes the total
-HTTP deadline. Bare cancellation without a deadline does not interrupt a call
-already in progress; supporting that requires first measuring and designing a
-general cancellable `leanhttp.Call` seam.
+An S3 context covers dialing, request I/O, and response-body reads. Bare
+cancellation closes that operation's active connection; the callback is stopped
+before a completed connection can return to the HTTP pool. As with net/http, an
+arbitrary upload source blocked inside its own `Read`, or a download sink blocked
+inside its own `Write`, must provide its own cancellation seam.
 
-Each LIST page is limited to 4 MiB. `List(max <= 0)` deliberately collects all
-keys from all pages into one slice and may grow with the object count; callers
-on small nodes should pass a positive `max`.
+S3 additionally applies a 30-second socket-progress timeout by default. Long
+`GetTo` and `PutFrom` transfers may run for any total duration while reads or
+writes keep making progress; a socket operation blocked for thirty seconds
+without progress fails the operation and closes its connection.
+`Client.IdleTimeout` selects another positive duration; zero selects the
+default. S3 applies this policy around its dialed connections rather than
+adding per-call progress policy to `leanhttp`.
+
+Buffered `Get` has a fixed 4 MiB allocation cap and returns
+`ErrObjectTooLarge` above it; larger objects use `GetTo`.
+Each LIST page is limited to 4 MiB, 1,000 keys, 1,024 bytes per key, and 16 KiB
+per continuation token. `List` requires a positive result cap and rejects an
+empty-progress page or an unchanged continuation token.
+
+### Change rule, filled in: cancellable calls
+
+1. **Consumer.** S3 operations already accept contexts, and Hop's TamaGo HTTP
+   client needs the same cancellation behavior as its host implementation.
+2. **Smallest contract.** `leanhttp.Call.Context` bounds only that call and
+   closes its active connection on cancellation; S3 owns its separate fixed
+   connection-progress policy.
+3. **Tests.** Dial, header, body, cancellation-versus-pool-handoff, and S3
+   operation cancellation are covered at their owning layers; Hop's TamaGo
+   client is compile-gated against the seam.
+4. **Decision.** Call cancellation is KEEP. Interrupting an arbitrary caller
+   `Reader` or `Writer` remains the caller's responsibility.
+5. **Hard rejection.** Cancellation that wins before pool handoff never returns
+   the connection; after handoff its callback is unregistered. A nil context
+   retains the ordinary background lifetime.
 
 ## leannet
 
@@ -318,18 +352,30 @@ The IPv6 lane MUST:
 - provide UDP through `AF_INET6`, `ListenUDP6`, and `DialUDP6`; sockets are
   wildcard-bound and v6-only, so a non-wildcard local address and an
   IPv4-mapped address fail loudly, while TCPv6 remains unsupported;
-- own one EUI-64 link-local address and at most the first SLAAC address from an
-  autonomous `/64`; use a link-local source only for link-local unicast and
-  `ff02::/16`, and require the SLAAC source for every routed packet;
+- own one EUI-64 link-local address and at most one active SLAAC address from
+  capped autonomous `/64` PIO state; use a link-local source only for
+  link-local unicast and `ff02::/16`, and require the SLAAC source for every
+  routed packet;
 - implement only the ICMPv6 control needed by this path: bounded RS/RA and
   NS/NA plus unicast echo; validate every invariant of those supported forms
   before rejected input can mutate state;
 - require every SLLA/TLLA in a supported NS, NA, or RA to equal the Ethernet
   source MAC; reject a mismatch before it can mutate state;
-- retain bounded on-link PIO prefixes and bounded RIO routes, prefer the
-  longest RIO match, replace the next hop for a repeated prefix, remove an
-  explicitly withdrawn PIO or RIO, and use one advertised default router only
-  as a last resort;
+- retain bounded PIO identities and bounded RIO routes, honor default-router,
+  PIO valid/preferred, and RIO lifetimes with monotonic pump deadlines, but cap
+  every positive advertised value (including `0xffffffff`) to a renewable
+  two-hour local lease; prefer the longest live RIO match, replace the next hop
+  for a repeated prefix, remove expired or explicitly withdrawn state, wake
+  route/NDP waiters on that transition, and use one live advertised default
+  router only as a last resort; count a new PIO/RIO identity refused by its cap;
+- keep the selected SLAAC identity stable while preferred, replace it with a
+  retained preferred candidate after deprecation, and remove or replace it at
+  valid expiry or autonomous withdrawal without ever owning two SLAAC
+  identities; restart bounded router solicitation after the last live
+  RA-derived router, PIO, or RIO disappears;
+- preserve an echo request's exact owned destination as its queued reply source,
+  and drop a queued echo reply or NA if that local address is no longer owned
+  when the pump reaches wire emission;
 - accept explicit joins only for `ff02::/16`, with capped, stack-lifetime
   membership and local-loop behavior; all-nodes and the stack's
   solicited-node groups are implicit;
@@ -364,10 +410,31 @@ The transport core MUST:
 - turn exhausted budgets, full backlogs, and unreachable routes into explicit
   errors or RSTs, never silent permanent waits.
 
-Socket `Close` returns unread RX budget immediately. TX budget returns when FIN
-is acknowledged or the connection is reaped. The deliberately short close
-bounds—20 seconds in FIN-WAIT-2 and 1 second in TIME-WAIT—are resource policy
-for these nodes, not general Internet defaults.
+Socket `Close` returns unread RX budget immediately and starts one absolute
+20-second cleanup bound that ACKs and zero-window updates cannot renew. TX
+budget returns when FIN is acknowledged or the connection is reaped. A peer
+half-close may remain useful for tail reads and response writes, but an idle
+CLOSE-WAIT is reaped after two minutes unless real application I/O or cumulative
+ACK progress renews it. TIME-WAIT remains deliberately short at one second.
+These are resource policy for these nodes, not general Internet defaults.
+
+A completed inbound handshake is not caller-owned until `Accept` returns it.
+That backlog handoff therefore has one absolute 30-second deadline which peer
+traffic cannot renew. Reaped channel entries are physically pruned before the
+backlog cap is applied, so stale references cannot make an otherwise empty
+listener permanently refuse healthy handshakes.
+
+An open ESTABLISHED socket has no arbitrary idle reaper: silence alone does not
+prove either endpoint dead, so its handle remains caller-owned until `Close`, a
+reset, or bounded retransmission failure. Applications that impose an idle
+session policy must express it with socket deadlines and `Close`.
+
+A live `Stack` owns one sleeping pump until the caller invokes `Stack.Close`;
+that explicit close is the lifecycle boundary. It snapshots ARP/NDP counters,
+releases TCP/UDP budget, and drops dynamic protocol maps, queues, loopback
+caches, the transmit buffer, IPv6 state, and the Device reference. Keeping a
+closed `Stack` for telemetry therefore does not keep its former high-water
+storage alive.
 
 ### ADAPT
 
@@ -377,14 +444,17 @@ not half a SACK implementation.
 
 IPv6 is not a general dual-stack implementation. NDP uses the same bounded,
 ARP-like resolution and aging model instead of the complete Neighbor
-Unreachability Detection state machine. The first autonomous `/64` remains
-selected for the stack lifetime; SLAAC renumbering requires a restart. PIO and
-RIO wall-clock expiry and route-preference machinery are absent, but an
-explicit zero-lifetime PIO or RIO withdrawal takes effect and a newer RIO for
-the same prefix replaces its next hop. A write before the first usable RA
-receives an explicit no-route error rather than implicitly waiting for
-configuration. Withdrawing a PIO removes its on-link classification but does
-not silently replace the selected SLAAC identity.
+Unreachability Detection state machine. RA lifetimes are relative values
+converted to monotonic deadlines and clipped to a renewable two-hour ownership
+lease. Thus even the wire's infinite value requires a live router to refresh;
+expiry and explicit zero-lifetime withdrawal free PIO/RIO/default-router state
+and wake its waiters. PIO L and A state are independent, so an L-only withdrawal
+removes on-link classification without inventing an autonomous withdrawal. One
+selected SLAAC address remains stable while preferred and can move to another
+retained preferred prefix after deprecation, withdrawal, or valid expiry;
+overlap with multiple owned identities remains outside the profile. A write
+before the first usable RA receives an explicit no-route error rather than
+implicitly waiting for configuration.
 
 NDP is deliberately stricter than RFC 4861: the SLLA/TLLA and Ethernet source
 MAC must identify the same sender. This fail-closed home-link rule excludes
@@ -399,9 +469,9 @@ a specific local address is forbidden.
 
 Absent: congestion control, out-of-order reassembly/SACK, TCPv6, DHCPv6,
 IPv4-mapped dual-family sockets, active DAD, privacy or temporary addresses,
-multiple SLAAC identities, full NUD and automatic renumbering, MLD/IGMP,
-multicast outside link scope, proxy-ND and VRRP-style MAC indirection, ICMPv6
-redirects and error/PMTUD state, IPv4 and IPv6 fragmentation, IPv4 options,
+multiple simultaneous SLAAC identities, full NUD and multi-address renumbering,
+MLD/IGMP, multicast outside link scope, proxy-ND and VRRP-style MAC indirection,
+ICMPv6 redirects and error/PMTUD state, IPv4 and IPv6 fragmentation, IPv4 options,
 IPv6 extension headers and jumbograms, TCP timestamps/PAWS, Nagle, SYN
 cookies, urgent-data API, inbound IP broadcast, and data-path logging.
 [`leannet/DESIGN.md`](leannet/DESIGN.md) explains why and when a feature may
@@ -631,8 +701,10 @@ composition errors in `leanhttps` or `leans3`.
 An IPv6 profile change additionally proves lazy enablement, v4/v6 port
 isolation, the mandatory UDP checksum, the 1280/1232-byte transmit boundary,
 exact Ethernet destination filtering, malformed NDP with zero state mutation,
-NDP give-up/deadline/close wakeups, and RA source selection plus
-PIO/RIO/default-route precedence, replacement, and explicit withdrawal.
+NDP give-up/deadline/close wakeups, and RA source selection plus monotonic
+two-hour-capped PIO/RIO/default-route expiry and refresh, bounded-slot release,
+replacement, explicit withdrawal, single-address renumbering, pump-driven
+solicitation/waiter wakeups, and stale queued NA/echo suppression.
 
 ### Consumer source gate
 

@@ -378,12 +378,12 @@ func TestListPagineertMetToken(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	keys, truncated, err := klant(t, srv).List(context.Background(), "apps/c/j/", 0)
+	keys, truncated, err := klant(t, srv).List(context.Background(), "apps/c/j/", 10)
 	if err != nil {
 		t.Fatalf("List: %v", err)
 	}
 	if truncated {
-		t.Error("truncated = true without a cap")
+		t.Error("truncated = true before the cap")
 	}
 	want := []string{"apps/c/j/a.txt", "apps/c/j/b.txt", "apps/c/j/c.txt"}
 	if len(keys) != len(want) {
@@ -401,6 +401,236 @@ func TestListPagineertMetToken(t *testing.T) {
 		if p != "apps/c/j/" {
 			t.Errorf("prefix %q, want apps/c/j/", p)
 		}
+	}
+}
+
+func TestListEistEenPositieveCap(t *testing.T) {
+	c := &Client{}
+	if _, _, err := c.List(context.Background(), "", 0); err == nil || !strings.Contains(err.Error(), "max must be positive") {
+		t.Fatalf("List zonder cap = %v, wil een duidelijke fout", err)
+	}
+}
+
+func TestListWeigertTokenZonderVoortgang(t *testing.T) {
+	var calls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		fmt.Fprint(w, `<ListBucketResult><IsTruncated>true</IsTruncated>`+
+			`<NextContinuationToken>zelfde</NextContinuationToken>`+
+			`<Contents><Key>k</Key></Contents></ListBucketResult>`)
+	}))
+	defer srv.Close()
+
+	_, _, err := klant(t, srv).List(context.Background(), "", 10)
+	if err == nil || !strings.Contains(err.Error(), "did not advance") {
+		t.Fatalf("List met herhaalde token = %v, wil progress-fout", err)
+	}
+	if got := calls.Load(); got != 2 {
+		t.Fatalf("requests = %d, wil stoppen na 2", got)
+	}
+}
+
+func TestListWeigertLegeAfgekaptePagina(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `<ListBucketResult><IsTruncated>true</IsTruncated>`+
+			`<NextContinuationToken>volgende</NextContinuationToken></ListBucketResult>`)
+	}))
+	defer srv.Close()
+
+	_, _, err := klant(t, srv).List(context.Background(), "", 10)
+	if err == nil || !strings.Contains(err.Error(), "no key progress") {
+		t.Fatalf("lege truncated pagina = %v, wil progress-fout", err)
+	}
+}
+
+func TestGetHeeftEenBufferlimiet(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", fmt.Sprint(maxBufferedGetBytes+1))
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	_, _, err := klant(t, srv).Get(context.Background(), "te-groot")
+	if !errors.Is(err, ErrObjectTooLarge) {
+		t.Fatalf("Get boven limiet = %v, wil ErrObjectTooLarge", err)
+	}
+}
+
+func TestGetBegrenstOokEenBodyZonderLengte(t *testing.T) {
+	payload := bytes.Repeat([]byte("x"), int(maxBufferedGetBytes+1))
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.(http.Flusher).Flush() // Forceer chunked framing zonder Content-Length.
+		_, _ = w.Write(payload)
+	}))
+	defer srv.Close()
+
+	_, _, err := klant(t, srv).Get(context.Background(), "te-groot-chunked")
+	if !errors.Is(err, ErrObjectTooLarge) {
+		t.Fatalf("chunked Get boven limiet = %v, wil ErrObjectTooLarge", err)
+	}
+}
+
+func TestContextCancelOnderbreektActieveS3Call(t *testing.T) {
+	requestSeen := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(requestSeen)
+		<-r.Context().Done()
+	}))
+	defer srv.Close()
+	c := klant(t, srv)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		_, _, err := c.Get(ctx, "wacht")
+		done <- err
+	}()
+	select {
+	case <-requestSeen:
+	case <-time.After(time.Second):
+		t.Fatal("S3 request bereikte de server niet")
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("Get na cancel = %v, wil context.Canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("S3 call bleef na context-cancel hangen")
+	}
+}
+
+func TestS3IdleTimeoutConfiguratie(t *testing.T) {
+	if got, err := (&Client{}).ioIdleTimeout(); err != nil || got != defaultIOIdleTimeout {
+		t.Fatalf("default idle-timeout = %v, err=%v; wil %v", got, err, defaultIOIdleTimeout)
+	}
+	if got, err := (&Client{IdleTimeout: 7 * time.Second}).ioIdleTimeout(); err != nil || got != 7*time.Second {
+		t.Fatalf("override idle-timeout = %v, err=%v", got, err)
+	}
+	if _, err := (&Client{IdleTimeout: -1}).ioIdleTimeout(); err == nil {
+		t.Error("negatieve idle-timeout werd geaccepteerd")
+	}
+}
+
+func TestS3IdleTimeoutBreektStilleBodyAf(t *testing.T) {
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", "2")
+		_, _ = io.WriteString(w, "x")
+		w.(http.Flusher).Flush()
+		select {
+		case <-r.Context().Done():
+		case <-release:
+		}
+	}))
+	defer srv.Close()
+	c := klant(t, srv)
+	c.IdleTimeout = 40 * time.Millisecond
+	done := make(chan error, 1)
+	go func() {
+		_, _, err := c.Get(context.Background(), "stil")
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		var ne net.Error
+		if !errors.As(err, &ne) || !ne.Timeout() {
+			t.Fatalf("stille GET gaf %v, wil idle-timeout", err)
+		}
+	case <-time.After(time.Second):
+		close(release)
+		t.Fatal("S3 GET met stille body bleef hangen")
+	}
+}
+
+func TestS3IdleTimeoutLaatLangzameGetToVoortgangDoor(t *testing.T) {
+	payload := []byte("langzaam-maar-levend")
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", fmt.Sprint(len(payload)))
+		for _, b := range payload {
+			_, _ = w.Write([]byte{b})
+			w.(http.Flusher).Flush()
+			time.Sleep(10 * time.Millisecond)
+		}
+	}))
+	defer srv.Close()
+	c := klant(t, srv)
+	c.IdleTimeout = 80 * time.Millisecond
+	start := time.Now()
+	var dst bytes.Buffer
+	n, _, err := c.GetTo(context.Background(), "langzaam", &dst)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != int64(len(payload)) || !bytes.Equal(dst.Bytes(), payload) {
+		t.Fatalf("GetTo = %d bytes %q", n, dst.Bytes())
+	}
+	if elapsed := time.Since(start); elapsed <= c.IdleTimeout {
+		t.Fatalf("GetTo duurde %v en bewees geen renewal voorbij %v", elapsed, c.IdleTimeout)
+	}
+}
+
+func TestS3IdleTimeoutLaatLangzamePutFromVoortgangDoor(t *testing.T) {
+	client, server := net.Pipe()
+	defer server.Close()
+	payload := []byte("langzaam-maar-levend")
+	got := make([]byte, len(payload))
+	serverDone := make(chan error, 1)
+	go func() {
+		// Read headers one wire byte at a time: a bufio.Reader could read the
+		// upload ahead in one socket operation and turn slow application
+		// consumption into silence rather than the progress this test targets.
+		header := make([]byte, 0, 1024)
+		one := make([]byte, 1)
+		for !bytes.HasSuffix(header, []byte("\r\n\r\n")) {
+			if _, err := io.ReadFull(server, one); err != nil {
+				serverDone <- err
+				return
+			}
+			header = append(header, one[0])
+		}
+		if _, err := io.WriteString(server, "HTTP/1.1 100 Continue\r\n\r\n"); err != nil {
+			serverDone <- err
+			return
+		}
+		for i := range got {
+			time.Sleep(10 * time.Millisecond)
+			if _, err := io.ReadFull(server, got[i:i+1]); err != nil {
+				serverDone <- err
+				return
+			}
+		}
+		_, err := io.WriteString(server, "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+		serverDone <- err
+	}()
+
+	var dialed atomic.Bool
+	c := &Client{
+		Endpoint: "http://s3.pipe", Bucket: "b", Region: "r",
+		AccessKeyID: "a", SecretAccessKey: "s", UsePathStyle: true,
+		IdleTimeout: 50 * time.Millisecond,
+		Dial: func(context.Context, string, string) (net.Conn, error) {
+			if dialed.Swap(true) {
+				return nil, errors.New("onverwachte tweede dial")
+			}
+			return client, nil
+		},
+	}
+	defer c.CloseIdle()
+	start := time.Now()
+	if _, err := c.PutFrom(context.Background(), "langzaam", bytes.NewReader(payload),
+		int64(len(payload)), hexSHA256(payload), nil); err != nil {
+		t.Fatal(err)
+	}
+	if elapsed := time.Since(start); elapsed <= c.IdleTimeout {
+		t.Fatalf("PutFrom duurde %v en bewees geen renewal voorbij %v", elapsed, c.IdleTimeout)
+	}
+	if !bytes.Equal(got, payload) {
+		t.Fatalf("server las %q, wil %q", got, payload)
+	}
+	if err := <-serverDone; err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -423,6 +653,25 @@ func TestListCapMeldtAfkapping(t *testing.T) {
 	}
 	if len(keys) != 2 || !truncated {
 		t.Fatalf("got %d keys (truncated=%v), want 2 keys with truncated=true", len(keys), truncated)
+	}
+}
+
+func TestListExacteCapVraagtGeenExtraPagina(t *testing.T) {
+	var calls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		fmt.Fprint(w, `<ListBucketResult><IsTruncated>true</IsTruncated>`+
+			`<NextContinuationToken>onnodig</NextContinuationToken>`+
+			`<Contents><Key>k1</Key></Contents><Contents><Key>k2</Key></Contents></ListBucketResult>`)
+	}))
+	defer srv.Close()
+
+	keys, truncated, err := klant(t, srv).List(context.Background(), "", 2)
+	if err != nil || len(keys) != 2 || !truncated {
+		t.Fatalf("List exact op cap = %v, truncated=%v, err=%v", keys, truncated, err)
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("requests = %d, wil 1", got)
 	}
 }
 

@@ -69,6 +69,7 @@ import (
 	"fmt"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -117,13 +118,25 @@ type Conn struct {
 	rmu sync.Mutex
 	wmu sync.Mutex
 
+	// closing prevents new writes from racing a close_notify. Close has a
+	// separate once for the transport because its deadline fallback may have to
+	// close the socket from a timer while Close itself is blocked in Write.
+	closing       atomic.Bool
+	closeOnce     sync.Once
+	connCloseOnce sync.Once
+	closeErr      error
+
 	// Per-direction record state; sequence resets after every key change.
 	wKeys trafficKeys
 	wAEAD cipher.AEAD
 	wSeq  uint64
-	rKeys trafficKeys
-	rAEAD cipher.AEAD
-	rSeq  uint64
+	// writeErr is protected by wmu and permanent. Once a record write fails,
+	// ciphertext may be partial and its sequence number has been consumed; a
+	// later application retry cannot safely resume this TLS stream.
+	writeErr error
+	rKeys    trafficKeys
+	rAEAD    cipher.AEAD
+	rSeq     uint64
 
 	transcript []byte // all handshake messages; cleared afterward
 	hsBuf      []byte // incomplete handshake-message bytes
@@ -136,6 +149,13 @@ var _ net.Conn = (*Conn)(nil)
 // dialTimeout separately bounds TCP setup and TLS handshake so a silent peer
 // cannot retain a goroutine and socket forever. It matches leanhttp's timeout.
 const dialTimeout = 10 * time.Second
+
+// A close_notify is only a courtesy once the caller has requested Close. A
+// peer that stopped reading must not be able to retain the connection (and its
+// owner) indefinitely. The record is tiny and normally enters the transport
+// immediately; backpressure beyond this bound turns the graceful close into a
+// transport close.
+const closeNotifyTimeout = 250 * time.Millisecond
 
 // Dial opens TCP and performs the handshake with [dialTimeout]. For custom
 // deadlines, dial separately and call [Client]; for cancellation use
@@ -214,8 +234,7 @@ func (c *Conn) setWrite(k trafficKeys) {
 
 // writeCCS sends the empty plaintext change_cipher_spec compatibility record.
 func (c *Conn) writeCCS() error {
-	_, err := c.conn.Write([]byte{recCCS, 3, 3, 0, 1, 1})
-	return err
+	return writeFull(c.conn, []byte{recCCS, 3, 3, 0, 1, 1})
 }
 
 // readHandshakeMsg returns and records the next handshake message. It buffers
@@ -336,8 +355,17 @@ func (c *Conn) postHandshake(payload []byte) error {
 
 // Write sends application data fragmented at the RFC record limit.
 func (c *Conn) Write(p []byte) (int, error) {
+	if c.closing.Load() {
+		return 0, net.ErrClosed
+	}
 	c.wmu.Lock()
 	defer c.wmu.Unlock()
+	if c.closing.Load() {
+		return 0, net.ErrClosed
+	}
+	if c.writeErr != nil {
+		return 0, c.writeErr
+	}
 	total := 0
 	for len(p) > 0 {
 		n := min(len(p), maxPlain)
@@ -350,16 +378,38 @@ func (c *Conn) Write(p []byte) (int, error) {
 	return total, nil
 }
 
-// Close sends close_notify before closing, allowing the peer to distinguish a
-// complete stream from a truncated connection.
+// Close sends a best-effort close_notify before closing, allowing the peer to
+// distinguish a complete stream from a truncated connection. It never waits
+// behind an application Write: closing the transport is what releases such a
+// writer. A close_notify that itself blocks is bounded by a write deadline and
+// an independent transport-close timer.
 func (c *Conn) Close() error {
-	if c.wAEAD != nil {
-		c.wmu.Lock()
-		// A failed close_notify must not prevent closing an already broken socket.
-		_ = c.writeRecord(recAlert, []byte{2, alertCloseNotify})
-		c.wmu.Unlock()
-	}
-	return c.conn.Close()
+	c.closeOnce.Do(func() {
+		c.closing.Store(true)
+
+		// Waiting for wmu can deadlock behind a Write whose peer stopped
+		// reading. In that case the transport close below is the only safe way
+		// to release it, so close_notify is no longer feasible.
+		if c.wmu.TryLock() {
+			if c.wAEAD != nil {
+				// There is no deadline to restore: the transport is irrevocably
+				// closed immediately after this best-effort alert.
+				if err := c.conn.SetWriteDeadline(time.Now().Add(closeNotifyTimeout)); err == nil {
+					timer := time.AfterFunc(closeNotifyTimeout, c.closeTransport)
+					_ = c.writeRecord(recAlert, []byte{2, alertCloseNotify})
+					timer.Stop()
+				}
+			}
+			c.wmu.Unlock()
+		}
+
+		c.closeTransport()
+	})
+	return c.closeErr
+}
+
+func (c *Conn) closeTransport() {
+	c.connCloseOnce.Do(func() { c.closeErr = c.conn.Close() })
 }
 
 // keyUpdateMsg reciprocates a requested update without requesting another,
@@ -371,7 +421,7 @@ func keyUpdateMsg() []byte {
 	return b.buf
 }
 
-func (c *Conn) LocalAddr() net.Addr                { return c.conn.LocalAddr() }
+func (c *Conn) LocalAddr() net.Addr { return c.conn.LocalAddr() }
 
 // Grown geeft de bulk-classificatie van het onderliggende transport door
 // (zie leannet tcpSock.Grown): zo geldt de pool-regel "gegroeid = sluiten,

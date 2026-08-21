@@ -27,10 +27,13 @@
 //
 // # Contexts
 //
-// Operations map a [context.Context] deadline to leanhttp Call.Timeout and
-// reject an already canceled context. Bare cancellation after a call starts is
-// not observed: leanhttp has no context seam, and closing one request's pooled
-// connection safely would require a watcher goroutine per call.
+// Operations pass [context.Context] through dialing, request I/O, and response
+// bodies. Cancellation closes only that operation's active connection; a fully
+// consumed healthy connection may return to the pool after its callback stops.
+// A 30-second progress timeout also bounds each blocked socket read or write by
+// default; [Client.IdleTimeout] configures it. A caller-supplied upload reader or
+// download writer blocked inside its own method remains that caller's
+// cancellation responsibility.
 //
 // # Composition
 //
@@ -63,6 +66,11 @@ const (
 	methodDelete = "DELETE"
 )
 
+const (
+	defaultIOIdleTimeout = 30 * time.Second
+	s3DialTimeout        = 10 * time.Second
+)
+
 // Status codes not named by leanhttp.
 const (
 	statusConflict           = 409
@@ -82,6 +90,10 @@ var (
 	// ErrPreconditionFailed reports a 412, or a provider's 409 for a concurrent
 	// If-None-Match race. Nothing was written.
 	ErrPreconditionFailed = errors.New("leans3: precondition failed")
+
+	// ErrObjectTooLarge reports that buffered [Client.Get] crossed its 4 MiB cap.
+	// [Client.GetTo] remains the streaming operation for larger objects.
+	ErrObjectTooLarge = errors.New("leans3: object exceeds buffered GET limit")
 )
 
 // StatusError represents any other unsuccessful response. Body retains a
@@ -133,6 +145,12 @@ type Client struct {
 	// Now overrides signature time. Nil uses time.Now; tests need this seam for
 	// deterministic signatures.
 	Now func() time.Time
+
+	// IdleTimeout bounds one blocked socket read or write. Progress renews the
+	// bound, so a long active GetTo or PutFrom is not a total-timeout failure. Zero
+	// selects 30 seconds; a negative value is invalid. It is read when the pool is
+	// first built. Context deadlines remain absolute caps.
+	IdleTimeout time.Duration
 
 	mu   sync.Mutex
 	pool *leanhttp.Client
@@ -186,7 +204,7 @@ func (c *Client) do(ctx context.Context, r request) (*leanhttp.Response, error) 
 		Body:       r.body,
 		BodyReader: r.stream,
 		BodyLen:    r.streamLen,
-		Timeout:    timeoutFor(ctx),
+		Context:    ctx,
 		// A SigV4 signature covers this host and path. Following a redirect would
 		// invalidate it and could leak signed headers such as a session token.
 		NoFollow: true,
@@ -197,6 +215,16 @@ func (c *Client) do(ctx context.Context, r request) (*leanhttp.Response, error) 
 	// leanhttp centrally handles bodyless 204 and 304 responses (RFC 9112 §6.3),
 	// preventing S3 DELETE from waiting until the server's idle timeout.
 	return resp, nil
+}
+
+func (c *Client) ioIdleTimeout() (time.Duration, error) {
+	if c.IdleTimeout < 0 {
+		return 0, errors.New("leans3: IdleTimeout must not be negative")
+	}
+	if c.IdleTimeout == 0 {
+		return defaultIOIdleTimeout, nil
+	}
+	return c.IdleTimeout, nil
 }
 
 // fail maps an unsuccessful response to its error while bounding body reads.
@@ -227,16 +255,21 @@ func (c *Client) client() (*leanhttp.Client, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.pool == nil {
+		idle, err := c.ioIdleTimeout()
+		if err != nil {
+			return nil, err
+		}
 		dial, err := c.dialer()
 		if err != nil {
 			return nil, err
 		}
-		c.pool = &leanhttp.Client{DialContext: dial}
+		c.pool = &leanhttp.Client{DialContext: withProgress(dial, idle)}
 	}
 	return c.pool, nil
 }
 
-// dialer selects transport from Endpoint. Nil means leanhttp's plain HTTP dial.
+// dialer selects transport from Endpoint. Plain HTTP retains a bounded setup
+// dial even though the progress wrapper starts only after connection setup.
 //
 // Nil roots use x509.SystemCertPool: the host trust store or roots embedded in
 // a bare-metal image. There is deliberately no skip-verify option.
@@ -255,7 +288,7 @@ func (c *Client) dialer() (func(ctx context.Context, network, addr string) (net.
 			SignatureAlgorithms: x509verify.SignatureAlgorithms,
 		}), nil
 	case "http":
-		return nil, nil
+		return (&net.Dialer{Timeout: s3DialTimeout}).DialContext, nil
 	default:
 		return nil, fmt.Errorf("leans3: Endpoint scheme must be http or https, got %q", u.Scheme)
 	}
@@ -269,18 +302,6 @@ func (c *Client) CloseIdle() {
 	if pool != nil {
 		pool.CloseIdle()
 	}
-}
-
-// timeoutFor maps a context deadline to leanhttp's per-call timeout.
-func timeoutFor(ctx context.Context) time.Duration {
-	deadline, ok := ctx.Deadline()
-	if !ok {
-		return 0
-	}
-	if d := time.Until(deadline); d > 0 {
-		return d
-	}
-	return time.Nanosecond // Already expired: fail on first I/O instead of blocking.
 }
 
 func (c *Client) now() time.Time {
