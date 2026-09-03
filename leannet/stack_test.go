@@ -1338,8 +1338,8 @@ func TestStackIdleVerbindingGeeftBuffersTerug(t *testing.T) {
 
 	// Sinds de RX-groei op volle segmenten (tcp.go) draagt een gegroeide
 	// ontvanger een venster-BELOFTE die de pot pint zolang de verbinding
-	// idle openstaat — de belofte mag niet naar links (RFC 9293, zie
-	// shrinkRing). "Snel heeft altijd een eind": de verbinding die groeide
+	// idle openstaat — de belofte mag niet naar links (RFC 9293).
+	// "Snel heeft altijd een eind": de verbinding die groeide
 	// hoort te SLUITEN (de leanhttp-pool sluit gegroeide verbindingen,
 	// client.go put; trage stromen groeien nooit en poolen gewoon). De
 	// invariant is dus: bij close komt álles per direct terug in de pot.

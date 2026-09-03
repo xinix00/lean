@@ -1080,7 +1080,7 @@ func TestTCPHalfCloseKeepsReceiving(t *testing.T) {
 	}
 }
 
-func TestTCPTxKrimptOpDeLaatsteAck(t *testing.T) {
+func TestTCPTxBehoudtGroeiTotClose(t *testing.T) {
 	w := newTCPPair(t, tcpFloorTx, 32<<10)
 	pot := &budget{total: 256 << 10}
 	if !pot.reserve(2 * tcpFloorTx) {
@@ -1107,12 +1107,12 @@ func TestTCPTxKrimptOpDeLaatsteAck(t *testing.T) {
 	if got := w.a.tx.buffered(); got != 0 {
 		t.Fatalf("na de pump staat er nog %d bytes onbevestigd", got)
 	}
-	if got := w.a.tx.size(); got != tcpFloorTx {
-		t.Fatalf("zendring is %d bytes na de laatste ACK, wil de vloer %d — "+
-			"de gegroeide ring blijft staan tot iets ánders nog een ACK stuurt", got, tcpFloorTx)
+	if got := w.a.tx.size(); got <= tcpFloorTx {
+		t.Fatalf("zendring is na de laatste ACK teruggevallen naar %d bytes — "+
+			"één bulkstroom zou daardoor steeds opnieuw alloceren", got)
 	}
-	if pot.used != base {
-		t.Fatalf("pot draagt %d bytes, wil %d — de groei is niet teruggestort", pot.used, base)
+	if pot.used <= base {
+		t.Fatalf("pot draagt %d bytes, wil meer dan basis %d zolang de verbinding leeft", pot.used, base)
 	}
 }
 
@@ -1797,21 +1797,6 @@ func TestTCPOudePrefixWordtGetrimd(t *testing.T) {
 	w.b.recv(seg, w.now)
 	if got := string(readAll(w.b)); got != "def" {
 		t.Fatalf("b las %q, wil de nieuwe suffix %q — de oude prefix is niet getrimd", got, "def")
-	}
-}
-
-func TestTCPKrimpLuktOpVollePot(t *testing.T) {
-	c := &tcpConn{}
-	c.rx = ring{buf: make([]byte, 32<<10)}
-	c.pot = &budget{total: 32 << 10, used: 32 << 10}
-	c.maxBuf = 64 << 10
-	c.advSet = true
-	c.shrinkRx()
-	if got := c.rx.size(); got != tcpFloorRx {
-		t.Fatalf("ring is %d na krimp op een volle pot, wil de vloer (%d)", got, tcpFloorRx)
-	}
-	if c.pot.used != tcpFloorRx {
-		t.Fatalf("pot.used = %d, wil %d — de krimp gaf de oude ring niet terug", c.pot.used, tcpFloorRx)
 	}
 }
 

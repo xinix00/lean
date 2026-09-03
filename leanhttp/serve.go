@@ -322,6 +322,13 @@ func serveConn(nc net.Conn, h Handler) {
 		if c.hijacked {
 			return
 		}
+		// Keep the capacity for the entire request, then end a bulk connection.
+		// This mirrors the client pool: chatty connections remain small and reusable;
+		// a grown connection returns all ring budget on close instead of shrinking and
+		// reallocating repeatedly while one request is still moving data.
+		if g, ok := nc.(growthReporter); ok && g.Grown() {
+			w.keepAlive = false
+		}
 		if err := w.finish(); err != nil || !w.keepAlive || c.watched {
 			// Before a clean close, briefly drain unread valid body bytes. Closing
 			// with unread TCP data may reset and discard the response send queue.

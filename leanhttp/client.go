@@ -15,6 +15,10 @@ import (
 	"time"
 )
 
+type growthReporter interface {
+	Grown() bool
+}
+
 // Two idle connections support parallel page resources without flooding the
 // server. Thirty seconds stays well below common server-side idle timeouts.
 const (
@@ -162,7 +166,7 @@ func (cl *Client) put(addr string, c net.Conn, br *bufio.Reader) bool {
 	// once. Slow streams (SSE, chat) never grow and pool as always. The cost
 	// is one fresh handshake per bulk reuse — exactly the rare, already
 	// expensive case.
-	if g, ok := c.(interface{ Grown() bool }); ok && g.Grown() {
+	if g, ok := c.(growthReporter); ok && g.Grown() {
 		return false
 	}
 	max := cl.MaxIdlePerHost

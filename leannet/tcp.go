@@ -134,10 +134,9 @@ type tcpConn struct {
 	tx txRing
 
 	// Rings start at their floors and double under receive or write pressure,
-	// bounded by maxBuf and pot. nil pot disables growth.
-	//
-	// Empty rings shrink to their floors after the last read or ACK. Otherwise a
-	// few idle pooled HTTP connections could retain the entire budget.
+	// bounded by maxBuf and pot. nil pot disables growth. Grown capacity lives
+	// until close: shrinking between application reads or ACKs would turn one
+	// bulk stream into a grow/allocate/shrink cycle.
 	pot    *budget
 	maxBuf int
 
@@ -297,54 +296,6 @@ func (c *tcpConn) write(p []byte) (int, error) {
 	return n, nil
 }
 
-// shrinkRing returns an empty grown ring to its floor. Without this, four idle
-// pooled HTTP connections at the default per-connection cap can exhaust Budget
-// and prevent even the watchdog from dialing.
-//
-// keep preserves an already-advertised receive window, which cannot shrink left
-// (RFC 9293 §3.8.6.2.1). Transmit rings have no external promise.
-func (c *tcpConn) shrinkRing(r *ring, floor, keep int) {
-	if c.pot == nil || r.buffered() != 0 {
-		return
-	}
-	target := floor
-	if keep > target {
-		target = keep
-	}
-	if target >= r.size() {
-		return
-	}
-	// Release the empty old buffer before reserving the smaller one. Reserving
-	// first would necessarily fail when the budget is full and prevent shrink.
-	old := r.size()
-	r.grow(nil)
-	c.pot.release(old)
-	if !c.pot.reserve(target) {
-		// Only an accounting bug can fail after releasing a larger reservation.
-		panic("leannet: shrink reservation failed after releasing a larger ring")
-	}
-	r.grow(make([]byte, target))
-}
-
-// shrinkRx and shrinkTx run after the final read and final acknowledgment.
-func (c *tcpConn) shrinkRx() {
-	// Before the first post-SYN advertisement the ring remains at its floor and
-	// a zero edge carries no shrink information.
-	if !c.advSet {
-		return
-	}
-	keep := 0
-	if d := seqDiff(c.advEdge, c.rcvNxt); d > 0 {
-		keep = d
-	}
-	c.shrinkRing(&c.rx, tcpFloorRx, keep)
-}
-
-func (c *tcpConn) shrinkTx() {
-	// No sent guard is needed: shrink requires empty and sent never exceeds buffered.
-	c.shrinkRing(&c.tx.ring, tcpFloorTx, 0)
-}
-
 // growRing doubles r within maxBuf and the budget.
 func (c *tcpConn) growRing(r *ring) bool {
 	if c.pot == nil {
@@ -417,8 +368,6 @@ func (c *tcpConn) read(p []byte) (int, error) {
 			c.needAck = true
 		}
 	}
-	// The application caught up; release surplus empty capacity.
-	c.shrinkRx()
 	return n, nil
 }
 
@@ -739,10 +688,6 @@ func (c *tcpConn) processAck(seg tcpSeg, now int64) (accept bool) {
 	c.persistBackoff = 0
 	c.touchCloseWait(now) // cumulative progress is activity, duplicate ACKs are not
 
-	// Shrink after updating accounting because this final ACK may empty an idle
-	// pooled connection. An in-flight FIN uses sequence, not ring, space.
-	c.shrinkTx()
-
 	// Karn permits RTT measurement only for non-retransmitted space.
 	if c.timing && seqLEQ(c.timedSeq, ack) {
 		c.updateRTT(time.Duration(now - c.timedAt))
@@ -847,7 +792,8 @@ func (c *tcpConn) processData(seg tcpSeg, now int64) {
 		//     18-08 on the LicheeRV: image streams at ~170KB/s (one floor
 		//     window per ~90ms) while the budget pot sat idle. Chatty
 		//     connections never send full segments and stay at the floor;
-		//     shrinkRx returns grown rings there after the final read.
+		//     grown capacity remains useful through the rest of the stream and
+		//     returns to the budget on close.
 		if c.advSet && (c.rx.free() == 0 || len(seg.data) >= int(c.advMSS)) {
 			if c.growRing(&c.rx) && n < dataLen {
 				m := c.rx.write(seg.data[n:])

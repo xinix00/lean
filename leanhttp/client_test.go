@@ -105,6 +105,31 @@ func TestGrownVerbindingKomtNietInPool(t *testing.T) {
 	<-serverDone
 }
 
+func TestServerSluitGegroeideVerbindingNaRequest(t *testing.T) {
+	client, rawServer := net.Pipe()
+	serverDone := make(chan struct{})
+	go func() {
+		serveConn(grownTestConn{rawServer}, func(w ResponseWriter, r *Request) {
+			io.WriteString(w, "ok")
+		})
+		close(serverDone)
+	}()
+	t.Cleanup(func() { client.Close() })
+
+	client.SetDeadline(time.Now().Add(5 * time.Second))
+	if _, err := io.WriteString(client, "GET / HTTP/1.1\r\nHost: x\r\n\r\n"); err != nil {
+		t.Fatal(err)
+	}
+	response, err := io.ReadAll(client)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := string(response); !strings.Contains(got, "Connection: close\r\n") || !strings.HasSuffix(got, "\r\n\r\nok") {
+		t.Fatalf("antwoord %q, wil een compleet antwoord met Connection: close", got)
+	}
+	<-serverDone
+}
+
 type gatedCloseConn struct {
 	net.Conn
 	started chan struct{}

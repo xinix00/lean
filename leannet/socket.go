@@ -516,10 +516,10 @@ func (t *tcpSock) RemoteAddr() net.Addr { return tcpAddr(t.c.key.rip, t.c.key.rp
 // is the growth signal, tcp.go); chatty long-lived streams (SSE, attach
 // sessions) stay at the floor forever. A grown receive ring carries an
 // advertised-window promise that pins budget for as long as the connection
-// idles open (shrinkRing: the promise cannot shrink left, RFC 9293). So "fast
+// idles open (the promise cannot shrink left, RFC 9293). So "fast
 // always has an end": a pool should CLOSE a grown connection instead of
 // keeping it idle — the promise dies with the close and the budget returns at
-// once. leanhttp's pool does exactly that (client.go put).
+// once. leanhttp does that on both sides of a request.
 func (t *tcpSock) Grown() bool {
 	s := t.s
 	s.mu.Lock()
