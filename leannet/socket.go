@@ -393,7 +393,7 @@ func (s *Stack) dialTCP(ctx context.Context, raddr [4]byte, rport uint16, deadli
 		s.mu.Unlock()
 		return nil, err
 	}
-	c.tcp.openActive(s.nextISS(), uint16(MTU-40), s.cfg.AdvWS)
+	c.tcp.openActive(s.nextISS(), uint16(s.linkMTU(raddr)-40), s.cfg.AdvWS)
 	// hop determines which ARP outcome governs this dial.
 	s.notify() // pump the SYN, resolving ARP first if needed
 
@@ -697,7 +697,7 @@ func (u *udpSock) writeUDP(p []byte, dst [4]byte, dport uint16) (int, error) {
 			if mac, ok := s.routeLocked(dst, now, true); ok {
 				off := EthernetHeaderSize + sizeIPv4
 				copy(s.txBuf[off+sizeUDP:], p)
-				n, err := PutUDP(s.txBuf[off:], u.lport, dport, s.cfg.IP, dst, len(p))
+				n, err := putUDP(s.txBuf[off:], u.lport, dport, s.cfg.IP, dst, len(p), !s.trusted(dst))
 				if err != nil {
 					return false, err
 				}

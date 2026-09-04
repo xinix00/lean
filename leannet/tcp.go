@@ -103,6 +103,7 @@ type tcpSeg struct {
 
 // tcpConn is one connection. The socket layer provides all synchronization.
 type tcpConn struct {
+	cnt    tcpCounters // telemetry, summed into Stats
 	state  tcpState
 	listen bool // passive side: SYN on tcpClosed opens into SYN-RCVD
 
@@ -301,8 +302,13 @@ func (c *tcpConn) growRing(r *ring) bool {
 	if c.pot == nil {
 		return false
 	}
-	// maxBuf caps receive and transmit combined, not each ring independently.
-	headroom := c.maxBuf - (c.rx.size() + c.tx.size())
+	// maxBuf caps each ring on its own. Combined, a connection that writes
+	// and reads big chunks in turn let the transmit ring take the whole
+	// allowance and pinned the receive ring on its floor: the peer could
+	// then send 4 KiB per round trip (256 rounds per MiB, measured 04-09).
+	// The receive ring bounds the advertised window, so maxBuf still says
+	// how much a peer may have in flight toward us.
+	headroom := c.maxBuf - r.size()
 	if headroom <= 0 {
 		return false
 	}
@@ -540,8 +546,12 @@ func (c *tcpConn) enterEstablished() {
 func (c *tcpConn) takeSynOptions(seg tcpSeg) {
 	if seg.mss != 0 {
 		c.peerMSS = int(seg.mss)
-		if c.peerMSS > MTU-40 {
-			// Peer MSS is an upper bound; clamp it to our MTU.
+		// Peer MSS is an upper bound; clamp it to what we advertised, which
+		// already follows the link toward this peer (Stack.linkMTU). A bare
+		// connection without an advertised MSS keeps the classic clamp.
+		if limit := int(c.advMSS); limit > 0 && c.peerMSS > limit {
+			c.peerMSS = limit
+		} else if limit == 0 && c.peerMSS > MTU-40 {
 			c.peerMSS = MTU - 40
 		}
 	}
@@ -634,6 +644,9 @@ func (c *tcpConn) processAck(seg tcpSeg, now int64) (accept bool) {
 	if seqLT(c.wl1, seg.seq) || (c.wl1 == seg.seq && seqLEQ(c.wl2, ack)) {
 		wasClosed := c.sndWnd == 0
 		c.sndWnd = wnd
+		if wnd == 0 && !wasClosed {
+			c.cnt.zeroWnd++
+		}
 		c.wl1, c.wl2 = seg.seq, ack
 		// A valid zero-window update proves the peer is alive in persist mode and
 		// resets retry count. Old zero-window advertisements do not.
@@ -658,6 +671,7 @@ func (c *tcpConn) processAck(seg tcpSeg, now int64) (accept bool) {
 		if len(seg.data) == 0 && !seg.flags.Has(FlagFIN) && sameWnd && c.una != c.nxt {
 			c.dupacks++
 			if c.dupacks == 3 {
+				c.cnt.fastRetrans++
 				c.goBackN()
 			}
 		} else {
@@ -778,6 +792,8 @@ func (c *tcpConn) processData(seg tcpSeg, now int64) {
 			}
 			goto fin
 		}
+		c.cnt.segsIn++
+		c.cnt.bytesIn += len(seg.data)
 		n := c.rx.write(seg.data)
 		c.rcvNxt += uint32(n)
 		c.needAck = true
@@ -892,6 +908,7 @@ func (c *tcpConn) emit(buf []byte, now int64) (seg tcpSeg, ok bool) {
 			if c.una != c.nxt {
 				c.goBackN() // resend the previous probe byte
 			}
+			c.cnt.persist++
 			c.probe = true // permit one byte beyond the zero window
 		} else {
 			if c.backoff < tcpBackoffMax {
@@ -900,6 +917,7 @@ func (c *tcpConn) emit(buf []byte, now int64) (seg tcpSeg, ok bool) {
 			}
 			c.deadline = now + int64(c.currentRTO())
 			if c.una != c.nxt {
+				c.cnt.retrans++
 				c.goBackN()
 			}
 		}
@@ -950,6 +968,8 @@ func (c *tcpConn) emit(buf []byte, now int64) (seg tcpSeg, ok bool) {
 		n = len(buf)
 	}
 	if n > 0 {
+		c.cnt.segsOut++
+		c.cnt.bytesOut += n
 		c.probe = false
 		got := c.tx.nextSend(buf[:n])
 		seg = tcpSeg{seq: c.nxt, ack: c.rcvNxt, flags: FlagACK | FlagPSH,
@@ -1130,4 +1150,16 @@ func (c *tcpConn) updateRTT(sample time.Duration) {
 		c.srtt += (sample - c.srtt) / 8
 	}
 	c.rto = c.srtt + 4*c.rttvar
+}
+
+// tcpCounters are per-connection telemetry counters, summed by Stack.Stats.
+type tcpCounters struct {
+	retrans     int // RTO retransmissions (go-back-N)
+	fastRetrans int // three duplicate ACKs
+	persist     int // zero-window probes sent
+	zeroWnd     int // peer advertised a zero window
+	segsOut     int // data segments sent (retransmissions included)
+	bytesOut    int
+	segsIn      int // data segments received
+	bytesIn     int
 }

@@ -205,6 +205,10 @@ func (f UDPFrame) Payload() []byte { return f[sizeUDP:f.Len()] }
 
 // PutUDP writes the header and checksum for a payload already placed after sizeUDP.
 func PutUDP(b []byte, srcPort, dstPort uint16, src, dst [4]byte, payloadLen int) (int, error) {
+	return putUDP(b, srcPort, dstPort, src, dst, payloadLen, true)
+}
+
+func putUDP(b []byte, srcPort, dstPort uint16, src, dst [4]byte, payloadLen int, sum bool) (int, error) {
 	total := sizeUDP + payloadLen
 	if len(b) < total || total > 0xffff {
 		return 0, errShortFrame
@@ -213,6 +217,9 @@ func PutUDP(b []byte, srcPort, dstPort uint16, src, dst [4]byte, payloadLen int)
 	binary.BigEndian.PutUint16(b[2:4], dstPort)
 	binary.BigEndian.PutUint16(b[4:6], uint16(total))
 	binary.BigEndian.PutUint16(b[6:8], 0)
+	if !sum {
+		return total, nil // zero = no checksum, which UDP allows
+	}
 	csum := pseudoChecksum(ProtoUDP, src, dst, b[:total])
 	if csum == 0 {
 		csum = 0xffff // RFC 768 reserves zero for an absent checksum
@@ -286,6 +293,13 @@ func (f TCPFrame) ChecksumOK(src, dst [4]byte) bool {
 // PutTCP writes a header, options, and checksum for an already-placed payload.
 // opts must be a multiple of four bytes; the caller supplies NOP/EOL padding.
 func PutTCP(b []byte, srcPort, dstPort uint16, seq, ack uint32, flags TCPFlags, wnd uint16, opts []byte, src, dst [4]byte, payloadLen int) (int, error) {
+	return putTCP(b, srcPort, dstPort, seq, ack, flags, wnd, opts, src, dst, payloadLen, true)
+}
+
+// putTCP is PutTCP with the checksum optional: a link that is memory (a ring
+// between two stacks on one machine) has no bit errors, and both stacks agree
+// through Config.LinkTrusted to leave the field zero there.
+func putTCP(b []byte, srcPort, dstPort uint16, seq, ack uint32, flags TCPFlags, wnd uint16, opts []byte, src, dst [4]byte, payloadLen int, sum bool) (int, error) {
 	if len(opts)%4 != 0 || len(opts) > 40 {
 		return 0, errBadTCPOff
 	}
@@ -303,7 +317,9 @@ func PutTCP(b []byte, srcPort, dstPort uint16, seq, ack uint32, flags TCPFlags, 
 	binary.BigEndian.PutUint16(b[16:18], 0)
 	binary.BigEndian.PutUint16(b[18:20], 0) // urgent pointer is unused
 	copy(b[sizeTCP:hdr], opts)
-	binary.BigEndian.PutUint16(b[16:18], pseudoChecksum(ProtoTCP, src, dst, b[:total]))
+	if sum {
+		binary.BigEndian.PutUint16(b[16:18], pseudoChecksum(ProtoTCP, src, dst, b[:total]))
+	}
 	return total, nil
 }
 

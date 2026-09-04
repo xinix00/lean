@@ -81,6 +81,22 @@ type Config struct {
 
 	// AdvWS is the advertised window-scale shift. Zero is valid (RFC 7323).
 	AdvWS uint8
+
+	// MTU is the link MTU (0 = 1500). It applies to peers on MTUNet (zero =
+	// the stack's own prefix); every other peer is reached through a gateway
+	// and is always treated as 1500. The advertised MSS and the clamp on the
+	// peer's MSS follow the destination, so a jumbo LAN never pushes a jumbo
+	// frame toward a 1500-byte uplink. A gateway whose own address lives on
+	// the uplink but whose device is the jumbo LAN names that LAN here.
+	MTU       int
+	MTUNet    [4]byte
+	MTUPrefix int
+
+	// LinkTrusted says the link toward MTUNet is memory, not a wire: frames
+	// there cannot be corrupted, so TCP and UDP checksums are neither
+	// computed nor verified for peers on that net. Both stacks must agree;
+	// everything beyond the net keeps full checksums.
+	LinkTrusted bool
 }
 
 type connKey struct {
@@ -91,6 +107,7 @@ type connKey struct {
 
 // Stack connects the protocol machines under one mutex.
 type Stack struct {
+	mtu int // link MTU, see Config.MTU
 	mu  sync.Mutex
 	cfg Config
 	dev Device
@@ -143,6 +160,16 @@ type Stats struct {
 	DropBadFrame    int
 	DropReplyFull   int // connectionless replies or loopback frames dropped on overflow
 
+	// TCP counters, summed over the live connections.
+	TCPRetransmits     int // RTO retransmissions
+	TCPFastRetransmits int // three duplicate ACKs
+	TCPPersistProbes   int // zero-window probes sent
+	TCPZeroWindows     int // peer advertised a zero window
+	TCPSegsOut         int // data segments sent
+	TCPBytesOut        int
+	TCPSegsIn          int // data segments received
+	TCPBytesIn         int
+
 	// ARP contains a complete copy of the ARP machine counters.
 	ARP ARPStats
 
@@ -165,6 +192,16 @@ func (s *Stack) Stats() Stats {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	st := s.stats
+	for _, c := range s.conns {
+		st.TCPRetransmits += c.tcp.cnt.retrans
+		st.TCPFastRetransmits += c.tcp.cnt.fastRetrans
+		st.TCPPersistProbes += c.tcp.cnt.persist
+		st.TCPZeroWindows += c.tcp.cnt.zeroWnd
+		st.TCPSegsOut += c.tcp.cnt.segsOut
+		st.TCPBytesOut += c.tcp.cnt.bytesOut
+		st.TCPSegsIn += c.tcp.cnt.segsIn
+		st.TCPBytesIn += c.tcp.cnt.bytesIn
+	}
 	if s.arp != nil {
 		st.ARP = s.arp.cnt
 	}
@@ -191,6 +228,10 @@ func NewStack(dev Device, cfg Config, issSeed uint32) *Stack {
 	if cfg.MaxBufPerConn < tcpFloorRing {
 		cfg.MaxBufPerConn = tcpFloorRing
 	}
+	mtu := cfg.MTU
+	if mtu <= 0 {
+		mtu = MTU
+	}
 	s := &Stack{
 		cfg:       cfg,
 		dev:       dev,
@@ -203,7 +244,8 @@ func NewStack(dev Device, cfg Config, issSeed uint32) *Stack {
 		t0:        time.Now(),
 		nextEph:   ephemeralBase,
 		issSeed:   issSeed,
-		txBuf:     make([]byte, MTU+EthernetMaximumSize),
+		txBuf:     make([]byte, mtu+EthernetMaximumSize),
+		mtu:       mtu,
 	}
 	go s.pump()
 	return s
@@ -347,7 +389,7 @@ func (s *Stack) RecvInboundPacket(frame []byte) error {
 		s.mu.Unlock()
 		return nil
 	}
-	if len(frame) > MTU+EthernetMaximumSize {
+	if len(frame) > s.mtu+EthernetMaximumSize {
 		// Reject jumbo frames before a generated reply can overflow txBuf.
 		s.mu.Lock()
 		s.stats.DropBadFrame++
@@ -451,7 +493,7 @@ func (s *Stack) recvIPv4(ip IPv4Frame, srcMAC [6]byte, now int64) {
 	switch ip.Proto() {
 	case ProtoTCP:
 		f, err := ParseTCP(ip.Payload())
-		if err != nil || !f.ChecksumOK(src, s.cfg.IP) {
+		if err != nil || !(s.trusted(src) || f.ChecksumOK(src, s.cfg.IP)) {
 			s.stats.DropBadFrame++
 			return
 		}
@@ -461,7 +503,7 @@ func (s *Stack) recvIPv4(ip IPv4Frame, srcMAC [6]byte, now int64) {
 		f, err := ParseUDP(ip.Payload())
 		// The pseudo-header carries the frame's own destination: our unicast
 		// address (guaranteed by ingress) or a joined multicast group.
-		if err != nil || !f.ChecksumOK(src, ip.Dst()) {
+		if err != nil || !(s.trusted(src) || f.ChecksumOK(src, ip.Dst())) {
 			s.stats.DropBadFrame++
 			return
 		}
@@ -544,7 +586,7 @@ func (s *Stack) recvTCP(f TCPFrame, src [4]byte, now int64) {
 		s.notify()
 		return
 	}
-	c.tcp.openPassive(s.nextISS(), uint16(MTU-40), s.cfg.AdvWS)
+	c.tcp.openPassive(s.nextISS(), uint16(s.linkMTU(src)-40), s.cfg.AdvWS)
 	c.tcp.recv(seg, now)
 	// emit sends any pending reset first; reap preserves it if the connection dies.
 	c.listener = l
@@ -865,7 +907,7 @@ func (s *Stack) queueRSTLocked(dst [4]byte, sport, dport uint16, seq, ack uint32
 		flags |= FlagACK
 	}
 	buf := make([]byte, sizeTCP)
-	n, err := PutTCP(buf, sport, dport, seq, ack, flags, 0, nil, s.cfg.IP, dst, 0)
+	n, err := putTCP(buf, sport, dport, seq, ack, flags, 0, nil, s.cfg.IP, dst, 0, !s.trusted(dst))
 	if err != nil {
 		return // only an internal sizing error can reach this
 	}
@@ -939,7 +981,7 @@ func (s *Stack) lbBuf() []byte {
 		s.lbFree = s.lbFree[:n-1]
 		return b[:0]
 	}
-	return make([]byte, 0, MTU+EthernetMaximumSize)
+	return make([]byte, 0, s.mtu+EthernetMaximumSize)
 }
 
 func (s *Stack) sendIPv4Locked(dstMAC [6]byte, dstIP [4]byte, proto byte, payload []byte) {
@@ -951,8 +993,9 @@ func (s *Stack) sendIPv4Locked(dstMAC [6]byte, dstIP [4]byte, proto byte, payloa
 
 func (s *Stack) sendTCPLocked(dstMAC [6]byte, key connKey, w wireSeg) {
 	off := EthernetHeaderSize + sizeIPv4
-	n, err := PutTCP(s.txBuf[off:], key.lport, key.rport, w.seg.seq, w.seg.ack,
-		w.seg.flags, w.seg.wnd, w.opts, s.cfg.IP, key.rip, w.payloadLen)
+	n, err := putTCP(s.txBuf[off:], key.lport, key.rport, w.seg.seq, w.seg.ack,
+		w.seg.flags, w.seg.wnd, w.opts, s.cfg.IP, key.rip, w.payloadLen, !s.trusted(key.rip))
+
 	if err != nil {
 		s.stats.DropBadFrame++ // count the internal sizing error explicitly
 		return
@@ -1041,4 +1084,29 @@ func parseTCPSeg(f TCPFrame) (tcpSeg, bool) {
 		}
 	}
 	return seg, true
+}
+
+// linkMTU is the MTU toward dst: the configured link MTU on the local prefix,
+// and never more than the classic 1500 beyond it (the gateway's uplink).
+// trusted reports whether ip lies on the trusted memory link (Config.LinkTrusted, MTUNet).
+func (s *Stack) trusted(ip [4]byte) bool {
+	if !s.cfg.LinkTrusted {
+		return false
+	}
+	net, pfx := s.cfg.MTUNet, s.cfg.MTUPrefix
+	if pfx == 0 {
+		net, pfx = s.cfg.IP, s.cfg.Prefix
+	}
+	return sameSubnet(ip, net, pfx)
+}
+
+func (s *Stack) linkMTU(dst [4]byte) int {
+	net, pfx := s.cfg.MTUNet, s.cfg.MTUPrefix
+	if pfx == 0 {
+		net, pfx = s.cfg.IP, s.cfg.Prefix
+	}
+	if sameSubnet(dst, net, pfx) {
+		return s.mtu
+	}
+	return min(s.mtu, MTU)
 }

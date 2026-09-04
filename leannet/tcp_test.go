@@ -1373,8 +1373,12 @@ func TestTCPMaxBufKlemtDeVerbinding(t *testing.T) {
 			data: make([]byte, promised)}, w.now)
 	}
 
-	if total := c.rx.size() + c.tx.size(); total > 16<<10 {
-		t.Fatalf("verbinding draagt %d bytes aan ringen, maxBuf is %d — de grens is per ring i.p.v. per verbinding", total, 16<<10)
+	// Sinds 04-09 klemt maxBuf élke ring apart: gecombineerd nam de tx-ring
+	// van een verbinding die om beurten grote chunks schrijft en leest de
+	// hele ruimte, en bleef de rx-ring op zijn vloer — de peer mocht dan
+	// 4 KiB per rondje sturen (HopOS system-verbinding, 256 rondjes per MiB).
+	if c.rx.size() > 16<<10 || c.tx.size() > 16<<10 {
+		t.Fatalf("ringen rx %d / tx %d bytes, maxBuf is %d per ring", c.rx.size(), c.tx.size(), 16<<10)
 	}
 }
 
