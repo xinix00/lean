@@ -817,3 +817,40 @@ func TestSentinelHoudtDeVerbinding(t *testing.T) {
 		t.Fatalf("%d verbindingen voor 3 misses — de sentinel-body wordt niet gedraind", n)
 	}
 }
+
+func TestHeadGeeftAlleenETag(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodHead || r.URL.Path != "/bkt/leases/c" {
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}
+		if r.Header.Get("Authorization") == "" {
+			t.Error("HEAD not signed")
+		}
+		w.Header().Set("ETag", `"etag-7"`)
+		w.Header().Set("Content-Length", "123") // a HEAD advertises the body it does not send
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	etag, err := klant(t, srv).Head(context.Background(), "leases/c")
+	if err != nil {
+		t.Fatalf("Head: %v", err)
+	}
+	if etag != `"etag-7"` {
+		t.Errorf("etag = %q, want %q", etag, `"etag-7"`)
+	}
+	// The connection must be reusable afterwards: a second call on the pool.
+	if _, err := klant(t, srv).Head(context.Background(), "leases/c"); err != nil {
+		t.Fatalf("second Head: %v", err)
+	}
+}
+
+func TestHeadAfwezigIsErrNotFound(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer srv.Close()
+	if _, err := klant(t, srv).Head(context.Background(), "leases/x"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("err = %v, want ErrNotFound", err)
+	}
+}

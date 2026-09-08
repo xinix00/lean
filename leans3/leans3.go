@@ -62,6 +62,7 @@ import (
 // HTTP methods used here; leanhttp intentionally has no method constants.
 const (
 	methodGet    = "GET"
+	methodHead   = "HEAD"
 	methodPut    = "PUT"
 	methodDelete = "DELETE"
 )

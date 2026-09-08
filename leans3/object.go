@@ -70,6 +70,34 @@ func (c *Client) Get(ctx context.Context, key string) ([]byte, string, error) {
 	return data, resp.Header.Get("ETag"), nil
 }
 
+// Head returns an object's ETag without its body, or [ErrNotFound]. It is
+// the second opinion for a store that answers GET and HEAD differently: a
+// half-deleted object on a replicated store (seen on Bunny Storage,
+// 2026-09-08) is 404 on GET yet 200 with an ETag on HEAD and in listings, and
+// that ETag is what a conditional PUT needs to get past it.
+func (c *Client) Head(ctx context.Context, key string) (string, error) {
+	u, err := c.URLFor(key)
+	if err != nil {
+		return "", err
+	}
+	resp, err := c.do(ctx, request{
+		op: methodHead, key: key, method: methodHead, url: u,
+		payloadHash: emptyPayloadHash,
+	})
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != leanhttp.StatusOK {
+		return "", c.fail(methodHead, key, resp)
+	}
+	etag := resp.Header.Get("ETag")
+	if etag == "" {
+		return "", fmt.Errorf("leans3: HEAD %s: response has no ETag", key)
+	}
+	return etag, nil
+}
+
 // GetTo streams an object to w and returns its byte count and ETag. An absent
 // key returns [ErrNotFound] before writing. Writer errors remain unwrap-able so
 // callers can distinguish local storage failures from transport failures.
