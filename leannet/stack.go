@@ -242,10 +242,13 @@ func NewStack(dev Device, cfg Config, issSeed uint32) *Stack {
 		udp:       newUDPTable(),
 		wake:      make(chan struct{}),
 		t0:        time.Now(),
-		nextEph:   ephemeralBase,
-		issSeed:   issSeed,
-		txBuf:     make([]byte, mtu+EthernetMaximumSize),
-		mtu:       mtu,
+		// A replacement stack must not always reuse the first remote tuple;
+		// peers can retain TIME_WAIT across a node kernel FLIP. Reuse the
+		// caller-provided seed; the normal allocator still checks occupied ports.
+		nextEph: ephemeralBase + uint16(issSeed%(ephemeralEnd-ephemeralBase+1)),
+		issSeed: issSeed,
+		txBuf:   make([]byte, mtu+EthernetMaximumSize),
+		mtu:     mtu,
 	}
 	go s.pump()
 	return s
@@ -640,6 +643,7 @@ func (s *Stack) newConnLocked(key connKey) (*sconn, error) {
 	c.tcp.tx = txRing{ring: ring{buf: make([]byte, tcpFloorTx)}}
 	c.tcp.pot = &s.pot
 	c.tcp.maxBuf = s.cfg.MaxBufPerConn
+	c.tcp.congestion = !s.trusted(key.rip)
 	s.conns[key] = c
 	return c, nil
 }

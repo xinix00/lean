@@ -180,8 +180,13 @@ type tcpConn struct {
 	// Zero-window probes use separate backoff so they do not poison RTT/RTO.
 	persistBackoff uint8
 
-	// Simple fast retransmit (RFC 5681 §3.2).
+	// Fast retransmit: three latches recovery until cumulative ACK progress.
 	dupacks uint8
+
+	// Physical routes use ACK-clocked congestion control; memory links bypass it.
+	congestion                bool
+	cwnd, ssthresh, cwndAcked int
+	lastDataSent              int64
 
 	// RTO firings since the last valid ACK.
 	retries uint8
@@ -202,7 +207,7 @@ func (c *tcpConn) openActive(iss uint32, advMSS uint16, advWS uint8) {
 	*c = tcpConn{state: tcpSynSent, iss: iss, una: iss, nxt: iss, maxSent: iss,
 		dataBase: iss + 1, advMSS: advMSS, advWS: advWS,
 		rto: tcpRTOInitial, peerMSS: tcpDefaultMSS,
-		rx: c.rx, tx: c.tx, pot: c.pot, maxBuf: c.maxBuf}
+		rx: c.rx, tx: c.tx, pot: c.pot, maxBuf: c.maxBuf, congestion: c.congestion}
 }
 
 // openPassive creates a listener embryo that an incoming SYN opens into SYN-RCVD.
@@ -210,7 +215,7 @@ func (c *tcpConn) openPassive(iss uint32, advMSS uint16, advWS uint8) {
 	*c = tcpConn{state: tcpClosed, listen: true, iss: iss, maxSent: iss,
 		advMSS: advMSS, advWS: advWS,
 		rto: tcpRTOInitial, peerMSS: tcpDefaultMSS,
-		rx: c.rx, tx: c.tx, pot: c.pot, maxBuf: c.maxBuf}
+		rx: c.rx, tx: c.tx, pot: c.pot, maxBuf: c.maxBuf, congestion: c.congestion}
 }
 
 // close fixes FIN's sequence number after the final data byte and rejects later writes.
@@ -563,6 +568,7 @@ func (c *tcpConn) takeSynOptions(seg tcpSeg) {
 			c.sndWS = 14 // RFC 7323 §2.3 caps the shift at 14
 		}
 	}
+	c.initCongestion()
 }
 
 // rcvWnd is the promised window used for acceptability and RST validation, not
@@ -623,8 +629,11 @@ func (c *tcpConn) processAck(seg tcpSeg, now int64) (accept bool) {
 		c.needAck = true
 		return false
 	case seqLT(ack, c.una):
-		// An old ACK is not a duplicate under RFC 5681 §2 and breaks the run.
-		c.dupacks = 0
+		// An old ACK breaks the duplicate run, but cannot rearm recovery
+		// for the same unacknowledged data. Three is latched until progress.
+		if c.dupacks < 3 {
+			c.dupacks = 0
+		}
 		return true // ignore old ACK but still permit segment data
 	}
 
@@ -667,14 +676,19 @@ func (c *tcpConn) processAck(seg tcpSeg, now int64) (accept bool) {
 
 	if ack == c.una {
 		// RFC 5681 duplicate ACK: no data or FIN, same ACK and window, with data
-		// in flight. Three trigger one go-back-N in any sending close state.
+		// in flight. Latch at three until cumulative ACK progress: queued
+		// duplicates, window updates, and the rewound nxt must not restart
+		// the same go-back-N recovery. RTO still covers a lost retransmission.
 		if len(seg.data) == 0 && !seg.flags.Has(FlagFIN) && sameWnd && c.una != c.nxt {
-			c.dupacks++
-			if c.dupacks == 3 {
-				c.cnt.fastRetrans++
-				c.goBackN()
+			if c.dupacks < 3 {
+				c.dupacks++
+				if c.dupacks == 3 {
+					c.cnt.fastRetrans++
+					c.congestionLoss()
+					c.goBackN()
+				}
 			}
-		} else {
+		} else if c.dupacks < 3 {
 			c.dupacks = 0
 		}
 		return true
@@ -686,6 +700,7 @@ func (c *tcpConn) processAck(seg tcpSeg, now int64) (accept bool) {
 		if dataAcked > c.tx.buffered() {
 			dataAcked = c.tx.buffered() // SYN/FIN sequence space is not ring data
 		}
+		c.congestionACK(dataAcked)
 		// A cumulative ACK may overtake retransmission after goBackN. Restore the
 		// sent cursor before removing acknowledged bytes.
 		c.tx.forceSent(dataAcked)
@@ -911,6 +926,9 @@ func (c *tcpConn) emit(buf []byte, now int64) (seg tcpSeg, ok bool) {
 			c.cnt.persist++
 			c.probe = true // permit one byte beyond the zero window
 		} else {
+			if c.una != c.nxt && c.state != tcpSynSent && c.state != tcpSynRcvd {
+				c.congestionLoss()
+			}
 			if c.backoff < tcpBackoffMax {
 				c.backoff++
 				c.rto = min(c.currentRTO()*2, tcpRTOMax)
@@ -949,11 +967,13 @@ func (c *tcpConn) emit(buf []byte, now int64) (seg tcpSeg, ok bool) {
 	}
 
 	// Data path uses send-window headroom; an armed probe may exceed zero by one byte.
+	c.restartCongestionAfterIdle(now)
 	inFlight := seqDiff(c.nxt, c.una)
 	avail := int(c.sndWnd) - inFlight
 	if avail < 0 {
 		avail = 0
 	}
+	avail = min(avail, c.congestionAvailable())
 	if c.probe && avail == 0 {
 		avail = 1
 	}
@@ -976,6 +996,7 @@ func (c *tcpConn) emit(buf []byte, now int64) (seg tcpSeg, ok bool) {
 			wnd: c.advertisedWnd(), data: buf[:got]}
 		c.nxt += uint32(got)
 		c.postTx(seg.seq+uint32(got), now)
+		c.lastDataSent = now
 		// Piggyback FIN on final data when the window permits.
 		if c.finPending() && c.nxt == c.finSeq && inFlight+got < int(c.sndWnd) {
 			seg.flags |= FlagFIN

@@ -43,7 +43,6 @@ is needed.
 
 | Absent | Why | When to add it |
 |---|---|---|
-| **Congestion control (cwnd, slow start)** | Senders such as GitHub and Bunny limit our downloads; our uploads are heartbeats and API responses. We have no path that fills a congested link. | When a node sends large uploads over a congested WAN. The send loop already caps on `sndWnd`; cwnd would be a second cap. |
 | **Out-of-order reassembly (SACK, reorder buffer)** | An out-of-order segment is dropped with an immediate duplicate ACK, and the peer recovers through fast retransmit. This is RFC-compliant and removes the half of the state machine where lneto's bugs lived. | When hardware measurements show that reordering, rather than loss, costs throughput. Reordering is rare on our LANs and single-gateway paths. |
 | **General-purpose IPv6** | The measured path needs UDP, link-scoped discovery, and a ULA behind a Thread border router—not a second TCP stack or every IPv6 control plane. The implemented lane therefore stops at ICMPv6/NDP, one active SLAAC identity, and bounded, expiring PIO/RIO routing. | Extend only for a measured consumer. TCPv6, DHCPv6, IPv4-mapped dual-family sockets, extension headers, fragmentation, PMTUD, MLD, wider multicast, full NUD, active DAD, ICMPv6 redirect/error state, privacy addresses, and multiple simultaneous SLAAC identities are separate features, not implied follow-ups. |
 | **IPv4 fragmentation and options** | Both fail with their own error and counter. Our paths use DF and MTU 1500; options do not occur. Silent acceptance would hide them from metrics. | Only when a measured path sends them. Reassembly brings its full attack surface. |
@@ -56,6 +55,37 @@ is needed.
 | **A second global buffer control** | Splitting inbound/outbound or kernel/app uses the wrong axis: bulk and control exist in both directions. The relevant axis is per socket, which only the socket knows. | Never. See the budget model below. |
 
 ## What is included, and why
+
+**TCP congestion control on physical routes.** Application-to-application bulk
+transfers invalidated the earlier assumption that this stack only sends small
+uploads. A receive window describes socket capacity; it does not describe the
+capacity of a physical NIC queue. An unrestricted sender can overrun that queue
+and repeatedly replay an entire window.
+
+Untrusted routes therefore use an ACK-clocked congestion window alongside the
+peer's receive window. The initial window follows
+[RFC 6928 section 2](https://www.rfc-editor.org/rfc/rfc6928#section-2), using the
+negotiated MSS. Slow start grows by at most one MSS per acknowledgment;
+congestion avoidance grows by one MSS per window of newly acknowledged bytes.
+Loss sets the threshold to half the outstanding flight, with a two-MSS minimum,
+and restarts at one MSS. This is conservative Tahoe-style recovery, rather than
+Reno window inflation. Retransmission uses the reduced window; rewinding the
+send cursor never creates room for a new burst. Duplicate ACK recovery remains
+latched until cumulative ACK progress. Existing RTO handles a lost replay.
+
+After a fully acknowledged connection has sent no data for an RTO, its next
+transfer restarts at no more than the initial window, retaining the previous
+loss threshold. These mechanisms follow the congestion-window and restart
+principles in [RFC 5681](https://www.rfc-editor.org/rfc/rfc5681); this is not a
+claim of complete TCP conformance. There is no pacing worker or additional
+timer. Trusted memory routes (`LinkTrusted` within the configured memory
+prefix) retain their receive-window-only path. Reordering still uses the
+existing go-back-N mechanism; SACK and reassembly remain separate decisions.
+
+The bounded host test sends 8 MiB through a 64-frame queue with deliberate loss,
+checking completion and retransmission overhead. Additional tests cover ACK
+growth, idle restart, sequence wrap, reduced peer windows, RTO, persist probes,
+FIN, and trusted-route selection. Hardware acceptance is recorded by HopOS.
 
 **One shared pool, with an optional per-connection cap.** `Config.Budget` is the
 hard shared reservation pool for TCP rings and UDP receive queues;

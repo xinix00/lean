@@ -325,7 +325,7 @@ func TestStackEphemeralSkipsOccupied(t *testing.T) {
 	s := NewStack(da, Config{
 		IP: [4]byte{10, 0, 0, 1}, Prefix: 24, MAC: [6]byte{2, 0, 0, 0, 0, 1},
 		Budget: 1 << 20,
-	}, 1)
+	}, 0)
 	t.Cleanup(s.Close)
 
 	if _, err := s.ListenUDP(49153); err != nil {
@@ -1260,7 +1260,9 @@ func TestStackPeerHerstartZelfdeVierTupel(t *testing.T) {
 
 	da2 := &memDevice{}
 	da2.peer, db.peer = db, da2
-	a2 := NewStack(da2, cfgA, 999)
+	// Deliberately collide in the dynamic-port range while changing the ISS:
+	// this regression must still exercise recovery of the same four-tuple.
+	a2 := NewStack(da2, cfgA, 12345+(ephemeralEnd-ephemeralBase+1))
 	defer a2.Close()
 	go pump(a2, da2)
 

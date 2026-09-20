@@ -50,7 +50,10 @@ const (
 
 // errRefused is DHCPNAK: the address is no longer ours, so retrying on it would
 // be actively wrong.
-var errRefused = errors.New("server refused the lease (DHCPNAK)")
+// ErrRefused: the server answered DHCPNAK — the address is no longer ours.
+var ErrRefused = errors.New("server refused the lease (DHCPNAK)")
+
+var errRefused = ErrRefused
 
 // timers returns T1, T2, and expiry from ACK receipt. All zero means an infinite
 // or unknown lease. Invalid ordering falls back to RFC 2131 ratios 0.5 and
