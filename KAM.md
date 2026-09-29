@@ -55,7 +55,7 @@ not as a general capability of this stack. A caller that has a choice uses
 | Mux | method+path, exact/subtree, `{segment}`, `{rest...}`, `GET`→`HEAD`, `404`/`405`+`Allow` | canonical paths or rejection; immutable after start | host routing, `{$}`, escaped/dot routing, slash normalization, net/http compatibility work |
 | HTTP client | outbound HTTP/1.1, inbound 1.0/1.1, GET/HEAD redirects, response framing, deadlines, keep-alive pool | fixed-length streaming upload with a strict Expect decision; compression pass-through | request chunking, automatic decompression, CONNECT/upgrade, general retry state machine |
 | TLS/S3 | explicit trust model, SNI per connection, SigV4 and used object operations | TLS as a dialer composition; signed S3 calls never follow redirects | TLS server, silent skip-verify, multipart, streaming SigV4, SigV4a, presigned URLs, IMDS/IAM |
-| leannet | Ethernet; IPv4 ARP/ICMP/UDP/TCP and link-local multicast; opt-in IPv6 UDP, ICMPv6/NDP, link-scoped multicast, one active SLAAC identity, and expiring PIO/RIO routing; deadlines, close, bounded memory | one IPv4 identity; one derived link-local plus one active SLAAC IPv6 identity; bounded simplified NDP and route state; fixed 1280-byte IPv6 packet ceiling | TCPv6, DHCPv6, extension headers, fragmentation, PMTUD, MLD/IGMP, wider multicast, dual-family sockets, full NUD and multi-address renumbering, congestion control, timestamps, Nagle, SYN cookies, data-path logging |
+| leannet | Ethernet; IPv4 ARP/ICMP/UDP/TCP with congestion control (slow start, congestion avoidance, fast retransmit) and link-local multicast; opt-in IPv6 UDP, ICMPv6/NDP, link-scoped multicast, one active SLAAC identity, and expiring PIO/RIO routing; deadlines, close, bounded memory | one IPv4 identity; one derived link-local plus one active SLAAC IPv6 identity; bounded simplified NDP and route state; fixed 1280-byte IPv6 packet ceiling | TCPv6, DHCPv6, extension headers, fragmentation, PMTUD, MLD/IGMP, wider multicast, dual-family sockets, full NUD and multi-address renumbering, timestamps, Nagle, SYN cookies, data-path logging |
 
 The table is a summary; the boundaries below are normative.
 
@@ -467,7 +467,7 @@ a specific local address is forbidden.
 
 ### MURDER
 
-Absent: congestion control, out-of-order reassembly/SACK, TCPv6, DHCPv6,
+Absent: out-of-order reassembly/SACK, TCPv6, DHCPv6,
 IPv4-mapped dual-family sockets, active DAD, privacy or temporary addresses,
 multiple simultaneous SLAAC identities, full NUD and multi-address renumbering,
 MLD/IGMP, multicast outside link scope, proxy-ND and VRRP-style MAC indirection,
@@ -904,3 +904,11 @@ An extension to this KAM includes all of:
 Without all five, the feature stays outside scope. This is not incomplete
 standards compliance; it is the safety boundary that keeps the supported subset
 fully reviewable.
+
+## Errata
+
+- 2026-09-29: congestion control was listed under MURDER while `leannet`
+  has carried it (slow start, congestion avoidance, fast retransmit) since
+  the Go generation, with tests. The Rust port kept it and this document was
+  corrected: it is KEEP. A stack without it is not lighter, it is unfair to
+  the network it shares.
