@@ -5,20 +5,31 @@
 //! Elke primitieve is getest tegen de officiële vectoren (RFC 6234, 4231,
 //! 5869, 7748, 8032, FIPS 197 en de GCM-specificatie).
 //!
+//! Voor ketenverificatie ([`crate::ChainVerifier`]) komen daar bij: SHA-384,
+//! ECDSA-verificatie op P-256 en P-384, en RSA-verificatie (PKCS#1 v1.5 en
+//! PSS) op een eigen bignum van vaste maat. Die raken alleen publieke data.
+//!
 //! Wat constant-time is en wat niet:
 //!
 //! - constant-time: AES (geen tabel), GHASH, X25519-ladder en het veld,
 //!   HMAC, het vergelijken van tags en Finished-MAC's, het wissen;
 //! - variabele tijd, bewust: Ed25519-verificatie (alleen publieke sleutel,
 //!   bericht en handtekening), de reductie modulo L daarin, en de codering
-//!   van veldelementen die alleen op publieke punten wordt gebruikt.
+//!   van veldelementen die alleen op publieke punten wordt gebruikt;
+//! - variabele tijd, bewust: [`bignum`], [`ecdsa`] en [`rsa`], die alleen
+//!   verifiëren en dus alleen publieke sleutels, digests en handtekeningen
+//!   zien.
 
 pub(crate) mod aes;
+pub(crate) mod bignum;
 pub(crate) mod ct;
+pub(crate) mod ecdsa;
 pub(crate) mod ed25519;
 pub(crate) mod field;
 pub(crate) mod gcm;
+pub(crate) mod hash;
 pub(crate) mod hmac;
+pub(crate) mod rsa;
 pub(crate) mod sha256;
 pub(crate) mod sha512;
 pub(crate) mod x25519;

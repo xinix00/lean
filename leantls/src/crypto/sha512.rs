@@ -1,7 +1,9 @@
-//! SHA-512 (FIPS 180-4), alleen omdat Ed25519 hem voorschrijft.
+//! SHA-512 en SHA-384 (FIPS 180-4), alleen voor handtekening-verificatie.
 //!
-//! De suite zelf gebruikt SHA-256; deze hash komt alleen in de
-//! handtekening-verificatie voor, over publieke data.
+//! De suite zelf gebruikt SHA-256. SHA-512 komt uit Ed25519; SHA-384 is
+//! dezelfde functie met een andere begintoestand en een afgekapte uitvoer,
+//! en is nodig omdat publieke CA's met ECDSA P-384/SHA-384 tekenen. Alles
+//! hier loopt over publieke data.
 
 /// Lengte van een SHA-512-digest in bytes.
 pub(crate) const LEN: usize = 64;
@@ -106,7 +108,22 @@ const H0: [u64; 8] = [
     0x5be0cd19137e2179,
 ];
 
-/// Een lopende SHA-512.
+/// De begintoestand van SHA-384 (FIPS 180-4 §5.3.4).
+const H0_384: [u64; 8] = [
+    0xcbbb9d5dc1059ed8,
+    0x629a292a367cd507,
+    0x9159015a3070dd17,
+    0x152fecd8f70e5939,
+    0x67332667ffc00b31,
+    0x8eb44a8768581511,
+    0xdb0c2e0d64f98fa7,
+    0x47b5481dbefa4fa4,
+];
+
+/// Lengte van een SHA-384-digest in bytes: de eerste 48 van [`Sha512::finish`].
+pub(crate) const LEN384: usize = 48;
+
+/// Een lopende SHA-512 (of SHA-384, zie [`Sha512::new384`]).
 pub(crate) struct Sha512 {
     /// De kettingwaarde.
     h: [u64; 8],
@@ -125,6 +142,17 @@ impl Sha512 {
     pub(crate) const fn new() -> Self {
         Self {
             h: H0,
+            buf: [0; BLOCK],
+            fill: 0,
+            total: 0,
+        }
+    }
+
+    /// Begint een SHA-384: dezelfde compressie, een andere begintoestand. De
+    /// digest is dan de eerste [`LEN384`] bytes van [`Sha512::finish`].
+    pub(crate) const fn new384() -> Self {
+        Self {
+            h: H0_384,
             buf: [0; BLOCK],
             fill: 0,
             total: 0,
@@ -217,6 +245,33 @@ mod tests {
         let mut h = Sha512::new();
         h.update(data);
         h.finish().to_vec()
+    }
+
+    /// RFC 6234 §8.5 (TEST1 en TEST2_2) voor SHA-384.
+    #[test]
+    fn rfc6234_sha384_vectors() {
+        let d384 = |data: &[u8]| {
+            let mut h = Sha512::new384();
+            h.update(data);
+            h.finish()[..LEN384].to_vec()
+        };
+        assert_eq!(
+            d384(b"abc"),
+            unhex(
+                "cb00753f45a35e8bb5a03d699ac65007272c32ab0eded1631a8b605a43ff5bed\
+                 8086072ba1e7cc2358baeca134c825a7"
+            )
+        );
+        assert_eq!(
+            d384(
+                b"abcdefghbcdefghicdefghijdefghijkefghijklfghijklmghijklmnhijklmno\
+                  ijklmnopjklmnopqklmnopqrlmnopqrsmnopqrstnopqrstu"
+            ),
+            unhex(
+                "09330c33f71147e83d192fc782cd1b4753111b173b3b05d22fa08086e3b0f712\
+                 fcc7c71a557e2db966c3e9fa91746039"
+            )
+        );
     }
 
     /// RFC 6234 §8.5 (TEST1, TEST2_2, TEST3) voor SHA-512.

@@ -8,6 +8,11 @@
 //	discard13  TLS 1.3, reads until EOF, then prints "result: <err|EOF>"
 //	chain13    TLS 1.3, Ed25519 leaf for leantls.test signed by an Ed25519 CA
 //	ecdsa13    TLS 1.3, ECDSA P-256 self-signed (not an Ed25519 peer)
+//	x509ecdsa  TLS 1.3, the P-256 chain from <dir> (testdata/chain): leaf + inter
+//	x509rsa    TLS 1.3, the RSA-2048 chain from <dir>; signs CertificateVerify with PSS
+//
+// The x509 modes take the chain directory as a second argument and print a
+// zero key: the caller trusts the root from the same directory.
 package main
 
 import (
@@ -20,6 +25,7 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/hex"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
@@ -81,6 +87,27 @@ func main() {
 		k, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 		t := template(1, "leantls-test", false)
 		chain, priv, shown = [][]byte{cert(t, t, &k.PublicKey, k)}, k, make([]byte, 32)
+	case "x509ecdsa", "x509rsa":
+		dir, prefix := os.Args[2], "ecdsa"
+		if mode == "x509rsa" {
+			prefix = "rsa"
+		}
+		read := func(name string) []byte {
+			b, err := os.ReadFile(dir + "/" + prefix + "-" + name)
+			if err != nil {
+				panic(err)
+			}
+			return b
+		}
+		blk, _ := pem.Decode(read("leaf.key"))
+		if blk == nil {
+			panic("no PEM in " + prefix + "-leaf.key")
+		}
+		k, err := x509.ParsePKCS8PrivateKey(blk.Bytes)
+		if err != nil {
+			panic(err)
+		}
+		chain, priv, shown = [][]byte{read("leaf.der"), read("inter.der")}, k, make([]byte, 32)
 	default:
 		panic("unknown mode " + mode)
 	}

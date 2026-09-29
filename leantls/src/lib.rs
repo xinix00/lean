@@ -16,8 +16,9 @@
 //! de handtekening over het transcript met die sleutel. Geen CA-, naam- of
 //! datumdubbelzinnigheid, ten koste van nieuwe pins als sleutels roteren;
 //! dat past bij een eigen vloot, niet bij publieke hosts. Voor die laatste
-//! levert de aanroeper een [`VerifyPeer`]. Zie [`Trust`]: er is altijd
-//! precies één model.
+//! levert de aanroeper een [`VerifyPeer`]; [`ChainVerifier`] is er een voor
+//! de Web-PKI, met wortels en tijd van de aanroeper (zie [`x509`]). Zie
+//! [`Trust`]: er is altijd precies één model.
 //!
 //! # Waarom een eigen TLS
 //!
@@ -61,7 +62,8 @@
 //!
 //! AES zonder tabel, GHASH, X25519 en HMAC zijn constant-time; de
 //! vergelijking van tags en Finished ook. Ed25519-verificatie werkt alleen op
-//! publieke data en is dat bewust niet.
+//! publieke data en is dat bewust niet; hetzelfde geldt voor de ECDSA- en
+//! RSA-verificatie en de bignums van [`x509`].
 
 #![cfg_attr(not(test), no_std)]
 #![cfg_attr(
@@ -89,6 +91,7 @@ mod schedule;
 mod spki;
 mod trust;
 mod wire;
+pub mod x509;
 
 #[cfg(test)]
 mod tests;
@@ -98,3 +101,4 @@ pub use error::{ConnError, Error, Result};
 pub use handshake::connect;
 pub use io::{AsyncRead, AsyncWrite};
 pub use trust::{CertChain, CertIter, Entropy, PeerKey, Trust, VerifyPeer};
+pub use x509::{ChainVerifier, Roots, X509Error};

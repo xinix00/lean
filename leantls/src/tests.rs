@@ -130,9 +130,15 @@ impl Drop for GoServer {
 }
 
 fn go_server(mode: &str) -> Option<GoServer> {
+    go_server_with(mode, &[])
+}
+
+/// Als [`go_server`], met extra argumenten (de ketenmap van de x509-modi).
+fn go_server_with(mode: &str, args: &[&str]) -> Option<GoServer> {
     let bin = go_binary()?;
     let mut child = Command::new(bin)
         .arg(mode)
+        .args(args)
         .stdout(Stdio::piped())
         .spawn()
         .unwrap();
@@ -415,9 +421,9 @@ impl VerifyPeer for TestChain {
 
 #[test]
 fn verify_peer_mode_against_stdlib_server() {
-    // Go deed dit met ECDSA- en RSA-bladen via x509verify; die is niet geport
-    // (zie het eindrapport). De haak zelf wordt hier aan de lijn getest met
-    // een Ed25519-keten van twee certificaten.
+    // De haak zelf, aan de lijn getest met een Ed25519-keten van twee
+    // certificaten; de echte ketenverificatie (ECDSA en RSA) staat in
+    // `chain_verifier_against_stdlib_server`.
     let Some(srv) = go_server("chain13") else {
         return;
     };
@@ -455,6 +461,68 @@ fn verify_peer_mode_against_stdlib_server() {
     .err()
     .expect("een keten voor een andere naam werd geaccepteerd");
     assert!(err.to_string().contains("name"), "{err}");
+}
+
+/// De echte ketenverificatie tegen crypto/tls: een P-256- en een
+/// RSA-2048-keten uit `testdata/chain`, zodat de CertificateVerify met
+/// ECDSA (0x0403) en met RSA-PSS (0x0804) over de lijn gaat.
+#[test]
+fn chain_verifier_against_stdlib_server() {
+    use crate::{ChainVerifier, Roots};
+    // 2026-09-29: binnen de vaste geldigheid van de testketens, zodat de test
+    // niet afhangt van de klok van de machine.
+    const NOW: u64 = 1_790_640_000;
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("testdata/chain");
+    let dir = dir.to_str().unwrap();
+    let ecdsa_root: &[u8] = include_bytes!("../testdata/chain/ecdsa-root.der");
+    let rsa_root: &[u8] = include_bytes!("../testdata/chain/rsa-root.der");
+    for (mode, root, other) in [
+        ("x509ecdsa", ecdsa_root, rsa_root),
+        ("x509rsa", rsa_root, ecdsa_root),
+    ] {
+        let Some(srv) = go_server_with(mode, &[dir]) else {
+            return;
+        };
+        let roots = [root];
+        let v = ChainVerifier::new(Roots::from_list(&roots).unwrap(), NOW);
+        let mut conn = block_on(connect(
+            dial(&srv),
+            &Trust::Chain(&v),
+            "leantls.test",
+            entropy(),
+        ))
+        .unwrap_or_else(|e| panic!("{mode}: handshake: {e}"));
+        let msg = b"https met een echte keten";
+        block_on(write_all(&mut conn, msg)).unwrap();
+        let mut got = [0u8; 25];
+        block_on(read_exact(&mut conn, &mut got)).unwrap();
+        assert_eq!(&got, msg, "{mode}: echo");
+
+        let err = block_on(connect(
+            dial(&srv),
+            &Trust::Chain(&v),
+            "other.test",
+            entropy(),
+        ))
+        .err()
+        .expect("een keten voor een andere naam werd geaccepteerd");
+        assert!(err.to_string().contains("valid for"), "{mode}: {err}");
+
+        let wrong = [other];
+        let untrusted = ChainVerifier::new(Roots::from_list(&wrong).unwrap(), NOW);
+        let err = block_on(connect(
+            dial(&srv),
+            &Trust::Chain(&untrusted),
+            "leantls.test",
+            entropy(),
+        ))
+        .err()
+        .expect("een keten zonder vertrouwde wortel werd geaccepteerd");
+        assert!(
+            err.to_string().contains("unknown authority"),
+            "{mode}: {err}"
+        );
+    }
 }
 
 // --- Nep-transport ------------------------------------------------------------

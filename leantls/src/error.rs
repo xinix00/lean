@@ -129,6 +129,8 @@ pub enum Error {
     WriteBacklog,
     /// De recordteller is op; de verbinding moet opnieuw.
     SequenceExhausted,
+    /// De ketenverificatie van [`crate::ChainVerifier`] weigerde.
+    X509(crate::x509::X509Error),
 }
 
 /// Een fout van de verbinding: van het transport of van TLS.
@@ -311,6 +313,7 @@ impl fmt::Display for Error {
             Error::KeyUpdateValue(v) => write!(f, "KeyUpdate with invalid request value {v}"),
             Error::WriteBacklog => f.write_str("write buffer full of unsent records"),
             Error::SequenceExhausted => f.write_str("record sequence number exhausted"),
+            Error::X509(e) => write!(f, "x509: {e}"),
         }
     }
 }
