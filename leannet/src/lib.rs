@@ -81,6 +81,52 @@
 //! # Ok::<(), leannet::Error>(())
 //! ```
 //!
+//! # Sluiten
+//!
+//! [`Stack::tcp_close`] is een nette close, geen abort. De FIN komt ná alle
+//! gebufferde data en die data wordt nog verstuurd en zo nodig
+//! hertransmitteerd. Op de draad is het een half-close: wat de peer daarna
+//! nog stuurt, wordt bevestigd en weggegooid, zodat zijn FIN kan afronden.
+//! Het ontvangstbudget komt meteen terug, het zendbudget zodra de FIN
+//! bevestigd is. De hele afronding (data, FIN, TIME-WAIT van één seconde)
+//! krijgt één absolute termijn van 20 seconden; wat dan nog loopt, krijgt een
+//! RST. Een close tijdens SYN-SENT laat de poging zonder FIN vallen.
+//!
+//! Na `tcp_close` is het handvat dicht voor I/O, maar [`Stack::tcp_unacked`]
+//! en [`Stack::tcp_register_write_waker`] blijven werken tot de verbinding
+//! weg is. Zo wacht een flush op precies zijn eigen verbinding: nul is "de
+//! peer heeft alles, FIN inbegrepen", en [`Error::Closed`] is "er valt niets
+//! meer te wachten". De write-waker gaat bij elke binnenkomende ACK af.
+//!
+//! ```
+//! use core::task::{Poll, Waker};
+//! use leannet::{Error, Stack, TcpHandle};
+//!
+//! /// Eén poll van een flush: klaar als de peer alles bevestigde.
+//! fn poll_flush(s: &mut Stack, h: TcpHandle, w: &Waker) -> Poll<Result<(), Error>> {
+//!     // Eerst registreren, dan kijken: een ACK tussen beide is dan geen
+//!     // verloren wek.
+//!     if let Err(e) = s.tcp_register_write_waker(h, w) {
+//!         return Poll::Ready(if e == Error::Closed { Ok(()) } else { Err(e) });
+//!     }
+//!     match s.tcp_unacked(h) {
+//!         Ok(0) | Err(Error::Closed) => Poll::Ready(Ok(())),
+//!         Ok(_) => Poll::Pending,
+//!         Err(e) => Poll::Ready(Err(e)),
+//!     }
+//! }
+//! ```
+//!
+//! [`Stack::close`] breekt elke verbinding lokaal af en stuurt niets meer:
+//! geen FIN, geen RST (de klaargezette resets gaan met de rijen weg en
+//! [`Stack::poll_transmit`] geeft daarna `None`). Wachters worden gewekt en
+//! elk handvat geeft [`Error::Closed`]. Een drop van de stack doet op de
+//! draad hetzelfde, alleen zonder wekken: het geheugen gaat terug, de wakers
+//! verdwijnen ongewekt. In beide gevallen merkt de peer het pas aan zijn eigen
+//! hertransmissietimers, of aan de RST van een latere stack op hetzelfde
+//! adres. Wie de peer netjes wil laten gaan, sluit eerst elke verbinding met
+//! `tcp_close`, wacht op de flush en pompt tot de FINs bevestigd zijn.
+//!
 //! # Geheugen
 //!
 //! [`Config::budget`] is één gedeelde pot voor alle TCP-ringen en

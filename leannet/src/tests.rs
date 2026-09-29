@@ -2137,3 +2137,189 @@ fn stack_conn_starts_at_floors() {
     );
     assert_eq!(s.pot.used, TCP_FLOOR_RING);
 }
+
+// ---- tcp_unacked en de flush (lean v3.1) ----
+
+/// Brengt alle frames van a één voor één naar b en na elk frame b's
+/// antwoorden terug, en geeft `tcp_unacked(h)` na elke ronde. Zo is elke
+/// afzonderlijke ACK zichtbaar in plaats van alleen de eindstand.
+fn step_unacked(net: &mut Net, h: TcpHandle) -> Vec<usize> {
+    let now = net.now;
+    let mut frame = vec![0u8; net.a.frame_len()];
+    let mut out = Vec::new();
+    while let Some(n) = net.a.poll_transmit(now, &mut frame) {
+        out.push(frame[..n].to_vec());
+    }
+    let mut seen = Vec::new();
+    for f in out {
+        let _ = net.b().receive(&f, now);
+        while let Some(n) = net.b().poll_transmit(now, &mut frame) {
+            let _ = net.a.receive(&frame[..n], now);
+        }
+        seen.push(net.a.tcp_unacked(h).unwrap());
+    }
+    seen
+}
+
+/// Geschreven data telt tot de peer haar bevestigt, en daalt per ACK naar nul;
+/// de write-waker gaat bij die ACKs af.
+#[test]
+fn unacked_daalt_met_acks_naar_nul() {
+    let mut net = Net::pair(1 << 20, 1 << 20);
+    let (c, s, _) = connected(&mut net, 7001);
+    assert_eq!(net.a.tcp_unacked(c), Ok(0), "verse verbinding");
+
+    let data = vec![7u8; 3000]; // Drie segmenten bij een MSS van 1460.
+    let now = net.now;
+    assert_eq!(net.a.tcp_write(c, &data, now), Ok(3000));
+    assert_eq!(net.a.tcp_unacked(c), Ok(3000), "onverzonden telt mee");
+
+    let (w, woke) = counting_waker();
+    net.a.tcp_register_write_waker(c, &w).unwrap();
+    let seen = step_unacked(&mut net, c);
+    assert!(woke.count() > 0, "write-waker ging niet af bij een ACK");
+    assert!(
+        seen.windows(2).all(|p| p[1] <= p[0]),
+        "unacked steeg: {seen:?}"
+    );
+    assert!(
+        seen.iter().any(|&u| u > 0 && u < 3000),
+        "geen tussenstand per ACK: {seen:?}"
+    );
+    assert_eq!(seen.last(), Some(&0), "niet alles bevestigd: {seen:?}");
+    assert_eq!(read_exact(&mut net, sb, s, 3000, SEC), data);
+}
+
+/// Na een close telt de FIN als één tot de peer hem bevestigt; een verloren
+/// FIN houdt de teller op één. TIME-WAIT is nul, daarna is het handvat weg.
+#[test]
+fn unacked_fin_telt_tot_peer_ackt_en_time_wait_sluit_af() {
+    let mut net = Net::pair(1 << 20, 1 << 20);
+    let (c, s, _) = connected(&mut net, 7002);
+    let now = net.now;
+    net.a.tcp_write(c, &[1u8; 100], now).unwrap();
+    net.a.tcp_close(c, now).unwrap();
+    // I/O is dicht, de bevraging niet: 100 bytes plus de FIN.
+    assert_eq!(net.a.tcp_write(c, &[1], now), Err(Error::Closed));
+    assert_eq!(net.a.tcp_unacked(c), Ok(101));
+
+    // De draad is door: data en FIN gaan verloren, de teller blijft staan.
+    net.cut = true;
+    net.run_for(50 * MS);
+    assert_eq!(
+        net.a.tcp_unacked(c),
+        Ok(101),
+        "verloren data telde als bevestigd"
+    );
+
+    // De waker werkt na de close en gaat af als de hertransmissie bevestigd wordt.
+    let (w, woke) = counting_waker();
+    net.a.tcp_register_write_waker(c, &w).unwrap();
+    net.cut = false;
+    let acked = net.run_until(5 * SEC, |n| n.a.tcp_unacked(c) == Ok(0));
+    assert!(acked, "FIN nooit bevestigd: {:?}", net.a.tcp_unacked(c));
+    assert!(woke.count() > 0, "write-waker ging niet af na de close");
+    assert_eq!(
+        net.a.conns[c.idx].as_ref().unwrap().tcp.state,
+        TcpState::FinWait2
+    );
+
+    // De server leest de staart en EOF en sluit; a gaat naar TIME-WAIT.
+    let now = net.now;
+    let mut buf = [0u8; 256];
+    assert_eq!(net.b().tcp_read(s, &mut buf, now), Ok(100));
+    assert_eq!(net.b().tcp_read(s, &mut buf, now), Ok(0), "geen EOF");
+    net.b().tcp_close(s, now).unwrap();
+    assert_eq!(net.b().tcp_unacked(s), Ok(1), "de FIN van b telt");
+    // a adverteert na zijn close een nulvenster (zijn ontvangstring is terug),
+    // dus b's FIN gaat mee op de eerste persist-probe, niet meteen.
+    let tw = net.run_until(3 * SEC, |n| {
+        n.a.conns[c.idx].as_ref().unwrap().tcp.state == TcpState::TimeWait
+    });
+    assert!(tw, "a kwam niet in TIME-WAIT");
+    assert_eq!(
+        net.a.tcp_unacked(c),
+        Ok(0),
+        "TIME-WAIT volgt op een bevestigde FIN"
+    );
+    // LAST-ACK ging bij de ACK meteen naar gesloten en is opgeruimd.
+    assert_eq!(net.b().tcp_unacked(s), Err(Error::Closed));
+
+    // Na TIME-WAIT is het handvat weg, ook als de plek hergebruikt wordt.
+    let (w, woke) = counting_waker();
+    net.a.tcp_register_write_waker(c, &w).unwrap();
+    net.run_for(2 * SEC);
+    assert!(woke.count() > 0, "het einde van TIME-WAIT wekte niet");
+    assert_eq!(net.a.tcp_unacked(c), Err(Error::Closed));
+    assert_eq!(net.a.tcp_register_write_waker(c, &w), Err(Error::Closed));
+    let l2 = net.b().tcp_listen(7003).unwrap();
+    let c2 = dial(&mut net, IP_B, 7003, 5 * SEC).unwrap();
+    let _ = accept(&mut net, sb, l2);
+    assert_eq!(c2.idx, c.idx, "de test wil hergebruik van de plek");
+    assert_eq!(net.a.tcp_unacked(c), Err(Error::Closed));
+    assert_eq!(net.a.tcp_unacked(c2), Ok(0));
+}
+
+/// Een peer die niet leest, sluit zijn venster: unacked blijft staan zolang
+/// hij niet leest, persist-probes of niet, en valt naar nul als hij leest.
+#[test]
+fn unacked_blijft_hoog_bij_peer_die_niet_leest() {
+    // Een kleine pot aan b houdt zijn ontvangstring op 20 KiB.
+    let mut net = Net::pair(1 << 20, 80 << 10);
+    let (c, s, _) = connected(&mut net, 7004);
+    let data = vec![3u8; 256 << 10];
+    let mut off = 0;
+    net.run_until(3 * SEC, |n| {
+        let now = n.now;
+        if let Ok(k) = n.a.tcp_write(c, &data[off..], now) {
+            off += k;
+        }
+        false
+    });
+    assert!(off < data.len(), "een niet-lezende peer nam alles aan");
+    let held = |net: &mut Net| net.b().conns[s.idx].as_ref().unwrap().tcp.rx.buffered();
+    let unacked = net.a.tcp_unacked(c).unwrap();
+    assert!(unacked > 0, "niets onbevestigd tegen een vol venster");
+    assert_eq!(
+        unacked + held(&mut net),
+        off,
+        "unacked is niet wat b nog mist"
+    );
+
+    net.run_for(10 * SEC);
+    assert_eq!(
+        net.a.tcp_unacked(c),
+        Ok(unacked),
+        "probes veranderden de stand"
+    );
+
+    assert_eq!(read_exact(&mut net, sb, s, off, 10 * SEC).len(), off);
+    let drained = net.run_until(5 * SEC, |n| n.a.tcp_unacked(c) == Ok(0));
+    assert!(drained, "na lezen bleef {:?}", net.a.tcp_unacked(c));
+}
+
+/// Een reset terwijl de applicatie het handvat houdt is een fout, geen nul;
+/// `Stack::close` stuurt niets en laat geen bevraagbaar handvat achter.
+#[test]
+fn unacked_reset_en_stack_close() {
+    let mut net = Net::pair(1 << 20, 1 << 20);
+    let (c, s, _) = connected(&mut net, 7005);
+    let now = net.now;
+    net.a.tcp_write(c, &[9u8; 500], now).unwrap();
+    // b breekt de verbinding af; zijn pomp stuurt de RST.
+    net.b().conns[s.idx].as_mut().unwrap().tcp.abort();
+    net.settle();
+    assert_eq!(net.a.tcp_unacked(c), Err(Error::Reset));
+
+    let (c2, _, _) = connected(&mut net, 7006);
+    let now = net.now;
+    net.a.tcp_write(c2, &[9u8; 500], now).unwrap();
+    net.a.close();
+    let mut frame = vec![0u8; 2048];
+    assert_eq!(
+        net.a.poll_transmit(now, &mut frame),
+        None,
+        "close stuurde iets"
+    );
+    assert_eq!(net.a.tcp_unacked(c2), Err(Error::Closed));
+}

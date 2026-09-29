@@ -427,6 +427,11 @@ impl Stack {
     /// Tellers blijven leesbaar, maar dynamische protocolopslag (tabellen,
     /// rijen, loopbackbuffers) gaat meteen terug naar de allocator, zodat een
     /// bewaarde gesloten stack zijn hoogwaterstand niet vasthoudt.
+    ///
+    /// Er gaat niets meer de draad op: de resets van de afgebroken
+    /// verbindingen verdwijnen met de rijen en [`Stack::poll_transmit`] geeft
+    /// `None`. Een nette afronding is `tcp_close` per verbinding en pompen
+    /// tot [`Stack::tcp_unacked`] nul of [`Error::Closed`] geeft.
     pub fn close(&mut self) {
         if self.closed {
             return;

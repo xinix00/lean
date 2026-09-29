@@ -360,6 +360,19 @@ impl TcpConn {
         Ok(())
     }
 
+    /// De volgnummerruimte die de peer nog niet bevestigde: de hele zendring
+    /// (onverzonden plus onderweg) en één voor een FIN die nog niet bevestigd is.
+    ///
+    /// De FIN telt als één, net als in de volgnummerruimte: zo is nul precies
+    /// "de peer heeft alles, einde inbegrepen", en heeft een flush na een close
+    /// één getal om op te wachten in plaats van een tweede vraag.
+    pub(crate) fn unacked(&self) -> usize {
+        // Alleen `ack == fin_seq + 1` bevestigt de FIN (zie `process_ack`), dus
+        // zolang `una <= fin_seq` staat hij nog open.
+        let fin_open = self.closing && seq_leq(self.una, self.fin_seq);
+        self.tx.buffered() + usize::from(fin_open)
+    }
+
     /// Markeert een volledige socket-close, anders dan de half-close van
     /// `close`. Geeft ongelezen ontvangstopslag vrij terwijl `app_closed`
     /// binnenkomende data blijft opschuiven en bevestigen, zodat de peer zijn

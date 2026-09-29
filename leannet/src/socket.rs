@@ -53,6 +53,26 @@ impl Stack {
             .ok_or(Error::Closed)
     }
 
+    /// De verbinding achter `h` zolang de stack er nog iets voor bewaart: ook
+    /// na [`Stack::tcp_close`], tot TIME-WAIT verstreek of de verbinding
+    /// anders uit de demux ging.
+    ///
+    /// Een losgelaten verbinding die de demux verlaat, geeft in `reap` meteen
+    /// haar plek vrij; de generatie houdt een later hergebruik van die plek
+    /// buiten dit handvat.
+    fn tracked(&self, h: TcpHandle) -> Result<&crate::stack::Conn> {
+        self.conn(h.idx)
+            .filter(|c| c.generation == h.generation && (c.app_owned || c.live))
+            .ok_or(Error::Closed)
+    }
+
+    /// Hetzelfde als [`Stack::tracked`], veranderbaar.
+    fn tracked_mut(&mut self, h: TcpHandle) -> Result<&mut crate::stack::Conn> {
+        self.conn_mut(h.idx)
+            .filter(|c| c.generation == h.generation && (c.app_owned || c.live))
+            .ok_or(Error::Closed)
+    }
+
     // ---- TCP-listener ----
 
     /// Opent een TCP-listener; poort nul kiest een efemere poort. Alleen
@@ -344,7 +364,16 @@ impl Stack {
     /// seconden die ACKs en nulvensterupdates niet verlengen. Zendbudget komt
     /// terug als de FIN bevestigd is of de verbinding wordt opgeruimd.
     ///
-    /// Na `close` is het handvat ongeldig; wachters worden gewekt.
+    /// Dit is geen abort: gebufferde data gaat nog uit en wordt hertransmitteerd,
+    /// de FIN volgt erachter. Op de draad is het een half-close; wat de peer
+    /// daarna nog stuurt wordt bevestigd en weggegooid, zodat zijn FIN kan
+    /// afronden. Pas als de 20 seconden verstrijken zonder net einde volgt een
+    /// RST.
+    ///
+    /// Na `close` is het handvat ongeldig voor I/O; wachters worden gewekt.
+    /// [`Stack::tcp_unacked`] en [`Stack::tcp_register_write_waker`] blijven
+    /// werken tot de stack de verbinding loslaat, zodat een flush kan zien
+    /// wanneer de peer alles heeft.
     pub fn tcp_close(&mut self, h: TcpHandle, now: u64) -> Result {
         let pot = &mut self.pot;
         let c = self
@@ -427,10 +456,51 @@ impl Stack {
         Ok(())
     }
 
-    /// Registreert wie op schrijfruimte of op de uitkomst van een dial wacht.
+    /// Registreert wie op schrijfruimte, de uitkomst van een dial of een
+    /// bevestiging wacht.
+    ///
+    /// De waker gaat af bij elk segment dat de verbinding binnenkrijgt (dus
+    /// bij elke ACK, ook een die niets vrijgeeft), bij een deadline, en als de
+    /// stack de verbinding opruimt. Daarmee is hij ook de waker voor een flush
+    /// op [`Stack::tcp_unacked`]: registreren, opnieuw kijken, wachten. Een
+    /// wek is een reden om te kijken, geen belofte van voortgang.
+    ///
+    /// Anders dan de andere calls werkt hij ook na [`Stack::tcp_close`], tot de
+    /// verbinding weg is; daarna [`Error::Closed`].
     pub fn tcp_register_write_waker(&mut self, h: TcpHandle, w: &Waker) -> Result {
-        self.sock(h)?.write_waker.register(w);
+        self.tracked_mut(h)?.write_waker.register(w);
         Ok(())
+    }
+
+    /// Het aantal volgnummers dat de peer nog niet bevestigde: bytes in de
+    /// zendring (onverzonden plus onderweg), plus één zolang een FIN van
+    /// [`Stack::tcp_close`] onbevestigd is. `Ok(0)` betekent dat de peer
+    /// alles heeft, einde inbegrepen.
+    ///
+    /// Het handvat blijft na [`Stack::tcp_close`] bevraagbaar zolang de stack
+    /// de verbinding bewaart: in FIN-WAIT, CLOSING, LAST-ACK en TIME-WAIT (daar
+    /// altijd `Ok(0)`, want TIME-WAIT volgt pas op de ACK van onze FIN).
+    /// Daarna geeft het [`Error::Closed`], ook als een latere verbinding de
+    /// plek hergebruikt.
+    ///
+    /// Let op: [`Error::Closed`] na een close zegt "hier valt niets meer te
+    /// wachten", niet "alles kwam aan". LAST-ACK gaat bij de ACK op de FIN
+    /// meteen naar gesloten en wordt direct opgeruimd, dus die flush ziet
+    /// `Closed` in plaats van `0`; een verbinding die de 20-secondengrens of
+    /// de hertransmissieladder niet overleefde evengoed. Wie het verschil
+    /// moet weten, wacht vóór de close op `0` en sluit daarna.
+    ///
+    /// [`Error::Reset`] als de verbinding gereset is terwijl de applicatie het
+    /// handvat nog houdt: die bytes komen nooit meer aan.
+    ///
+    /// Wie wil wachten registreert [`Stack::tcp_register_write_waker`]: die
+    /// gaat bij elke ACK af.
+    pub fn tcp_unacked(&self, h: TcpHandle) -> Result<usize> {
+        let c = self.tracked(h)?;
+        if c.tcp.reset {
+            return Err(Error::Reset);
+        }
+        Ok(c.tcp.unacked())
     }
 
     // ---- UDP ----
