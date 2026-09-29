@@ -1,0 +1,13 @@
+[package]
+name = "leandhcp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "DHCPv4 (RFC 2131) op rauwe ethernet-frames: een lease voordat er een netstack is."
+
+[dependencies]
+
+[lints]
+workspace = true

@@ -1,0 +1,15 @@
+[package]
+name = "leanhttps"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Een compositie: leanhttp over leantls, en niets anders."
+
+[dependencies]
+leanhttp = { path = "../leanhttp" }
+leantls = { path = "../leantls" }
+
+[lints]
+workspace = true

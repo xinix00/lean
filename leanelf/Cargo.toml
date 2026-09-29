@@ -1,0 +1,13 @@
+[package]
+name = "leanelf"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "ELF64 voor een loader: PT_LOAD-segmenten, de bytes op een laadadres, symbolen op naam."
+
+[dependencies]
+
+[lints]
+workspace = true

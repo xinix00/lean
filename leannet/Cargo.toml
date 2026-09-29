@@ -1,0 +1,13 @@
+[package]
+name = "leannet"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "TCP/IP voor bare metal: Ethernet, IPv4 ARP/ICMP/UDP/TCP, een begrensd bufferbudget."
+
+[dependencies]
+
+[lints]
+workspace = true

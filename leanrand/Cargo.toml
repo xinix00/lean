@@ -1,0 +1,13 @@
+[package]
+name = "leanrand"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Random voor een node: bytes, een id, een begrensd getal, jitter op een wachttijd."
+
+[dependencies]
+
+[lints]
+workspace = true

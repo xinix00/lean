@@ -1,0 +1,13 @@
+[package]
+name = "leancookie"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Een cookie-jar (RFC 6265), host-only tenzij anders gevraagd."
+
+[dependencies]
+
+[lints]
+workspace = true
