@@ -679,6 +679,78 @@ fn tcp_rx_grows_on_a_jumbo_link_with_a_window_limited_sender() {
 }
 
 #[test]
+fn tcp_rx_grows_when_small_segments_reach_the_advertised_edge() {
+    // De Pi 4, 01-10-2026: de zender schrijft in stukken van 8 KiB in een
+    // venster van 16 KiB, de lezer draint na elk segment. Geen segment is
+    // vol (MSS 64 KiB) en geen segment vult de lokale vrije ruimte (die is
+    // steeds de hele ring), maar het tweede segment van elke rondreis
+    // bereikt de rand die wij adverteerden: de zender is venster-beperkt.
+    let mut a = TcpConn::with_rings(16 << 10, 256 << 10).unwrap();
+    let mut b = TcpConn::with_rings(16 << 10, 16 << 10).unwrap();
+    a.open_active(1000, 65495, 0);
+    b.open_passive(5000, 65495, 0);
+    let mut w = Wire {
+        a,
+        b,
+        pot_a: Budget::new(0),
+        pot_b: Budget::new(1 << 20),
+        now: HOUR,
+        drop_ab: None,
+        drop_ba: None,
+    };
+    w.b.budgeted = true;
+    w.b.max_buf = 256 << 10;
+    w.connect();
+
+    let payload: Vec<u8> = (0..256 << 10).map(|i| (i * 7) as u8).collect();
+    let mut got = Vec::new();
+    let mut written = 0;
+    let mut buf = vec![0u8; 70 << 10];
+    let mut largest = 0;
+    for _ in 0..2000 {
+        if got.len() >= payload.len() {
+            break;
+        }
+        let now = w.now;
+        // Schrijfstappen van 8 KiB, elk meteen als segment onderweg en meteen
+        // gelezen, tot het venster van de zender op is; dan pas de ACK's. Zo
+        // vult de zender elk venster met kleine segmenten, zoals op het ijzer.
+        loop {
+            if written < payload.len() {
+                let end = (written + (8 << 10)).min(payload.len());
+                written += w.write_a(&payload[written..end]).unwrap_or(0);
+            }
+            let Some(seg) = w.a.emit(&mut buf, now) else {
+                break;
+            };
+            largest = largest.max(seg.len);
+            let data = buf[..seg.len].to_vec();
+            w.recv_b(&seg, &data);
+            got.extend(read_all(&mut w.b));
+        }
+        while let Some(seg) = w.b.emit(&mut buf, now) {
+            let data = buf[..seg.len].to_vec();
+            w.recv_a(&seg, &data);
+        }
+    }
+    assert_eq!(got.len(), payload.len(), "transfer incomplete");
+    assert_eq!(got, payload);
+    // Nooit een vol segment (de MSS is 65495): de vol-segment-trigger kan
+    // hier niet gevuurd hebben.
+    assert!(
+        largest <= 32 << 10,
+        "the test wanted small segments, saw {largest}"
+    );
+    assert!(
+        w.b.rx.size() >= 64 << 10,
+        "rx ring stayed near the floor with small segments: {}",
+        w.b.rx.size()
+    );
+    assert!(w.b.cnt.rx_grown >= 2, "growth not counted: {:?}", w.b.cnt);
+    assert_eq!(w.b.cnt.rx_grow_refused, 0);
+}
+
+#[test]
 fn tcp_tx_grows_when_peer_offers_window() {
     let mut w = new_pair(512, 16384);
     w.pot_a = Budget::new(16384);

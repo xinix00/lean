@@ -177,6 +177,11 @@ pub(crate) struct TcpCounters {
     pub(crate) persist: usize,
     /// De peer adverteerde een nulvenster.
     pub(crate) zero_wnd: usize,
+    /// De ontvangstring groeide (een venster-beperkte zender, zie
+    /// `accept_data`).
+    pub(crate) rx_grown: usize,
+    /// Een groei die nodig was maar niet kon: de pot, `max_buf` of de heap.
+    pub(crate) rx_grow_refused: usize,
     /// Verstuurde datasegmenten, hertransmissies inbegrepen.
     pub(crate) segs_out: usize,
     pub(crate) bytes_out: usize,
@@ -1014,7 +1019,6 @@ impl TcpConn {
     fn accept_data(&mut self, data: &[u8], pot: &mut Budget) -> bool {
         self.cnt.segs_in += 1;
         self.cnt.bytes_in += data.len();
-        let offered = self.rx.free();
         let mut n = self.rx.write(data);
         self.rcv_nxt = self.rcv_nxt.wrapping_add(seq_len(n));
         self.need_ack = true;
@@ -1030,23 +1034,35 @@ impl TcpConn {
         //     ~170 KB/s (één vloervenster per ~90 ms) terwijl de pot leeg
         //     stond. Chatverkeer stuurt nooit volle segmenten en blijft op de
         //     vloer;
-        //   - het segment vulde het venster dat wij boden (len >= offered):
-        //     op een jumbo-link (MSS 64 KiB, het slot-LAN van HopOS) kan een
+        //   - de zender bereikte de rand die wij adverteerden (rcv_nxt op
+        //     adv_edge): hij is venster-beperkt, ongeacht zijn segmentmaat.
+        //     Op een jumbo-link (MSS 64 KiB, het slot-LAN van HopOS) kan een
         //     venster-beperkte zender nooit een VOL segment sturen zolang ons
-        //     venster kleiner is dan zijn MSS, en dan hield de vol-segment-
-        //     trigger elke bulkstroom op de vloer: gemeten 30-09-2026 op de
-        //     Pi 4, app naar app 100 MB/s, één venster van 16 KiB per
-        //     rondreis terwijl de ringen 480 KiB mochten zijn.
-        if self.adv_set
+        //     venster kleiner is dan zijn MSS, en een snelle lezer houdt de
+        //     ring leeg; de twee triggers hierboven hielden elke bulkstroom
+        //     dan op de vloer: gemeten 30-09 en 01-10-2026 op de Pi 4, app
+        //     naar app 100 MB/s, twee segmenten van 8 KiB per rondreis in
+        //     een venster van 16 KiB terwijl de ringen 480 KiB mochten zijn.
+        //     "Het segment vulde wat wij lokaal vrij hadden" (v3.1.2) was
+        //     niet genoeg: de lezer had de ring al leeg, dus elk segment was
+        //     kleiner dan die vrije ruimte.
+        let limited = self.adv_set
             && (self.rx.free() == 0
                 || data.len() >= usize::from(self.adv_mss)
-                || data.len() >= offered)
-            && self.grow_rx(pot)
-            && n < data.len()
-        {
-            let m = self.rx.write(data.get(n..).unwrap_or(&[]));
-            self.rcv_nxt = self.rcv_nxt.wrapping_add(seq_len(m));
-            n += m;
+                || self.rcv_nxt == self.adv_edge);
+        if limited {
+            if self.grow_rx(pot) {
+                self.cnt.rx_grown += 1;
+                if n < data.len() {
+                    let m = self.rx.write(data.get(n..).unwrap_or(&[]));
+                    self.rcv_nxt = self.rcv_nxt.wrapping_add(seq_len(m));
+                    n += m;
+                }
+            } else if self.rx.size() < self.max_buf {
+                // Het plafond (`max_buf`) is geen weigering; de pot of de
+                // heap wel.
+                self.cnt.rx_grow_refused += 1;
+            }
         }
         n >= data.len()
     }

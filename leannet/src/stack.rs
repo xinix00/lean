@@ -120,6 +120,11 @@ pub struct Stats {
     pub tcp_persist_probes: usize,
     /// Keren dat een peer een nulvenster adverteerde.
     pub tcp_zero_windows: usize,
+    /// Ontvangstringen die groeiden omdat de zender venster-beperkt was.
+    pub tcp_rx_grown: usize,
+    /// Groei die nodig was maar geweigerd werd (pot, `max_buf_per_conn`,
+    /// heap): de verbinding bleef op haar venster hangen.
+    pub tcp_rx_grow_refused: usize,
     /// Verstuurde datasegmenten.
     pub tcp_segs_out: usize,
     /// Verstuurde databytes.
@@ -388,6 +393,8 @@ impl Stack {
             st.tcp_fast_retransmits += n.fast_retrans;
             st.tcp_persist_probes += n.persist;
             st.tcp_zero_windows += n.zero_wnd;
+            st.tcp_rx_grown += n.rx_grown;
+            st.tcp_rx_grow_refused += n.rx_grow_refused;
             st.tcp_segs_out += n.segs_out;
             st.tcp_bytes_out += n.bytes_out;
             st.tcp_segs_in += n.segs_in;
