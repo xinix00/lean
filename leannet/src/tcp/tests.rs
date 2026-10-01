@@ -624,6 +624,61 @@ fn tcp_window_update_for_blocked_sender() {
 }
 
 #[test]
+fn tcp_rx_grows_on_a_jumbo_link_with_a_window_limited_sender() {
+    // Het slot-LAN van HopOS (30-09-2026): MSS 65495, de ontvangstring op de
+    // vloer van 16 KiB. De zender kan nooit een vol segment sturen zolang
+    // ons venster kleiner is dan zijn MSS, en een snelle lezer houdt de ring
+    // leeg; zonder de venster-trigger bleef de ring voorgoed 16 KiB.
+    let mut a = TcpConn::with_rings(256 << 10, 256 << 10).unwrap();
+    let mut b = TcpConn::with_rings(16 << 10, 16 << 10).unwrap();
+    a.open_active(1000, 65495, 0);
+    b.open_passive(5000, 65495, 0);
+    let mut w = Wire {
+        a,
+        b,
+        pot_a: Budget::new(0),
+        pot_b: Budget::new(1 << 20),
+        now: HOUR,
+        drop_ab: None,
+        drop_ba: None,
+    };
+    w.b.budgeted = true;
+    w.b.max_buf = 256 << 10;
+    w.connect();
+
+    let payload: Vec<u8> = (0..512 << 10).map(|i| (i * 31) as u8).collect();
+    let mut got = Vec::new();
+    let mut written = 0;
+    let mut buf = vec![0u8; 70 << 10];
+    for _ in 0..400 {
+        if got.len() >= payload.len() {
+            break;
+        }
+        if written < payload.len() {
+            written += w.write_a(&payload[written..]).unwrap_or(0);
+        }
+        // Jumbo-segmenten per stuk bezorgen en meteen lezen.
+        let now = w.now;
+        while let Some(seg) = w.a.emit(&mut buf, now) {
+            let data = buf[..seg.len].to_vec();
+            w.recv_b(&seg, &data);
+            got.extend(read_all(&mut w.b));
+        }
+        while let Some(seg) = w.b.emit(&mut buf, now) {
+            let data = buf[..seg.len].to_vec();
+            w.recv_a(&seg, &data);
+        }
+    }
+    assert_eq!(got.len(), payload.len(), "transfer incomplete");
+    assert_eq!(got, payload);
+    assert!(
+        w.b.rx.size() >= 64 << 10,
+        "rx ring stayed near the floor on a jumbo link: {}",
+        w.b.rx.size()
+    );
+}
+
+#[test]
 fn tcp_tx_grows_when_peer_offers_window() {
     let mut w = new_pair(512, 16384);
     w.pot_a = Budget::new(16384);

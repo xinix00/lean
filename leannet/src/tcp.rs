@@ -1014,6 +1014,7 @@ impl TcpConn {
     fn accept_data(&mut self, data: &[u8], pot: &mut Budget) -> bool {
         self.cnt.segs_in += 1;
         self.cnt.bytes_in += data.len();
+        let offered = self.rx.free();
         let mut n = self.rx.write(data);
         self.rcv_nxt = self.rcv_nxt.wrapping_add(seq_len(n));
         self.need_ack = true;
@@ -1028,9 +1029,18 @@ impl TcpConn {
         //     16 KiB-vloer: gemeten 18-08-2026 op de LicheeRV, beeldstromen op
         //     ~170 KB/s (één vloervenster per ~90 ms) terwijl de pot leeg
         //     stond. Chatverkeer stuurt nooit volle segmenten en blijft op de
-        //     vloer.
+        //     vloer;
+        //   - het segment vulde het venster dat wij boden (len >= offered):
+        //     op een jumbo-link (MSS 64 KiB, het slot-LAN van HopOS) kan een
+        //     venster-beperkte zender nooit een VOL segment sturen zolang ons
+        //     venster kleiner is dan zijn MSS, en dan hield de vol-segment-
+        //     trigger elke bulkstroom op de vloer: gemeten 30-09-2026 op de
+        //     Pi 4, app naar app 100 MB/s, één venster van 16 KiB per
+        //     rondreis terwijl de ringen 480 KiB mochten zijn.
         if self.adv_set
-            && (self.rx.free() == 0 || data.len() >= usize::from(self.adv_mss))
+            && (self.rx.free() == 0
+                || data.len() >= usize::from(self.adv_mss)
+                || data.len() >= offered)
             && self.grow_rx(pot)
             && n < data.len()
         {
