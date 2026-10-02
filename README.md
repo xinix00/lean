@@ -3,10 +3,10 @@
 Small Rust crates that do what they say and link nothing you did not ask for.
 
 This is the third generation of lean, in Rust. The Go generation (v1.x) lives
-in [OLD/](OLD/) with its own README and tests; its releases stay tagged. The
-contract did not change with the language: [KAM.md](KAM.md) fixes what each
-crate promises, narrows and refuses, and the Go tests are the specification
-the Rust tests are ported from.
+at tag [v1.2.0](https://github.com/xinix00/lean/tree/v1.2.0) with its own
+README and tests; its releases stay tagged. The contract did not change with
+the language: [KAM.md](KAM.md) fixes what each crate promises, narrows and
+refuses, and the Go tests are the specification the Rust tests are ported from.
 
 Every crate stands on its own: `core` and `alloc`, its own tests, no
 dependencies on each other and none from outside. Import one and you pay for
