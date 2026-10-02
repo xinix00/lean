@@ -15,6 +15,13 @@ use core::fmt;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Error {
+    /// Een ongeldig of niet-ondersteund IPv6-pakket/adres.
+    InvalidIpv6,
+    /// Geen bruikbare bron of route naar de IPv6-bestemming.
+    NoRoute6,
+    /// De IPv6-buur gaf geen antwoord binnen vijf pogingen.
+    Unreachable6,
+
     /// Een frame of header is korter dan zijn vaste deel of zijn lengteveld.
     ShortFrame {
         /// Aanwezige bytes.
@@ -172,6 +179,9 @@ impl fmt::Display for Ip {
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match *self {
+            Self::InvalidIpv6 => write!(f, "invalid or unsupported IPv6 packet/address"),
+            Self::NoRoute6 => write!(f, "no IPv6 route or source address"),
+            Self::Unreachable6 => write!(f, "IPv6 neighbor did not answer"),
             Error::ShortFrame { len, need } => {
                 write!(f, "leannet: frame too short ({len} < {need} bytes)")
             }

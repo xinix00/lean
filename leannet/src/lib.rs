@@ -5,7 +5,8 @@
 //! (agent-, leader- en consolelisteners), artefacten downloaden (uitgaand TCP
 //! onder TLS), namen en tijd ophalen (UDP voor DNS en SNTP) en link-local
 //! multicast voor mDNS. Al het andere is bewust afwezig, niet onaf; de grenzen
-//! staan in `KAM.md` (de leannet-sectie) en het waarom in `OLD/leannet/DESIGN.md`.
+//! staan in `KAM.md` (de leannet-sectie) en het waarom in `leannet/DESIGN.md`
+//! van de Go-generatie (tag v1.2.0 van github.com/xinix00/lean).
 //!
 //! # Eén eigenaar, geen I/O
 //!
@@ -142,8 +143,9 @@
 //!
 //! # Niet in deze crate
 //!
-//! De opt-in IPv6-baan uit de Go-versie (UDP/ICMPv6/NDP/SLAAC) is niet geport;
-//! een IPv6-frame is hier stille LAN-ruis. De TamaGo-`net.SocketFunc`-naad
+//! De opt-in IPv6-baan draagt UDP/ICMPv6/NDP/SLAAC en PIO/RIO-routes voor
+//! Matter/Thread. TCPv6, fragmentatie en extensieheaders blijven buiten het profiel.
+//! Zonder IPv6-socket of groepsjoin blijft IPv6 stille LAN-ruis. De TamaGo-`net.SocketFunc`-naad
 //! bestaat niet in Rust; de handvat-API hierboven vervangt hem.
 
 #![cfg_attr(not(test), no_std)]
@@ -163,6 +165,7 @@ extern crate alloc;
 mod arp;
 mod error;
 mod icmp;
+mod ipv6;
 mod multicast;
 mod neighbor;
 mod queue;
@@ -173,6 +176,7 @@ mod tcp;
 mod udp;
 mod waker;
 pub mod wire;
+pub mod wire6;
 
 #[cfg(test)]
 mod testnet;
@@ -180,6 +184,7 @@ mod testnet;
 mod tests;
 
 pub use error::{Error, Result};
+pub use ipv6::{Endpoint6, NdpStats, Udp6Handle};
 pub use socket::{Endpoint, UDP_MAX_PAYLOAD};
 pub use stack::{
     Config, ETHERNET_HEADER_SIZE, ETHERNET_MAXIMUM_SIZE, ListenHandle, MTU, Stack, Stats,

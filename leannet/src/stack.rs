@@ -268,6 +268,8 @@ pub struct Stack {
     pub(crate) conns: Vec<Option<Conn>>,
     pub(crate) listeners: Vec<Option<Listener>>,
     pub(crate) udp: UdpTable,
+    pub(crate) v6: Option<crate::ipv6::State>,
+    pub(crate) ndp_closed: crate::NdpStats,
     /// Verbindingsloze antwoorden: `[dst 4][proto 1][IP-payload]`.
     pub(crate) out: RecordQueue,
     /// Draadklare UDP-frames.
@@ -283,7 +285,7 @@ pub struct Stack {
     pub(crate) iss_seed: u32,
     next_generation: u32,
     /// Een frame-grote kladbuffer voor loopback-ingress en UDP-bouw.
-    scratch: Vec<u8>,
+    pub(crate) scratch: Vec<u8>,
     /// Een UDP-schrijver wacht op ruimte in `udp_out`.
     udp_out_waiters: bool,
     pub(crate) stats: Stats,
@@ -354,6 +356,8 @@ impl Stack {
             conns: Vec::new(),
             listeners: Vec::new(),
             udp: UdpTable::new(),
+            v6: None,
+            ndp_closed: crate::NdpStats::default(),
             out: RecordQueue::new(OUT_QUEUE_CAP, OUT_QUEUE_CAP * 256 + 2 * frame),
             udp_out: RecordQueue::new(
                 UDP_OUT_FRAMES,
@@ -461,6 +465,15 @@ impl Stack {
             if let Some(mut u) = self.udp.close(i, &mut self.pot) {
                 u.read_waker.wake();
                 u.write_waker.wake();
+            }
+        }
+        self.ndp_closed = self.ndp_stats();
+        if let Some(mut v) = self.v6.take() {
+            for i in 0..v.udp.ports.len() {
+                if let Some(mut u) = v.udp.close(i, &mut self.pot) {
+                    u.read_waker.wake();
+                    u.write_waker.wake();
+                }
             }
         }
         self.conns = Vec::new();
@@ -602,7 +615,24 @@ impl Stack {
                     _ => self.stats.drop_bad_frame += 1,
                 }
             }
-            // IPv6 en al het andere is hier LAN-ruis: stil en ongeteld.
+            wire::ETHERTYPE_IPV6 => {
+                if let Some(v) = &mut self.v6 {
+                    match crate::wire6::parse(eth.payload()) {
+                        Ok(p)
+                            if (p.dst[0] != 255 && eth.dst() == self.cfg.mac)
+                                || (p.dst[0] == 255
+                                    && eth.dst() == crate::wire6::multicast_mac(p.dst)) =>
+                        {
+                            if !v.receive(&p, eth.src(), now) {
+                                self.stats.drop_bad_frame += 1;
+                            }
+                            self.notify();
+                        }
+                        _ => self.stats.drop_bad_frame += 1,
+                    }
+                }
+            }
+            // Niet-ondersteunde EtherTypes blijven stille LAN-ruis.
             _ => {}
         }
     }
@@ -1069,6 +1099,11 @@ impl Stack {
         if let Some(n) = self.udp_out.pop(frame) {
             if self.udp_out_waiters {
                 self.udp_out_waiters = false;
+                if let Some(v) = &mut self.v6 {
+                    for u in v.udp.ports.iter_mut().flatten() {
+                        u.write_waker.wake();
+                    }
+                }
                 for u in self.udp.ports.iter_mut().flatten() {
                     u.write_waker.wake();
                 }
@@ -1076,6 +1111,11 @@ impl Stack {
             return Some(n);
         }
         if let Some(n) = self.drain_arp(now, frame) {
+            return Some(n);
+        }
+        if let Some(v) = &mut self.v6
+            && let Some(n) = v.emit(now, frame)
+        {
             return Some(n);
         }
         self.drain_tcp(now, frame)
@@ -1166,6 +1206,9 @@ impl Stack {
     /// Onderhoud vóór het zenden: socketdeadlines wekken, eigenaarloze en
     /// verlopen verbindingen opruimen, en verbindingen zonder route afbreken.
     fn maintain(&mut self, now: u64) {
+        if let Some(v) = &mut self.v6 {
+            v.tick(now);
+        }
         for c in self.conns.iter_mut().flatten() {
             if c.rd_deadline.is_some_and(|d| now >= d) {
                 c.read_waker.wake();
@@ -1247,6 +1290,14 @@ impl Stack {
             add(u.wr_deadline.filter(|_| u.write_waker.is_set()));
         }
         add(self.arp.nt.next_deadline());
+        if let Some(v) = &self.v6
+            && let Some(t) = v.deadline()
+        {
+            if t <= now {
+                return Some(now);
+            }
+            add(Some(t));
+        }
         d
     }
 
@@ -1387,6 +1438,13 @@ impl Stack {
                 } else {
                     self.stats.drop_reply_full += 1;
                 }
+            }
+        }
+        if ether_type == wire::ETHERTYPE_IPV6 && dst[..2] == [51, 51] {
+            let joined = crate::wire6::parse(bytes.get(SIZE_ETH..).unwrap_or(&[]))
+                .is_ok_and(|p| self.v6.as_ref().is_some_and(|v| v.accepts(p.dst)));
+            if joined && !self.loopback.push(&[bytes]) {
+                self.stats.drop_reply_full += 1;
             }
         }
         // Frames naar ons eigen MAC gaan naar de lokale ingress in plaats van

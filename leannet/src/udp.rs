@@ -23,11 +23,12 @@ use crate::{Error, Result};
 pub(crate) const UDP_DGRAM_OVERHEAD: usize = 64;
 
 /// Het fysieke recordhoofd in de ring: bron (4), bronpoort (2), lengte (2).
+#[cfg(test)]
 pub(crate) const UDP_REC_HDR: usize = 8;
 
 /// Eén gebonden poort en zijn ontvangstrij.
 #[derive(Debug)]
-pub(crate) struct UdpPort {
+pub(crate) struct UdpPort<const N: usize = 4> {
     /// Generatie van het handvat dat naar deze plek wijst.
     pub(crate) generation: u32,
     /// Het poortnummer.
@@ -39,7 +40,7 @@ pub(crate) struct UdpPort {
     /// De records.
     q: Ring,
     /// Het filter van een verbonden socket: alleen deze peer komt binnen.
-    pub(crate) peer: Option<([u8; 4], u16)>,
+    pub(crate) peer: Option<([u8; N], u16)>,
     /// Datagrammen die vielen omdat de rij vol was of het filter weigerde.
     pub(crate) cnt_drop: usize,
     /// Leesdeadline in monotone nanoseconden.
@@ -52,23 +53,21 @@ pub(crate) struct UdpPort {
     pub(crate) write_waker: WakerSlot,
 }
 
-impl UdpPort {
+impl<const N: usize> UdpPort<N> {
     /// Haalt het oudste datagram op zonder te blokkeren. Is `p` te klein, dan
     /// valt de rest weg (UDP-semantiek) maar blijft de recordgrens.
-    pub(crate) fn recv_from(&mut self, p: &mut [u8]) -> Option<(usize, [u8; 4], u16)> {
-        let mut hdr = [0u8; UDP_REC_HDR];
-        if self.q.peek(&mut hdr, 0) != UDP_REC_HDR {
+    pub(crate) fn recv_from(&mut self, p: &mut [u8]) -> Option<(usize, [u8; N], u16)> {
+        let mut src = [0; N];
+        let mut hdr = [0; 4];
+        if self.q.peek(&mut src, 0) != N || self.q.peek(&mut hdr, N) != 4 {
             return None;
         }
-        let [a, b, c, d, p0, p1, l0, l1] = hdr;
-        let src = [a, b, c, d];
+        let [p0, p1, l0, l1] = hdr;
         let sport = u16::from_be_bytes([p0, p1]);
         let len = usize::from(u16::from_be_bytes([l0, l1]));
         let take = len.min(p.len());
-        let n = self
-            .q
-            .peek(p.get_mut(..take).unwrap_or(&mut []), UDP_REC_HDR);
-        self.q.drop_front(UDP_REC_HDR + len);
+        let n = self.q.peek(p.get_mut(..take).unwrap_or(&mut []), N + 4);
+        self.q.drop_front(N + 4 + len);
         self.used = self.used.saturating_sub(UDP_DGRAM_OVERHEAD + len);
         Some((n, src, sport))
     }
@@ -81,15 +80,15 @@ impl UdpPort {
 
 /// Wijst poorten toe en verdeelt binnenkomende datagrammen.
 #[derive(Debug, Default)]
-pub(crate) struct UdpTable {
-    pub(crate) ports: Vec<Option<UdpPort>>,
+pub(crate) struct UdpTable<const N: usize = 4> {
+    pub(crate) ports: Vec<Option<UdpPort<N>>>,
     /// Voor telemetrie en een toekomstig ICMP port-unreachable.
     pub(crate) cnt_no_port: usize,
 }
 
-impl UdpTable {
+impl<const N: usize> UdpTable<N> {
     /// Een lege tabel.
-    pub(crate) fn new() -> UdpTable {
+    pub(crate) fn new() -> UdpTable<N> {
         UdpTable::default()
     }
 
@@ -163,7 +162,7 @@ impl UdpTable {
     }
 
     /// De poort op plek `i`.
-    pub(crate) fn get_mut(&mut self, i: usize) -> Option<&mut UdpPort> {
+    pub(crate) fn get_mut(&mut self, i: usize) -> Option<&mut UdpPort<N>> {
         self.ports.get_mut(i).and_then(Option::as_mut)
     }
 
@@ -172,7 +171,7 @@ impl UdpTable {
     pub(crate) fn deliver(
         &mut self,
         dst_port: u16,
-        src: [u8; 4],
+        src: [u8; N],
         src_port: u16,
         payload: &[u8],
     ) -> Option<usize> {
@@ -192,21 +191,21 @@ impl UdpTable {
             u.cnt_drop += 1;
             return None;
         };
-        if u.used + cost > u.cap || u.q.free() < UDP_REC_HDR + payload.len() {
+        if u.used + cost > u.cap || u.q.free() < N + 4 + payload.len() {
             u.cnt_drop += 1;
             return None;
         }
         u.used += cost;
         let [p0, p1] = src_port.to_be_bytes();
         let [l0, l1] = len.to_be_bytes();
-        let [a, b, c, d] = src;
-        u.q.write(&[a, b, c, d, p0, p1, l0, l1]);
+        u.q.write(&src);
+        u.q.write(&[p0, p1, l0, l1]);
         u.q.write(payload);
         Some(i)
     }
 
     /// Geeft de poort op plek `i` vrij met zijn volledige reservering. Idempotent.
-    pub(crate) fn close(&mut self, i: usize, pot: &mut Budget) -> Option<UdpPort> {
+    pub(crate) fn close(&mut self, i: usize, pot: &mut Budget) -> Option<UdpPort<N>> {
         let u = self.ports.get_mut(i)?.take()?;
         pot.release(u.cap);
         Some(u)

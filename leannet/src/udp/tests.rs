@@ -15,7 +15,7 @@ fn udp_datagram_budget_charge_covers_descriptor() {
 
 #[test]
 fn udp_bind_close_rebind() {
-    let mut tab = UdpTable::new();
+    let mut tab = UdpTable::<4>::new();
     let mut pot = Budget::new(4096);
     let u = tab.bind(5353, 1024, &mut pot, 1).unwrap();
     assert_eq!(
@@ -37,7 +37,7 @@ fn udp_bind_close_rebind() {
 
 #[test]
 fn udp_deliver_recv_roundtrip() {
-    let mut tab = UdpTable::new();
+    let mut tab = UdpTable::<4>::new();
     let mut pot = Budget::new(4096);
     let u = tab.bind(4242, 512, &mut pot, 1).unwrap();
     let payload = b"hello node";
@@ -64,7 +64,7 @@ fn udp_deliver_recv_roundtrip() {
 
 #[test]
 fn udp_queue_full_drop() {
-    let mut tab = UdpTable::new();
+    let mut tab = UdpTable::<4>::new();
     let mut pot = Budget::new(4096);
     let u = tab
         .bind(7, UDP_DGRAM_OVERHEAD + 16 + 8, &mut pot, 1)
@@ -95,7 +95,7 @@ fn udp_queue_full_drop() {
 
 #[test]
 fn udp_budget() {
-    let mut tab = UdpTable::new();
+    let mut tab = UdpTable::<4>::new();
     let mut pot = Budget::new(100);
     let a = tab.bind(1, 64, &mut pot, 1).unwrap();
     assert_eq!(pot.free(), 36);
@@ -114,7 +114,7 @@ fn udp_budget() {
 
 #[test]
 fn udp_datagram_boundaries() {
-    let mut tab = UdpTable::new();
+    let mut tab = UdpTable::<4>::new();
     let mut pot = Budget::new(4096);
     let u = tab.bind(53, 512, &mut pot, 1).unwrap();
     // De rij houdt een eigen kopie; de bron van de aanroeper mag daarna veranderen.
@@ -133,7 +133,7 @@ fn udp_datagram_boundaries() {
 
 #[test]
 fn udp_truncation() {
-    let mut tab = UdpTable::new();
+    let mut tab = UdpTable::<4>::new();
     let mut pot = Budget::new(4096);
     let u = tab.bind(9, UDP_DGRAM_OVERHEAD + 16, &mut pot, 1).unwrap();
     assert!(tab.deliver(9, SRC, 1, b"0123456789").is_some());
