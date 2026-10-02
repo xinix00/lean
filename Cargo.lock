@@ -4,27 +4,27 @@ version = 4
 
 [[package]]
 name = "leancookie"
-version = "3.1.5"
+version = "3.1.6"
 
 [[package]]
 name = "leandhcp"
-version = "3.1.5"
+version = "3.1.6"
 
 [[package]]
 name = "leanelf"
-version = "3.1.5"
+version = "3.1.6"
 
 [[package]]
 name = "leanh2"
-version = "3.1.5"
+version = "3.1.6"
 
 [[package]]
 name = "leanhttp"
-version = "3.1.5"
+version = "3.1.6"
 
 [[package]]
 name = "leanhttps"
-version = "3.1.5"
+version = "3.1.6"
 dependencies = [
  "leanhttp",
  "leantls",
@@ -32,16 +32,16 @@ dependencies = [
 
 [[package]]
 name = "leannet"
-version = "3.1.5"
+version = "3.1.6"
 
 [[package]]
 name = "leanrand"
-version = "3.1.5"
+version = "3.1.6"
 
 [[package]]
 name = "leans3"
-version = "3.1.5"
+version = "3.1.6"
 
 [[package]]
 name = "leantls"
-version = "3.1.5"
+version = "3.1.6"

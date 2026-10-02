@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "HTTP/1.1 zonder TLS: client en server, sequentiele keep-alive, chunked antwoorden."
+description = "HTTP/1.1 zonder TLS: client en server, sequentiele keep-alive, chunked antwoorden en requestbodies."
 
 [dependencies]
 

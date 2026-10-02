@@ -27,7 +27,8 @@ use crate::header::{
     valid_field_value, valid_token,
 };
 use crate::io::{
-    AsyncRead, AsyncWrite, Conn, FmtBuf, IoError, ReadBuf, close, flush, try_extend, write_all,
+    AsyncRead, AsyncWrite, Conn, FmtBuf, IoError, ReadBuf, close, eof_is_unexpected, flush,
+    next_chunk, try_extend, write_all,
 };
 use crate::url::{canonical_path, clean_escapes, percent_decode};
 use crate::{
@@ -78,7 +79,8 @@ pub struct Request {
     pub raw_query: String,
     /// De requestheaders; herhaalde velden zijn tot een kommalijst gevouwen.
     pub header: Header,
-    /// De aangekondigde body-lengte, of `None` zonder `Content-Length`.
+    /// De aangekondigde body-lengte; `None` zonder `Content-Length`, ook voor
+    /// een gechunkte body.
     pub content_length: Option<u64>,
     values: Vec<(String, String)>,
     keep_alive: bool,
@@ -281,7 +283,7 @@ where
     let result = loop {
         wire.set_read_timeout(Some(if first { REQUEST_TIMEOUT } else { IDLE_TIMEOUT }));
         first = false;
-        let (req, body_len) = match read_request(&mut wire).await {
+        let (req, body) = match read_request(&mut wire).await {
             Ok(r) => r,
             Err(Reject::Gone) => break Ok(()),
             Err(Reject::Bad { status, err, drain }) => {
@@ -298,14 +300,14 @@ where
         };
         // Een body houdt zijn termijn; zonder body gaat hij uit, zodat een
         // SSE-handler onbeperkt kan stromen.
-        wire.set_read_timeout((body_len > 0).then_some(BODY_TIMEOUT));
+        wire.set_read_timeout(body.pending().then_some(BODY_TIMEOUT));
         wire.head_sent = false;
         let head = req.method == "HEAD";
         let keep_alive = req.keep_alive;
         let mut ex = Exchange {
             req,
             wire: &mut wire,
-            body_left: body_len,
+            body,
             resp: Resp::new(keep_alive, head),
         };
         let res = handler(&mut ex).await;
@@ -337,6 +339,22 @@ where
     result.map(|()| Outcome::Closed)
 }
 
+/// De requestbody zoals de handler hem leest: wat er van een bekende lengte
+/// of van de huidige chunk nog te lezen is, of er nog chunkkoppen volgen, en
+/// hoeveel een gechunkte body nog mag aankondigen onder [`MAX_BODY_BYTES`].
+struct Body {
+    left: u64,
+    chunked: bool,
+    budget: u64,
+}
+
+impl Body {
+    /// Of er nog bodybytes van de client kunnen komen.
+    fn pending(&self) -> bool {
+        self.left > 0 || self.chunked
+    }
+}
+
 /// Waarom er geen verzoek is.
 enum Reject {
     /// De client ging weg (EOF, termijn, verbroken): stil sluiten.
@@ -359,7 +377,9 @@ fn bad(err: Error) -> Reject {
 }
 
 /// Leest één requestregel, het kopblok en de framing van de body.
-async fn read_request<C: Conn>(wire: &mut Wire<C>) -> core::result::Result<(Request, u64), Reject> {
+async fn read_request<C: Conn>(
+    wire: &mut Wire<C>,
+) -> core::result::Result<(Request, Body), Reject> {
     // EOF, een termijn of een verbroken verbinding: de client ging weg. Een
     // aanwezige maar kapotte requestregel verdient een 400.
     let classify = |e: Error| match e {
@@ -424,13 +444,28 @@ async fn read_request<C: Conn>(wire: &mut Wire<C>) -> core::result::Result<(Requ
         err,
         drain: true,
     };
-    let body_len = match (cls, tes) {
+    let mut body = Body {
+        left: 0,
+        chunked: false,
+        budget: MAX_BODY_BYTES,
+    };
+    match (cls, tes) {
         // Herhaalde framing, ook lege regels (RFC 9112 §6).
         (c, t) if c > 1 || t > 1 => return Err(reject(400, Error::RepeatedFraming)),
         // TE plus CL laat tussenstations het oneens zijn over de grens (§6.1).
         (1, 1) => return Err(reject(400, Error::BothFramings)),
-        // Request-bodies vragen Content-Length; geen gebruiker stuurt chunked.
-        (_, 1) => return Err(reject(501, Error::RequestTransferEncoding)),
+        // Precies `chunked`, zoals een proxy (cloudflared) een body zonder
+        // lengte doorgeeft; een andere of gestapelde codering is een 501 (§6.1).
+        (_, 1) => {
+            if !req
+                .header
+                .value("Transfer-Encoding")
+                .eq_ignore_ascii_case("chunked")
+            {
+                return Err(reject(501, Error::RequestTransferEncoding));
+            }
+            body.chunked = true;
+        }
         (1, _) => {
             // Streng decimaal: "+5" leest een proxy misschien anders.
             let n = parse_decimal(req.header.value("Content-Length"))
@@ -445,11 +480,11 @@ async fn read_request<C: Conn>(wire: &mut Wire<C>) -> core::result::Result<(Requ
                 ));
             }
             req.content_length = Some(n);
-            n
+            body.left = n;
         }
-        _ => 0,
-    };
-    Ok((req, body_len))
+        _ => {}
+    }
+    Ok((req, body))
 }
 
 /// Ontleedt `METHODE doel HTTP/1.1` tot een verzoek zonder headers.
@@ -593,7 +628,7 @@ pub struct Exchange<'c, C> {
     /// Het verzoek; de Mux zet er de wildcardwaarden in.
     pub req: Request,
     wire: &'c mut Wire<C>,
-    body_left: u64,
+    body: Body,
     resp: Resp,
 }
 
@@ -703,41 +738,84 @@ impl<'c, C: Conn> Exchange<'c, C> {
 
     /// Leest body-bytes; `Ok(0)` is het einde van de body.
     ///
-    /// Een verbinding die eindigt voordat `Content-Length` bereikt is, geeft
-    /// [`Error::UnexpectedEof`], nooit een stil kort succes.
+    /// Een verbinding die eindigt voordat `Content-Length` of de nul-chunk
+    /// bereikt is, geeft [`Error::UnexpectedEof`], nooit een stil kort succes.
+    /// Een gechunkte body boven [`MAX_BODY_BYTES`] is [`Error::BodyTooLarge`]
+    /// bij de chunkkop die de grens passeert.
     pub async fn read_body(&mut self, out: &mut [u8]) -> Result<usize> {
         if self.wire.hijacked {
             return Err(Error::Hijacked);
         }
-        if self.body_left == 0 || out.is_empty() {
+        if out.is_empty() || !self.more().await? {
             return Ok(0);
         }
-        let lim = out.len().min(usize_of(self.body_left));
+        let lim = out.len().min(usize_of(self.body.left));
         let dst = out.get_mut(..lim).unwrap_or(&mut []);
         let n = self.wire.rbuf.read(&mut self.wire.conn, dst).await?;
         if n == 0 {
             return Err(Error::UnexpectedEof);
         }
-        self.body_left -= u64_of(n);
+        self.took(n).await?;
         Ok(n)
     }
 
-    /// Leest de hele body; hij is door de parser al begrensd op
-    /// [`MAX_BODY_BYTES`].
+    /// Leest de hele body, begrensd op [`MAX_BODY_BYTES`]: door de parser
+    /// voor een bekende lengte, per chunkkop voor een gechunkte.
     pub async fn read_body_to_end(&mut self) -> Result<Vec<u8>> {
-        let len = usize_of(self.body_left);
         let mut body = Vec::new();
-        body.try_reserve_exact(len)
-            .map_err(|_| Error::Alloc { bytes: len })?;
-        body.resize(len, 0);
-        let mut at = 0;
-        while at < len {
-            let n = self
-                .read_body(body.get_mut(at..).unwrap_or(&mut []))
-                .await?;
-            at += n;
+        while self.more().await? {
+            let mut at = body.len();
+            let len = usize_of(self.body.left);
+            body.try_reserve(len)
+                .map_err(|_| Error::Alloc { bytes: at + len })?;
+            body.resize(at + len, 0);
+            while at < body.len() {
+                at += self
+                    .read_body(body.get_mut(at..).unwrap_or(&mut []))
+                    .await?;
+            }
         }
         Ok(body)
+    }
+
+    /// Zet de volgende chunk klaar als de vorige op is; `false` is het einde
+    /// van de body.
+    async fn more(&mut self) -> Result<bool> {
+        if self.body.left == 0 && self.body.chunked {
+            match next_chunk(&mut self.wire.rbuf, &mut self.wire.conn).await? {
+                None => self.body.chunked = false,
+                Some(n) => {
+                    if n > self.body.budget {
+                        return Err(Error::BodyTooLarge {
+                            len: (MAX_BODY_BYTES - self.body.budget).saturating_add(n),
+                            limit: MAX_BODY_BYTES,
+                        });
+                    }
+                    self.body.budget -= n;
+                    self.body.left = n;
+                }
+            }
+        }
+        Ok(self.body.left > 0)
+    }
+
+    /// Boekt `n` gelezen bodybytes; na de laatste byte van een chunk hoort
+    /// zijn CRLF (RFC 9112 §7.1), en EOF daarvoor is afgekapt.
+    async fn took(&mut self, n: usize) -> Result {
+        self.body.left -= u64_of(n);
+        if self.body.left == 0 && self.body.chunked {
+            let mut budget = BUF_SIZE;
+            let crlf = self
+                .wire
+                .rbuf
+                .read_line(&mut self.wire.conn, &mut budget)
+                .await
+                .map_err(eof_is_unexpected)?;
+            if !crlf.is_empty() {
+                return Err(Error::ChunkNotCrlf);
+            }
+        }
+        Ok(())
     }
 
     /// Claimt de leeskant voor [`Exchange::done`], zonder te wachten.
@@ -756,7 +834,7 @@ impl<'c, C: Conn> Exchange<'c, C> {
         if self.wire.head_sent {
             return Err(Error::DoneAfterStart);
         }
-        if self.body_left > 0 {
+        if self.body.pending() {
             self.wire.set_read_timeout(Some(DRAIN_TIMEOUT));
             let _ = self.discard_body().await;
         }
@@ -872,7 +950,7 @@ impl<'c, C: Conn> Exchange<'c, C> {
     }
 
     async fn discard_body(&mut self) -> Result {
-        while self.body_left > 0 {
+        while self.more().await? {
             if !self.wire.rbuf.fill_some(&mut self.wire.conn).await? {
                 return Err(Error::UnexpectedEof);
             }
@@ -881,9 +959,9 @@ impl<'c, C: Conn> Exchange<'c, C> {
                 .rbuf
                 .buffered()
                 .len()
-                .min(usize_of(self.body_left));
+                .min(usize_of(self.body.left));
             self.wire.rbuf.consume(n);
-            self.body_left -= u64_of(n);
+            self.took(n).await?;
         }
         Ok(())
     }
@@ -1072,7 +1150,7 @@ impl<'c, C: Conn> Exchange<'c, C> {
             // Veeg vóór een nette close een ongelezen geldige body kort weg:
             // sluiten met ongelezen TCP-data kan resetten en het antwoord uit
             // de zendrij gooien.
-            if fin.is_ok() && !self.wire.watched && self.body_left > 0 {
+            if fin.is_ok() && !self.wire.watched && self.body.pending() {
                 self.wire.set_read_timeout(Some(DRAIN_TIMEOUT));
                 let _ = self.discard_body().await;
             }
@@ -1080,7 +1158,7 @@ impl<'c, C: Conn> Exchange<'c, C> {
         }
         // Veeg vóór hergebruik, zodat het volgende verzoek op zijn eigen regel
         // begint; lukt dat niet binnen de termijn, dan is hergebruik onveilig.
-        if self.body_left > 0 {
+        if self.body.pending() {
             self.wire.set_read_timeout(Some(DRAIN_TIMEOUT));
             if self.discard_body().await.is_err() {
                 return Ok(false);

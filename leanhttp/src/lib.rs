@@ -1,4 +1,5 @@
-//! HTTP/1.1 zonder TLS: client en server, sequentiele keep-alive, chunked antwoorden.
+//! HTTP/1.1 zonder TLS: client en server, sequentiele keep-alive, chunked antwoorden
+//! en chunked requestbodies.
 //!
 //! Deze crate praat niet met een netstack maar met een verbinding: alles wat
 //! [`AsyncRead`], [`AsyncWrite`] en [`Close`] implementeert (een leannet-socket,
@@ -86,7 +87,8 @@ pub const MAX_HEADER_BYTES: usize = 64 << 10;
 /// Grootste request-body die de server aanneemt.
 ///
 /// KAM: 1 MiB. Deze server is er voor API's en kleine formulieren, niet voor
-/// uploads; groter is een 413 nog voor de handler draait.
+/// uploads; groter is een 413 nog voor de handler draait. Een gechunkte body
+/// stuit erop bij de chunkkop die de grens passeert.
 pub const MAX_BODY_BYTES: u64 = 1 << 20;
 
 /// Grens waarboven een antwoord zonder lengte overgaat op chunked.

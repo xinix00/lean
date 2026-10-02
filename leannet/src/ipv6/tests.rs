@@ -264,6 +264,53 @@ fn slaac_thread_rio_and_router_withdrawal() {
     assert_eq!(s.udp6_send_to(h, to, b"matter", NOW), Err(Error::NoRoute6));
 }
 #[test]
+fn thread_route_without_sllao_learns_validated_ethernet_neighbor() {
+    let mut s = stack();
+    let h = s.udp6_bind(0, NOW).unwrap();
+    s.receive(
+        &ra(
+            w::link_local(MAC_B),
+            MAC_B,
+            0,
+            vec![pio(prefix(1), 0xc0, 1800, 1800)],
+        ),
+        NOW,
+    )
+    .unwrap();
+    let mac = [2, 3, 4, 5, 6, 7];
+    let router = w::link_local(mac);
+    let mut body = vec![134, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    body.extend_from_slice(&rio(prefix(2), 64, 1800));
+    // Start with a pending lookup, as on hardware before the next RA arrives.
+    s.v6.as_mut().unwrap().nt.resolve(router, NOW);
+    let wake = counting_waker();
+    s.udp6_register_write_waker(h, &wake.0).unwrap();
+    let mut malformed = body.clone();
+    malformed.extend_from_slice(&[1, 1, 2, 0, 0, 0, 0, 99]);
+    s.receive(&raw(router, w::ALL_NODES, mac, 58, 255, malformed), NOW)
+        .unwrap();
+    assert!(s.v6.as_mut().unwrap().nt.peek(router, NOW).is_none());
+    s.receive(&raw(router, w::ALL_NODES, mac, 58, 64, body.clone()), NOW)
+        .unwrap();
+    assert!(s.v6.as_mut().unwrap().nt.peek(router, NOW).is_none());
+    s.receive(&raw(router, w::ALL_NODES, mac, 58, 255, body), NOW)
+        .unwrap();
+    assert!(wake.1.count() > 0);
+    let peer = Endpoint6 {
+        ip: prefix(2),
+        port: 5540,
+    };
+    s.udp6_send_to(h, peer, b"matter", NOW).unwrap();
+    let mut frame = [0; 1514];
+    let n = s.poll_transmit(NOW, &mut frame).unwrap();
+    let eth = wire::parse_eth(&frame[..n]).unwrap();
+    assert_eq!(eth.dst(), mac);
+    let packet = w::parse(eth.payload()).unwrap();
+    assert_eq!(packet.dst, peer.ip);
+    assert_eq!(packet.next, 17);
+    assert_eq!(w::checksum(packet.src, packet.dst, 17, packet.payload), 0);
+}
+#[test]
 fn malformed_ra_tail_is_atomic_and_hop_limit_is_checked() {
     let mut s = stack();
     s.enable_ipv6(NOW).unwrap();

@@ -220,6 +220,30 @@ fn stack_udp_roundtrip() {
 }
 
 #[test]
+fn tcp_readable_meldt_data_en_fin_zonder_te_lezen() {
+    let mut net = Net::pair(1 << 20, 1 << 20);
+    let (c, s, _) = connected(&mut net, 82);
+    // Een verse verbinding: niets te lezen, en de vraag verbruikt niets.
+    assert_eq!(net.a.tcp_readable(c), Ok(false));
+    write_all(&mut net, sb, s, b"hallo", SEC);
+    let ok = net.run_until(SEC, |n| n.a.tcp_readable(c) == Ok(true));
+    assert!(ok, "readable werd nooit waar na een write van de peer");
+    // Twee keer vragen is één keer vragen: de bytes staan er nog.
+    assert_eq!(net.a.tcp_readable(c), Ok(true));
+    assert_eq!(read_exact(&mut net, sa, c, 5, SEC), b"hallo");
+    assert_eq!(net.a.tcp_readable(c), Ok(false));
+    // De FIN van de peer maakt de verbinding leesbaar: de read zegt dan EOF.
+    let now = net.now;
+    net.b().tcp_close(s, now).unwrap();
+    let ok = net.run_until(SEC, |n| n.a.tcp_readable(c) == Ok(true));
+    assert!(ok, "readable werd nooit waar na de FIN van de peer");
+    assert_eq!(net.a.tcp_read(c, &mut [0; 16], net.now), Ok(0));
+    // Een vreemd handvat is een fout, geen `false`.
+    net.a.tcp_close(c, net.now).unwrap();
+    assert_eq!(net.a.tcp_readable(c), Err(Error::Closed));
+}
+
+#[test]
 fn stack_read_deadline() {
     let mut net = Net::pair(1 << 20, 1 << 20);
     let (c, _, _) = connected(&mut net, 81);

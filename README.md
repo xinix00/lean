@@ -17,7 +17,7 @@ crates it joins and nothing else.
 | `leandhcp` | DHCPv4 on raw ethernet frames: a lease before any netstack exists. |
 | `leannet` | TCP/IP for bare metal: Ethernet, IPv4 ARP/ICMP/UDP/TCP; opt-in IPv6 UDP/NDP/SLAAC and Thread routes, one bounded buffer budget. |
 | `leancookie` | A cookie jar (RFC 6265), host-only by default. |
-| `leanhttp` | HTTP/1.1 without TLS: client and server, sequential keep-alive, chunked responses. |
+| `leanhttp` | HTTP/1.1 without TLS: client and server, sequential keep-alive, chunked responses and request bodies. |
 | `leantls` | TLS 1.3 for a network you own: one version, one suite, a pinned Ed25519 peer or a real chain. |
 | `leanhttps` | A composition: `leanhttp` over `leantls`, and nothing else. |
 | `leans3` | S3: SigV4 signing plus the object operations that are actually used. |

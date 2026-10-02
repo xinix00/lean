@@ -156,21 +156,72 @@ fn serve_post_met_body() {
 }
 
 #[test]
-fn serve_chunked_verzoek_body_is_een501() {
+fn serve_chunked_verzoek_body() {
+    // cloudflared geeft een body zonder lengte (ook een lege) chunked door; de
+    // handler leest hem als één body, en de verbinding blijft bruikbaar.
     let srv = h!(ex => {
         let b = ex.read_body_to_end().await?;
         ex.write(&b).await?;
     });
     let got = rt(
         &srv,
-        "POST /echo HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\nd\r\nhallo chunked\r\n0\r\n\r\n",
+        "POST /echo HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n6\r\nhallo \r\n7\r\nchunked\r\n0\r\n\r\n\
+         POST /echo HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n0\r\n\r\n",
     );
-    assert!(got.starts_with("HTTP/1.1 501"), "{got}");
+    assert_eq!(got.matches("HTTP/1.1 200").count(), 2, "{got}");
+    assert!(
+        split(&got).1.starts_with("hallo chunkedHTTP/1.1 200"),
+        "{got}"
+    );
     let got = rt(
         &srv,
         "POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 12\r\nConnection: close\r\n\r\nhallo lengte",
     );
     assert_eq!(split(&got).1, "hallo lengte");
+}
+
+#[test]
+fn serve_ongelezen_chunked_body_wordt_geveegd() {
+    let srv = h!(ex => {
+        let p = ex.req.path.clone();
+        ex.write(p.as_bytes()).await?;
+    });
+    let got = rt(
+        &srv,
+        "POST /een HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhallo\r\n0\r\n\r\n\
+         GET /twee HTTP/1.1\r\nHost: x\r\n\r\n",
+    );
+    assert_eq!(got.matches("HTTP/1.1 200").count(), 2, "{got}");
+    assert!(got.ends_with("/twee"), "{got}");
+}
+
+#[test]
+fn serve_chunked_body_boven_de_limiet_of_met_extensie_is_fout() {
+    let got = Rc::new(RefCell::new(None));
+    for (body, want) in [
+        // De kop kondigt meer aan dan de limiet: fout vóór er één byte binnen is.
+        (
+            format!("{:x}\r\n", MAX_BODY_BYTES + 1),
+            Error::BodyTooLarge {
+                len: MAX_BODY_BYTES + 1,
+                limit: MAX_BODY_BYTES,
+            },
+        ),
+        (
+            "5;ext=1\r\nhallo\r\n0\r\n\r\n".to_string(),
+            Error::ChunkExtension,
+        ),
+    ] {
+        let g = got.clone();
+        let srv = h!(ex => {
+            *g.borrow_mut() = Some(ex.read_body_to_end().await.map(|b| b.len()));
+        });
+        let resp = rt(
+            &srv,
+            &format!("POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n{body}"),
+        );
+        assert_eq!(*got.borrow(), Some(Err(want)), "{resp}");
+    }
 }
 
 #[test]

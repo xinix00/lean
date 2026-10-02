@@ -471,9 +471,12 @@ impl State {
             return false;
         }
         self.expire(now);
-        if has_mac {
-            self.learn(p.src, mac, now);
-        }
+        // Sommige Thread-borderrouters adverteren alleen een RIO, zonder
+        // SLLAO, en beantwoorden multicast-NS niet. Het gevalideerde frame
+        // draagt hun linkadres al. Leer dat passief, ook zonder de optionele
+        // SLLAO; een aanwezige optie moet hierboven nog steeds overeenkomen.
+        // `learn` overschrijft geen bestaande opgeloste buur met een andere MAC.
+        self.learn(p.src, mac, now);
         let life = u16::from_be_bytes([b[6], b[7]]);
         if life != 0 {
             self.router = Some((p.src, lease(now, u32::from(life))));
@@ -776,6 +779,11 @@ impl Stack {
         }
         let (n, ip, port) = u.recv_from(buf).ok_or(Error::WouldBlock)?;
         Ok((n, Endpoint6 { ip, port }))
+    }
+    /// Of er een datagram klaarligt; verbruikt niets (de IPv6-tegenhanger
+    /// van [`Stack::udp_readable`](crate::Stack::udp_readable)).
+    pub fn udp6_readable(&mut self, h: Udp6Handle) -> Result<bool> {
+        Ok(self.udp6_port(h)?.has_data())
     }
     /// Stuurt naar de vastgelegde peer.
     pub fn udp6_send(&mut self, h: Udp6Handle, data: &[u8], now: u64) -> Result<usize> {

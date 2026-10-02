@@ -16,7 +16,7 @@ use core::task::{Context, Poll};
 use core::time::Duration;
 
 use crate::error::{Error, Result};
-use crate::header::{try_string, valid_field_value};
+use crate::header::{parse_hex, try_string, valid_field_value, valid_token};
 use crate::{BUF_SIZE, MAX_HEADER_BYTES};
 
 /// Een fout van de verbinding zelf.
@@ -362,6 +362,98 @@ impl ReadBuf {
                 return Err(Error::InvalidHeaderName);
             }
             each(k, crate::header::trim_ows(v))?;
+        }
+    }
+}
+
+pub(crate) fn eof_is_unexpected(e: Error) -> Error {
+    if e == Error::Eof {
+        Error::UnexpectedEof
+    } else {
+        e
+    }
+}
+
+/// Trailers die framing, routering, verbinding, authenticatie, cache of inhoud
+/// raken (RFC 9110 §6.5.1). Dicht falen, ook al negeert deze parser de
+/// waarden: een ander station doet dat misschien niet.
+const FORBIDDEN_TRAILERS: &[&str] = &[
+    "transfer-encoding",
+    "content-length",
+    "host",
+    "connection",
+    "upgrade",
+    "te",
+    "trailer",
+    "content-type",
+    "content-encoding",
+    "content-range",
+    "cache-control",
+    "expect",
+    "max-forwards",
+    "pragma",
+    "range",
+    "if-match",
+    "if-none-match",
+    "if-modified-since",
+    "if-unmodified-since",
+    "if-range",
+    "authorization",
+    "www-authenticate",
+    "cookie",
+    "set-cookie",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "age",
+    "location",
+    "retry-after",
+    "vary",
+];
+
+/// Leest de volgende chunkkop; `None` na de nul-chunk en zijn trailers. Eén
+/// decoder voor een gechunkt antwoord (client) en een gechunkt verzoek (server).
+///
+/// Lange stromen hebben onbegrensd veel chunks, dus alleen de regelgrens per
+/// kop geldt; het trailerblok is eindig en krijgt het cumulatieve budget.
+pub(crate) async fn next_chunk<C: Conn>(rbuf: &mut ReadBuf, conn: &mut C) -> Result<Option<u64>> {
+    let mut budget = BUF_SIZE;
+    let line = rbuf
+        .read_line(conn, &mut budget)
+        .await
+        .map_err(eof_is_unexpected)?;
+    let (size, ext) = match line.split_once(';') {
+        Some((s, _)) => (s, true),
+        None => (line.as_str(), false),
+    };
+    // RFC 9112 §7.1: precies 1*HEXDIG, zonder teken of OWS.
+    let n = parse_hex(size).ok_or(Error::MalformedChunkSize)?;
+    if ext {
+        // Bewuste afwijking van RFC 9112 §7.1.1: alle extensies weigeren. Ze
+        // veilig negeren vraagt een volledige quote-bewuste parser, en geen
+        // gemeten peer stuurt ze; half valideren schept framing-ambiguïteit.
+        return Err(Error::ChunkExtension);
+    }
+    if n > 0 {
+        return Ok(Some(n));
+    }
+    let mut budget = MAX_HEADER_BYTES;
+    loop {
+        let t = rbuf
+            .read_line(conn, &mut budget)
+            .await
+            .map_err(eof_is_unexpected)?;
+        if t.is_empty() {
+            return Ok(None);
+        }
+        let name = t.split_once(':').map(|(k, _)| k);
+        let Some(name) = name.filter(|k| valid_token(k)) else {
+            return Err(Error::MalformedTrailer);
+        };
+        if FORBIDDEN_TRAILERS
+            .iter()
+            .any(|f| f.eq_ignore_ascii_case(name))
+        {
+            return Err(Error::ForbiddenTrailer);
         }
     }
 }

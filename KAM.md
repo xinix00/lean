@@ -50,7 +50,7 @@ not as a general capability of this stack. A caller that has a choice uses
 
 | Area | KEEP | ADAPT | MURDER |
 |---|---|---|---|
-| HTTP server | HTTP/1.1, sequential keep-alive, fixed and streamed responses, `HEAD`, `204`/`205`/`304`, `Done`, `Hijack` | origin-form only, known-length request bodies, WebSocket through raw takeover | HTTP/1.0, HTTP/2 in this package (it lives in `leanh2`), CONNECT, request chunking/trailers, server-side Expect state machine, general 1xx state machine |
+| HTTP server | HTTP/1.1, sequential keep-alive, fixed and streamed responses, `HEAD`, `204`/`205`/`304`, `Done`, `Hijack` | origin-form only, request bodies with `Content-Length` or exactly `Transfer-Encoding: chunked`, WebSocket through raw takeover | HTTP/1.0, HTTP/2 in this package (it lives in `leanh2`), CONNECT, chunk extensions and trailer semantics in requests, server-side Expect state machine, general 1xx state machine |
 | leanh2 | HTTP/2 server role on a caller-supplied connection: the client preface then SETTINGS first; 32 streams; 16 KiB frames; 64 KiB compressed and decoded headers; 64 KiB receive window per stream; atomic two-level flow control; statuses 200–599 | request bodies with exact Content-Length integrity; exact static HPACK matches use their index, otherwise response fields are literals without indexing; syntactically valid PRIORITY accepted and ignored; `GOAWAY` with the highest accepted stream | client role, listener/dialer, TLS/ALPN, `h2c` upgrade, protocol sniffing, push, CONNECT, trailing header sections, 1xx, priority state or scheduling, dynamic response compression |
 | Mux | method+path, exact/subtree, `{segment}`, `{rest...}`, `GET`→`HEAD`, `404`/`405`+`Allow` | canonical paths or rejection; immutable after start | host routing, `{$}`, escaped/dot routing, slash normalization, net/http compatibility work |
 | HTTP client | outbound HTTP/1.1, inbound 1.0/1.1, GET/HEAD redirects, response framing, deadlines, keep-alive pool | fixed-length streaming upload with a strict Expect decision; compression pass-through | request chunking, automatic decompression, CONNECT/upgrade, general retry state machine |
@@ -70,8 +70,10 @@ The server MUST:
 - require exactly one non-empty `Host` and accept only origin-form targets;
 - process requests sequentially per connection while both sides permit
   keep-alive;
-- accept a request body only with exactly one valid `Content-Length`, up to
-  1 MiB; a short body returns `io.ErrUnexpectedEOF`, never success;
+- accept a request body with exactly one valid `Content-Length`, or with exactly
+  `Transfer-Encoding: chunked` (no chunk extensions; trailers are checked and
+  discarded), decoded up to 1 MiB; a short body returns `io.ErrUnexpectedEOF`,
+  never success;
 - drain an unread request body within bounds before reuse and, while the
   transport remains healthy, before a clean close;
 - keep response framing unambiguous: known `Content-Length` or writer-owned

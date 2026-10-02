@@ -332,6 +332,22 @@ impl Stack {
         }
     }
 
+    /// Of een read nu zonder [`Error::WouldBlock`] zou terugkeren: er staan
+    /// ontvangen bytes klaar, of de peer sloot (FIN of reset), zodat de read
+    /// EOF of de fout meldt. Verbruikt niets.
+    ///
+    /// De niet-consumerende vraag voor een eigenaar die op meerdere
+    /// verbindingen tegelijk wacht: hij registreert
+    /// [`Stack::tcp_register_read_waker`] en leest pas als dit `true` zegt,
+    /// in plaats van elke verbinding rond te pollen met een lege read.
+    pub fn tcp_readable(&mut self, h: TcpHandle) -> Result<bool> {
+        let c = self.sock(h)?;
+        Ok(c.tcp.rx.buffered() > 0
+            || c.tcp.reset
+            || c.tcp.fin_rcvd
+            || c.tcp.state == TcpState::Closed)
+    }
+
     /// Buffert bytes om te versturen zonder te blokkeren en geeft het aantal.
     ///
     /// [`Error::WouldBlock`] als de zendring vol is en niet kan groeien;

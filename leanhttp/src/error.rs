@@ -72,7 +72,7 @@ pub enum Error {
     RepeatedFraming,
     /// `Transfer-Encoding` en `Content-Length` samen.
     BothFramings,
-    /// Een request met `Transfer-Encoding`; alleen `Content-Length` bestaat.
+    /// Een request met een andere `Transfer-Encoding` dan precies `chunked`.
     RequestTransferEncoding,
     /// `Content-Length` was geen kaal decimaal getal.
     BadContentLength,
@@ -227,9 +227,9 @@ impl fmt::Display for Error {
             Error::ExpectUnsupported => f.write_str("Expect is not supported"),
             Error::RepeatedFraming => f.write_str("repeated framing header"),
             Error::BothFramings => f.write_str("both Transfer-Encoding and Content-Length"),
-            Error::RequestTransferEncoding => f.write_str(
-                "Transfer-Encoding is not supported for requests; send a Content-Length",
-            ),
+            Error::RequestTransferEncoding => {
+                f.write_str("only Transfer-Encoding: chunked is supported for requests")
+            }
             Error::BadContentLength => f.write_str("bad Content-Length"),
             Error::BodyTooLarge { len, limit } => {
                 write!(f, "body of {len} bytes exceeds the {limit}-byte limit")
