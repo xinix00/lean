@@ -159,6 +159,34 @@ The server explicitly rejects:
 The Mux has no host routing, `{$}`, escaped routing, path cleaning, automatic
 slash redirects, or complete `net/http.ServeMux` algebra.
 
+### Change rule, filled in: a reader that leaves
+
+1. **Consumer.** Hop (`/v1/events`, log tails, on the host daemon and on
+   HopOS) and Stulp (its SSE stream) each pumped a long response and noticed
+   a departed reader only when a write failed: after the second keepalive at
+   best, never on a stack that does not fail a write to a gone peer
+   (measured 2026-10-02 on a LicheeRV: a closed stream kept its worker and
+   its stream slot for minutes). Spin's WebSockets read the client and are
+   not affected.
+2. **Smallest contract.** `Exchange::reader_gone` is one probe of the read
+   side under `PROBE_TIMEOUT` after `claim_done`: a timeout is a reader that
+   is still there, client bytes are discarded, EOF or any other error is a
+   reader that left. It works on a cooperative connection and on a blocking
+   one (one timed `read`). `Exchange::stream(status, &mut Source)` owns the
+   claim before the head, the head, one flush per `Next::Data`, a `nap` per
+   `Next::Nothing`, and stops at `Next::End` or a departed reader. The
+   `Source` owns its cadence and its keepalive policy.
+3. **Tests.** The probe sees a departure and nothing else (silence and client
+   bytes are not departures); without a watcher it never reports one; the
+   stream flushes each piece, ends chunked at `End`, and returns `Ok` with
+   the source not drained when the reader leaves.
+4. **Decision.** `reader_gone`, `stream`, `Next` and `Source` are KEEP. A
+   relay that reads an external source stays responsible for probing between
+   its own reads, as with any caller-owned `Reader`.
+5. **Hard rejection.** Without `claim_done` before the first write there is no
+   watcher: `reader_gone` is then always `false` and a stream behaves as
+   before. After `hijack` the same.
+
 ## leanhttp client
 
 ### KEEP
@@ -647,6 +675,9 @@ The core stays small only if consumers do not rebuild each seam halfway:
   response headers reach the wire, so the simple rule is to claim it before
   `WriteHeader`, `Write`, or `Flush`;
 - a hijacker uses neither `Done` nor the regular `ResponseWriter`;
+- a long response (SSE, a log tail) goes through `Exchange::stream`, or
+  claims the read side before its head and asks `reader_gone` in its own
+  loop. A write that fails is not how a stream learns that its reader left;
 - a `leanh2` caller chooses HTTP/2 before constructing `Conn` and supplies its
   liveness/deadline policy. The transport permits one concurrent read and write,
   and closing it wakes both. The caller may close or deadline it to initiate a

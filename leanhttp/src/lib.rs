@@ -69,7 +69,7 @@ pub use header::Header;
 pub use io::{AsyncRead, AsyncWrite, Close, Conn, IoError, close, flush, read, write_all};
 pub use mux::{Found, Mux};
 pub use pool::{Client, Pool};
-pub use server::{Exchange, Hijacked, Outcome, Raw, Request, serve};
+pub use server::{Exchange, Hijacked, Next, Outcome, Raw, Request, Source, serve};
 
 /// Leesbuffer per verbinding, en daarmee ook de grens van één headerregel.
 ///
@@ -125,6 +125,16 @@ pub const BODY_TIMEOUT: Duration = Duration::from_secs(5);
 ///
 /// Stilte is een fout; de body wordt dan niet verstuurd.
 pub const EXPECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Hoe lang één sondering van de leeskant door [`Exchange::reader_gone`]
+/// duurt voordat "de lezer is er nog" het antwoord is.
+///
+/// Een lange response (SSE, een log-tail) merkt anders pas aan een
+/// mislukte schrijf dat zijn lezer wegging, en op een stack die een
+/// schrijf naar een weggevallen lezer niet laat falen is dat nooit. Kort,
+/// want de sondering staat in de lus van de stroom; lang genoeg om op een
+/// blokkerende verbinding één `read` met termijn te zijn.
+pub const PROBE_TIMEOUT: Duration = Duration::from_millis(1);
 
 /// Statuscodes die deze crate of zijn gebruikers sturen.
 ///

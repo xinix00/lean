@@ -1393,3 +1393,172 @@ fn recorder() {
         assert!(crate::Request::new("GET", target).is_err(), "{target}");
     }
 }
+
+// ---- reader_gone en stream: een lange response en een lezer die weggaat ----
+
+/// Een bron met een vast script; is het op, dan "niets". Telt de dutjes.
+struct Script {
+    steps: Vec<crate::Next>,
+    naps: u32,
+}
+
+impl crate::Source for Script {
+    async fn next(&mut self) -> crate::Next {
+        if self.steps.is_empty() {
+            crate::Next::Nothing
+        } else {
+            self.steps.remove(0)
+        }
+    }
+
+    async fn nap(&mut self) {
+        self.naps += 1;
+        sleep(Duration::from_millis(500)).await;
+    }
+}
+
+/// Een bron die altijd iets heeft en nooit ophoudt.
+struct Forever {
+    sent: u32,
+}
+
+impl crate::Source for Forever {
+    async fn next(&mut self) -> crate::Next {
+        self.sent += 1;
+        crate::Next::Data(b"data: tik\n\n".to_vec())
+    }
+
+    async fn nap(&mut self) {}
+}
+
+/// Leest tot de server sluit.
+async fn read_rest(c: &mut End) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut buf = [0u8; 256];
+    loop {
+        match read(c, &mut buf).await {
+            Ok(0) | Err(_) => return out,
+            Ok(n) => out.extend_from_slice(&buf[..n]),
+        }
+    }
+}
+
+#[test]
+fn reader_gone_ziet_de_client_vertrekken_en_niets_anders() {
+    let rounds = Rc::new(Cell::new(0u32));
+    let r = rounds.clone();
+    let srv = h!(ex => {
+        ex.claim_done().await?;
+        ex.write(b"hoi\n").await?;
+        ex.flush().await?;
+        while !ex.reader_gone().await {
+            r.set(r.get() + 1);
+            sleep(Duration::from_millis(500)).await;
+        }
+    });
+    block_on(async {
+        let (mut c, s) = pipe();
+        srv(s);
+        write_all(&mut c, b"GET /stream HTTP/1.1\r\nHost: x\r\n\r\n")
+            .await
+            .unwrap();
+        let head = read_head(&mut c).await.unwrap();
+        assert!(head.contains("Connection: close"), "{head}");
+        let mut buf = [0u8; 16];
+        read(&mut c, &mut buf).await.unwrap();
+        // De lezer blijft even stil, stuurt dan iets (geen vertrek), en
+        // gaat daarna pas weg.
+        sleep(Duration::from_secs(2)).await;
+        write_all(&mut c, b"nog hier").await.unwrap();
+        sleep(Duration::from_secs(1)).await;
+        drop(c);
+        sleep(Duration::from_secs(2)).await;
+    });
+    // Drie seconden aanwezig, een ronde per halve seconde: stilte noch
+    // bytes golden als vertrek.
+    assert!((5..=8).contains(&rounds.get()), "{} rondes", rounds.get());
+}
+
+#[test]
+fn reader_gone_zonder_wachter_is_nooit_weg() {
+    let saw = Rc::new(Cell::new(None));
+    let s2 = saw.clone();
+    let srv = h!(ex => {
+        ex.header_mut().set("Content-Length", "2")?;
+        ex.write(b"ok").await?;
+        s2.set(Some(ex.reader_gone().await));
+    });
+    block_on(async {
+        let (mut c, s) = pipe();
+        srv(s);
+        write_all(&mut c, GET_CLOSE.as_bytes()).await.unwrap();
+        drop(c);
+        sleep(Duration::from_secs(1)).await;
+    });
+    assert_eq!(saw.get(), Some(false));
+}
+
+#[test]
+fn stream_pompt_elk_stuk_meteen_tot_het_einde() {
+    let naps = Rc::new(Cell::new(0u32));
+    let n = naps.clone();
+    let srv = h!(ex => {
+        ex.header_mut().set("Content-Type", "text/event-stream")?;
+        let mut src = Script {
+            steps: vec![
+                crate::Next::Data(b"data: 1\n\n".to_vec()),
+                crate::Next::Nothing,
+                crate::Next::Data(b"data: 2\n\n".to_vec()),
+                crate::Next::End,
+            ],
+            naps: 0,
+        };
+        ex.stream(200, &mut src).await?;
+        n.set(src.naps);
+    });
+    block_on(async {
+        let (mut c, s) = pipe();
+        srv(s);
+        write_all(&mut c, b"GET /events HTTP/1.1\r\nHost: x\r\n\r\n")
+            .await
+            .unwrap();
+        let head = read_head(&mut c).await.unwrap();
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+        assert!(head.contains("Connection: close"), "{head}");
+        assert!(head.contains("text/event-stream"), "{head}");
+        assert!(head.contains("Transfer-Encoding: chunked"), "{head}");
+        let body = String::from_utf8(read_rest(&mut c).await).unwrap();
+        let one = body.find("data: 1\n\n").expect("eerste stuk");
+        assert!(body[one..].contains("data: 2\n\n"), "{body}");
+        // Het einde van de bron sluit de stroom netjes af.
+        assert!(body.ends_with("0\r\n\r\n"), "{body}");
+    });
+    assert_eq!(naps.get(), 1);
+}
+
+#[test]
+fn stream_stopt_zodra_de_lezer_weggaat() {
+    let outcome = Rc::new(Cell::new(None));
+    let o = outcome.clone();
+    let srv = h!(ex => {
+        let mut src = Forever { sent: 0 };
+        let r = ex.stream(200, &mut src).await;
+        o.set(Some((r.is_ok(), src.sent)));
+    });
+    block_on(async {
+        let (mut c, s) = pipe();
+        srv(s);
+        write_all(&mut c, b"GET /events HTTP/1.1\r\nHost: x\r\n\r\n")
+            .await
+            .unwrap();
+        read_head(&mut c).await.unwrap();
+        let mut buf = [0u8; 64];
+        read(&mut c, &mut buf).await.unwrap();
+        drop(c);
+        sleep(Duration::from_secs(1)).await;
+    });
+    let (ok, sent) = outcome.get().expect("de stroom eindigde niet");
+    // Een vertrokken lezer is geen fout, en de bron is niet leeggepompt.
+    assert!(ok);
+    assert!(sent < 100, "{sent} stukken naar een lezer die weg was");
+}

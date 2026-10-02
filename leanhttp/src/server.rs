@@ -17,6 +17,7 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt::Write;
+use core::future::Future;
 use core::task::{Context, Poll};
 use core::time::Duration;
 
@@ -31,8 +32,34 @@ use crate::io::{
 use crate::url::{canonical_path, clean_escapes, percent_decode};
 use crate::{
     AUTO_CHUNK_BYTES, BODY_TIMEOUT, BUF_SIZE, DRAIN_TIMEOUT, IDLE_TIMEOUT, MAX_BODY_BYTES,
-    MAX_HEADER_BYTES, REQUEST_TIMEOUT, WRITE_TIMEOUT,
+    MAX_HEADER_BYTES, PROBE_TIMEOUT, REQUEST_TIMEOUT, WRITE_TIMEOUT,
 };
+
+/// Wat een [`Source`] per beurt aan [`Exchange::stream`] geeft.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Next {
+    /// Bytes voor de lezer; ze gaan meteen de draad op (een flush per stuk).
+    Data(Vec<u8>),
+    /// Nu niets; de stroom sondeert de lezer en wacht ([`Source::nap`]).
+    Nothing,
+    /// De bron is af; de stroom eindigt en de verbinding gaat dicht.
+    End,
+}
+
+/// De bron van een lange response voor [`Exchange::stream`]: wat er te
+/// schrijven is, en hoe lang te wachten als dat niets is.
+///
+/// De bron bezit zijn cadans en zijn keepalive-beleid: wil hij een lezer
+/// achter een proxy wakker houden, dan geeft hij zelf een commentaarregel
+/// (`: keepalive\n\n`) als [`Next::Data`]. De stroom bezit de rest: de
+/// leeskant claimen vóór de kop, de kop, de schrijf per stuk, en stoppen
+/// zodra de bron af is of de lezer wegging.
+pub trait Source {
+    /// Het volgende stuk, nu niets, of het einde.
+    fn next(&mut self) -> impl Future<Output = Next>;
+    /// Wacht tot er weer iets kan zijn, na een [`Next::Nothing`].
+    fn nap(&mut self) -> impl Future<Output = ()>;
+}
 
 /// Eén binnenkomend verzoek, zonder de body: die leest de handler via
 /// [`Exchange::read_body`].
@@ -755,6 +782,70 @@ impl<'c, C: Conn> Exchange<'c, C> {
                     self.wire.rbuf.consume(n);
                 }
                 _ => return Ok(()),
+            }
+        }
+    }
+
+    /// Of de lezer wegging: een FIN, een RST of een gesloten verbinding.
+    ///
+    /// Eén sondering van de leeskant met [`PROBE_TIMEOUT`]: een termijn die
+    /// verloopt is een lezer die er nog is, bytes van de client worden
+    /// verworpen (de leeskant is van de wachter), einde of een andere fout
+    /// is een lezer die weg is. Zo werkt dit op een coöperatieve verbinding
+    /// én op een blokkerende (één `read` met termijn), en kan een lange
+    /// response in zijn eigen lus kijken zonder `select`.
+    ///
+    /// Heeft de leeskant geen wachter ([`Exchange::claim_done`] vóór de
+    /// eerste schrijf), dan is de lezer nooit weg en merkt een stroom hem
+    /// pas aan een mislukte schrijf. Na een [`Exchange::hijack`] evenmin.
+    pub async fn reader_gone(&mut self) -> bool {
+        if !self.wire.watched || self.wire.hijacked {
+            return false;
+        }
+        self.wire.set_read_timeout(Some(PROBE_TIMEOUT));
+        let probe = self.wire.rbuf.fill_some(&mut self.wire.conn).await;
+        self.wire.set_read_timeout(None);
+        match probe {
+            Ok(true) => {
+                let n = self.wire.rbuf.buffered().len();
+                self.wire.rbuf.consume(n);
+                false
+            }
+            Ok(false) => true,
+            Err(Error::Io(IoError::TimedOut)) => false,
+            Err(_) => true,
+        }
+    }
+
+    /// Een lange response uit `src`: de kop met `status`, dan elk stuk
+    /// meteen de draad op, tot de bron af is of de lezer wegging.
+    ///
+    /// De naad voor SSE en een log-tail. De leeskant is geclaimd vóór de
+    /// kop (zie [`Exchange::claim_done`]; het antwoord zegt `Connection:
+    /// close`), zodat [`Exchange::reader_gone`] elke beurt kan kijken; de
+    /// headers zet de aanroeper vooraf met [`Exchange::header_mut`]. Zonder
+    /// `Content-Length` gaat de body chunked. Een lezer die wegging is geen
+    /// fout: de stroom eindigt met `Ok(())` en de verbinding gaat dicht.
+    ///
+    /// Waarom hier en niet bij elke gebruiker: een stroom die zijn lezer
+    /// alleen aan een mislukte schrijf merkt, houdt zijn werker vast tot de
+    /// tweede keepalive, of voorgoed op een stack die zo'n schrijf niet laat
+    /// falen. Drie gebruikers bouwden die naad halverwege na.
+    pub async fn stream<S: Source>(&mut self, status: u16, src: &mut S) -> Result {
+        self.claim_done().await?;
+        self.write_header(status)?;
+        self.flush().await?;
+        loop {
+            if self.reader_gone().await {
+                return Ok(());
+            }
+            match src.next().await {
+                Next::Data(bytes) => {
+                    self.write(&bytes).await?;
+                    self.flush().await?;
+                }
+                Next::Nothing => src.nap().await,
+                Next::End => return Ok(()),
             }
         }
     }
