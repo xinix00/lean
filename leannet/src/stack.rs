@@ -552,6 +552,56 @@ impl Stack {
         self.notify();
     }
 
+    // ---- de tabel voor wie doorstuurt ----
+
+    /// De MAC van de next-hop naar `dst`, uit dezelfde tabel als de eigen
+    /// verbindingen, voor een eigenaar die frames doorstuurt (Linux heeft één
+    /// neighbour-tabel, ook voor forwarding): de gateway buiten het subnet,
+    /// anders `dst` zelf. Onbekend is `None` en start één ontdubbelde vraag,
+    /// die [`Stack::poll_transmit`] verstuurt.
+    pub fn neighbor(&mut self, dst: [u8; 4], now: u64) -> Option<[u8; 6]> {
+        if self.closed {
+            return None;
+        }
+        let mac = self.route(dst, now, true);
+        if mac.is_none() {
+            self.notify();
+        }
+        mac
+    }
+
+    /// Twijfel aan de bekende next-hop van `dst`: één broadcast-vraag,
+    /// hoogstens één per seconde, en de MAC blijft gelden tot het antwoord
+    /// hem ververst (Linux: `NUD_PROBE`). Een buur of gateway die stil van
+    /// MAC wisselde, is zo terug op het eerste antwoord in plaats van pas na
+    /// het verloop.
+    pub fn probe_neighbor(&mut self, dst: [u8; 4], now: u64) {
+        let (hop, via_arp) = self.next_hop(dst);
+        if self.closed || !via_arp || hop == [0; 4] {
+            return;
+        }
+        self.arp.nt.probe(hop, now);
+        self.notify();
+    }
+
+    /// Een hint uit doorgestuurd verkeer (Linux: `neigh_confirm`): een
+    /// unicast-IPv4-frame aan ons van `src` met bron-MAC `mac` hoorde bij
+    /// een flow van de eigenaar. On-link telt het als eigen verkeer (scheppen
+    /// of verversen, nooit een MAC wisselen); van buiten het subnet kwam het
+    /// door de gateway en ververst het alleen die, met zijn bekende MAC. Zo
+    /// blijft de next-hop van een levende flow vers, en zet een buurman met
+    /// een vreemd bronadres nooit de gateway.
+    pub fn confirm_neighbor(&mut self, src: [u8; 4], mac: [u8; 6], now: u64) {
+        if self.closed {
+            return;
+        }
+        if same_subnet(src, self.cfg.ip, self.cfg.prefix) {
+            self.learn(src, mac, now);
+        } else if self.arp.peek(self.cfg.gw, now) == Some(mac) {
+            self.arp.learn(self.cfg.gw, mac, now);
+        }
+    }
+
     // ---- ingress ----
 
     /// Verwerkt één onvertrouwd Ethernet-frame. Korte, verkeerd geadresseerde

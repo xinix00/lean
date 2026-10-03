@@ -42,9 +42,11 @@ pub(crate) struct NeighborEntry {
     pub(crate) is_static: bool,
     /// Tijd van oplossing, verversing of opgave.
     pub(crate) born: u64,
-    /// Vragen verstuurd terwijl pending.
+    /// Vragen verstuurd terwijl pending; opgelost: 1 = een twijfelvraag
+    /// die nog uit moet ([`NeighborTable::probe`]).
     pub(crate) tries: u8,
-    /// Volgende vraagtijd terwijl pending.
+    /// Volgende vraagtijd terwijl pending; opgelost: de vroegste volgende
+    /// twijfel.
     pub(crate) due: u64,
 }
 
@@ -307,12 +309,31 @@ impl<K: Copy + PartialEq> NeighborTable<K> {
         }
     }
 
+    /// Twijfel aan een opgeloste entry (Linux: `NUD_PROBE`): één vraag,
+    /// hoogstens één per [`NEIGHBOR_RETRY_IVAL`], en de MAC blijft gelden
+    /// tot het antwoord hem ververst of de entry verloopt. `tries` op een
+    /// opgeloste entry is de vraag die [`NeighborTable::poll`] nog stuurt.
+    pub(crate) fn probe(&mut self, key: K, now: u64) {
+        if let Some(e) = self.get_mut(key)
+            && e.state == NeighborState::Resolved
+            && !e.is_static
+            && now >= e.due
+        {
+            e.tries = 1;
+            e.due = now + NEIGHBOR_RETRY_IVAL;
+        }
+    }
+
     /// Voert rijp pending werk uit. Kan meerdere entries opgeven voordat hij
     /// één query teruggeeft voor de protocolspecifieke zender.
     pub(crate) fn poll(&mut self, now: u64) -> (Option<K>, usize) {
         self.sweep_expired(now);
         let mut gave_up = 0;
         for (k, e) in &mut self.entries {
+            if e.state == NeighborState::Resolved && e.tries > 0 {
+                e.tries = 0;
+                return (Some(*k), gave_up);
+            }
             if e.state != NeighborState::Pending || now < e.due {
                 continue;
             }

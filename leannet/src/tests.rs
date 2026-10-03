@@ -6,7 +6,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::arp::{ARP_CACHE_CAP, ArpReply};
-use crate::neighbor::{NeighborEntry, NeighborState};
+use crate::neighbor::{NEIGHBOR_ENTRY_TTL, NeighborEntry, NeighborState};
 use crate::stack::{
     ConnKey, EPHEMERAL_BASE, EPHEMERAL_END, LOOPBACK_MAX, TCP_BACKLOG, TCP_BACKLOG_WAIT_DUR,
     TCP_FLOOR_RING, TCP_FLOOR_RX, TCP_FLOOR_TX, is_broadcast_ip,
@@ -2346,4 +2346,142 @@ fn unacked_reset_en_stack_close() {
         "close stuurde iets"
     );
     assert_eq!(net.a.tcp_unacked(c2), Err(Error::Closed));
+}
+
+// ---- de tabel voor wie doorstuurt (de NAT van HopOS) ----
+
+const FWD_GW: [u8; 4] = [10, 0, 0, 254];
+const FWD_GW_MAC: [u8; 6] = [0xaa, 0xbb, 0xcc, 0, 0, 1];
+const FWD_EXT: [u8; 4] = [93, 184, 216, 34];
+
+/// Stack a met een gateway, zoals de node-stack van HopOS na de lease.
+fn fwd_net() -> Net {
+    Net::single(
+        Config {
+            gw: FWD_GW,
+            ..cfg_a(1 << 20)
+        },
+        7,
+    )
+}
+
+/// Een ARP-frame aan a.
+fn arp_to_a(op: u16, mac: [u8; 6], ip: [u8; 4]) -> Vec<u8> {
+    let mut f = vec![0u8; 60];
+    wire::put_eth(&mut f, MAC_A, mac, wire::ETHERTYPE_ARP).unwrap();
+    wire::put_arp(&mut f[wire::SIZE_ETH..], op, mac, ip, MAC_A, IP_A).unwrap();
+    f
+}
+
+/// De ARP-vragen die a sinds de vorige keer de draad op deed.
+fn fwd_asked(net: &mut Net) -> Vec<[u8; 4]> {
+    net.settle();
+    let asked = net
+        .wire_a
+        .iter()
+        .filter_map(|f| arp_request_target(f))
+        .collect();
+    net.wire_a.clear();
+    asked
+}
+
+/// Wie doorstuurt, put uit dezelfde tabel als de eigen verbindingen: een
+/// bestemming buiten het subnet vraagt de gateway (de eerste Pi 5-boot van
+/// HopOS, 30-09), een onbekende on-link host zichzelf (Altra 14-07), en het
+/// antwoord lost beide op.
+#[test]
+fn doorsturen_vraagt_de_next_hop_uit_dezelfde_tabel() {
+    let mut net = fwd_net();
+    let now = net.now;
+    assert_eq!(net.a.neighbor(FWD_EXT, now), None);
+    assert_eq!(net.a.neighbor(FWD_EXT, now), None, "één vraag, ontdubbeld");
+    assert_eq!(fwd_asked(&mut net), [FWD_GW]);
+    net.a
+        .receive(&arp_to_a(wire::ARP_REPLY, FWD_GW_MAC, FWD_GW), now)
+        .unwrap();
+    assert_eq!(net.a.neighbor(FWD_EXT, now), Some(FWD_GW_MAC));
+    assert_eq!(net.a.neighbor(FWD_GW, now), Some(FWD_GW_MAC));
+
+    let peer = [10, 0, 0, 99];
+    assert_eq!(net.a.neighbor(peer, now), None);
+    assert_eq!(fwd_asked(&mut net), [peer]);
+    net.a
+        .receive(&arp_to_a(wire::ARP_REPLY, MAC_B, peer), now)
+        .unwrap();
+    assert_eq!(net.a.neighbor(peer, now), Some(MAC_B));
+}
+
+/// De vergiftigde gateway van 30-09 (HopOS op de Pi 5: 11 van 14 connects
+/// naar buiten op de deadline): de NAT leerde de gateway uit elk frame met
+/// een bron buiten het subnet. Een hint uit doorgestuurd verkeer zet de
+/// gateway nooit en wisselt geen MAC; met de bekende MAC houdt hij hem vers.
+#[test]
+fn een_hint_uit_verkeer_vergiftigt_de_gateway_niet() {
+    let mut net = fwd_net();
+    let now = net.now;
+    let rogue = [0x02, 0xba, 0xd0, 0, 0, 0x77];
+    net.a.confirm_neighbor(FWD_EXT, rogue, now);
+    net.a.confirm_neighbor([169, 254, 7, 7], rogue, now);
+    assert!(
+        net.a.arp.nt.get(FWD_GW).is_none(),
+        "een hint schiep de gateway"
+    );
+
+    assert_eq!(net.a.neighbor(FWD_EXT, now), None);
+    net.a
+        .receive(&arp_to_a(wire::ARP_REPLY, FWD_GW_MAC, FWD_GW), now)
+        .unwrap();
+    net.a.confirm_neighbor(FWD_EXT, rogue, now + SEC);
+    assert_eq!(net.a.neighbor(FWD_EXT, now + SEC), Some(FWD_GW_MAC));
+
+    // Een levende flow houdt de gateway voorbij zijn verloop vers.
+    let late = now + NEIGHBOR_ENTRY_TTL - SEC;
+    net.a.confirm_neighbor(FWD_EXT, FWD_GW_MAC, late);
+    let later = now + NEIGHBOR_ENTRY_TTL + SEC;
+    assert_eq!(net.a.neighbor(FWD_EXT, later), Some(FWD_GW_MAC));
+    // Zonder hint verloopt hij, en dan vraagt de volgende opnieuw.
+    let gone = late + NEIGHBOR_ENTRY_TTL + SEC;
+    net.now = gone;
+    assert_eq!(net.a.neighbor(FWD_EXT, gone), None);
+    assert_eq!(fwd_asked(&mut net), [FWD_GW]);
+
+    // On-link schept een hint de buur (het antwoord van een slot op een
+    // client in het eigen net hoeft dan niet te vragen), maar hij wisselt
+    // nooit zijn MAC.
+    let peer = [10, 0, 0, 99];
+    net.a.confirm_neighbor(peer, MAC_B, gone);
+    net.a.confirm_neighbor(peer, rogue, gone);
+    assert_eq!(net.a.neighbor(peer, gone), Some(MAC_B));
+}
+
+/// Twijfel (de tweede kale SYN op een doorgestuurde flow): één vraag per
+/// seconde, de bekende MAC blijft gelden, en een gateway die stil van MAC
+/// wisselde is terug op zijn antwoord (de Brother-jacht van 20-08 en de
+/// probe van 31-08 in HopOS).
+#[test]
+fn twijfel_vraagt_zonder_de_mac_los_te_laten() {
+    let mut net = fwd_net();
+    let now = net.now;
+    assert_eq!(net.a.neighbor(FWD_EXT, now), None);
+    net.a
+        .receive(&arp_to_a(wire::ARP_REPLY, FWD_GW_MAC, FWD_GW), now)
+        .unwrap();
+    net.wire_a.clear();
+
+    net.a.probe_neighbor(FWD_EXT, now);
+    net.a.probe_neighbor(FWD_EXT, now + MS);
+    assert_eq!(net.a.neighbor(FWD_EXT, now + MS), Some(FWD_GW_MAC));
+    assert_eq!(fwd_asked(&mut net), [FWD_GW], "één vraag per seconde");
+
+    let moved = [0xaa, 0xbb, 0xcc, 0, 0, 2];
+    net.a
+        .receive(&arp_to_a(wire::ARP_REPLY, moved, FWD_GW), now + 2 * MS)
+        .unwrap();
+    assert_eq!(net.a.neighbor(FWD_EXT, now + 2 * MS), Some(moved));
+
+    net.a.probe_neighbor(FWD_EXT, now + SEC);
+    assert_eq!(fwd_asked(&mut net), [FWD_GW], "na een seconde weer");
+    // Een onbekende next-hop kent geen twijfel: daar loopt de gewone vraag.
+    net.a.probe_neighbor([10, 0, 0, 77], now + SEC);
+    assert!(fwd_asked(&mut net).is_empty());
 }

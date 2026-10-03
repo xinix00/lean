@@ -459,6 +459,15 @@ prove either endpoint dead, so its handle remains caller-owned until `Close`, a
 reset, or bounded retransmission failure. Applications that impose an idle
 session policy must express it with socket deadlines and `Close`.
 
+An owner that forwards frames (the NAT of HopOS) shares the one ARP table
+instead of keeping a second cache (Linux has one neighbour table, and
+forwarding draws from it): `neighbor` gives the next-hop MAC for a destination
+or starts one deduplicated query; `probe_neighbor` asks again for a known next
+hop at most once per second while its MAC stays in use; `confirm_neighbor`
+takes a hint from forwarded unicast traffic, which may create or refresh an
+on-link entry and only refresh the gateway with its known MAC. No hint ever
+changes a MAC; only ARP does.
+
 A live `Stack` owns one sleeping pump until the caller invokes `Stack.Close`;
 that explicit close is the lifecycle boundary. It snapshots ARP/NDP counters,
 releases TCP/UDP budget, and drops dynamic protocol maps, queues, loopback
