@@ -1,8 +1,8 @@
 //! De UDP-poorttabel: binden, afleveren, ophalen, sluiten.
 //!
 //! `bind` reserveert een begrensde wachtrij uit het budget, `deliver` zet een
-//! datagram in de rij en `recv_from` haalt hem eruit; blokkeren en deadlines
-//! zijn van de socketlaag ([`crate::Stack`]). Deze kleine expliciete rij is de
+//! datagram in de rij en `recv_from` haalt hem eruit; het wachten is van de
+//! socketlaag ([`crate::Stack`]). Deze kleine expliciete rij is de
 //! enige reservering vooraf in leannet, en sluiten geeft hem volledig terug.
 //!
 //! De rij is een bytering van records (bron, poort, lengte, payload), dus een
@@ -39,14 +39,8 @@ pub(crate) struct UdpPort<const N: usize = 4> {
     used: usize,
     /// De records.
     q: Ring,
-    /// Het filter van een verbonden socket: alleen deze peer komt binnen.
-    pub(crate) peer: Option<([u8; N], u16)>,
-    /// Datagrammen die vielen omdat de rij vol was of het filter weigerde.
+    /// Datagrammen die vielen omdat de rij vol was.
     pub(crate) cnt_drop: usize,
-    /// Leesdeadline in monotone nanoseconden.
-    pub(crate) rd_deadline: Option<u64>,
-    /// Schrijfdeadline in monotone nanoseconden.
-    pub(crate) wr_deadline: Option<u64>,
     /// Wie wacht op een datagram.
     pub(crate) read_waker: WakerSlot,
     /// Wie wacht op een route voor een datagram.
@@ -129,10 +123,7 @@ impl<const N: usize> UdpTable<N> {
             cap: queue_cap,
             used: 0,
             q,
-            peer: None,
             cnt_drop: 0,
-            rd_deadline: None,
-            wr_deadline: None,
             read_waker: WakerSlot::default(),
             write_waker: WakerSlot::default(),
         };
@@ -166,8 +157,8 @@ impl<const N: usize> UdpTable<N> {
         self.ports.get_mut(i).and_then(Option::as_mut)
     }
 
-    /// Zet een binnenkomend IPv4-datagram in de rij en geeft de plek. `None`
-    /// betekent: geen gebonden poort, gefilterd, of een volle rij.
+    /// Zet een binnenkomend datagram in de rij en geeft de plek. `None`
+    /// betekent: geen gebonden poort, of een volle rij.
     pub(crate) fn deliver(
         &mut self,
         dst_port: u16,
@@ -180,12 +171,6 @@ impl<const N: usize> UdpTable<N> {
             return None;
         };
         let u = self.get_mut(i)?;
-        if u.peer.is_some_and(|p| p != (src, src_port)) {
-            // Filter verbonden sockets vóór de rij, zodat gespoofde afzenders
-            // de rij niet kunnen vullen en de echte peer verdringen.
-            u.cnt_drop += 1;
-            return None;
-        }
         let cost = UDP_DGRAM_OVERHEAD + payload.len();
         let Ok(len) = u16::try_from(payload.len()) else {
             u.cnt_drop += 1;

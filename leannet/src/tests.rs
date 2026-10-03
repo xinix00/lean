@@ -191,12 +191,13 @@ fn stack_tcp_echo_end_to_end() {
 fn stack_udp_roundtrip() {
     let mut net = Net::pair(1 << 20, 1 << 20);
     let srv = net.b().udp_bind(53).unwrap();
-    let cl = net.a.udp_connect(IP_B, 53).unwrap();
+    let cl = net.a.udp_bind(0).unwrap();
+    let to = Endpoint { ip: IP_B, port: 53 };
     let now = net.now;
     // De eerste zending wacht op ARP.
     let mut sent = false;
     net.run_until(3 * SEC, |n| {
-        sent = n.a.udp_send(cl, b"query", n.now).is_ok();
+        sent = n.a.udp_send_to(cl, to, b"query", n.now).is_ok();
         sent
     });
     assert!(sent, "client send never got a route");
@@ -211,8 +212,8 @@ fn stack_udp_roundtrip() {
         n.a.udp_readable(cl).unwrap()
     });
     assert!(ok, "no reply");
-    let k = net.a.udp_recv(cl, &mut buf, now).unwrap();
-    assert_eq!(&buf[..k], b"re:query");
+    let (k, from) = net.a.udp_recv_from(cl, &mut buf, now).unwrap();
+    assert_eq!((&buf[..k], from), (&b"re:query"[..], to));
     assert!(
         net.a.udp_local(cl).unwrap().port >= EPHEMERAL_BASE,
         "client port not in the ephemeral range"
@@ -241,36 +242,6 @@ fn tcp_readable_meldt_data_en_fin_zonder_te_lezen() {
     // Een vreemd handvat is een fout, geen `false`.
     net.a.tcp_close(c, net.now).unwrap();
     assert_eq!(net.a.tcp_readable(c), Err(Error::Closed));
-}
-
-#[test]
-fn stack_read_deadline() {
-    let mut net = Net::pair(1 << 20, 1 << 20);
-    let (c, _, _) = connected(&mut net, 81);
-    let start = net.now;
-    net.a
-        .tcp_set_read_deadline(c, Some(start + 150 * MS))
-        .unwrap();
-    let (w, woke) = counting_waker();
-    assert_eq!(
-        net.a.tcp_read(c, &mut [0; 16], net.now),
-        Err(Error::WouldBlock)
-    );
-    net.a.tcp_register_read_waker(c, &w).unwrap();
-    let mut res = Err(Error::WouldBlock);
-    net.run_until(2 * SEC, |n| {
-        if woke.count() == 0 {
-            return false;
-        }
-        res = n.a.tcp_read(c, &mut [0; 16], n.now);
-        res != Err(Error::WouldBlock)
-    });
-    assert_eq!(res, Err(Error::DeadlineExceeded));
-    let elapsed = net.now - start;
-    assert!(
-        (100 * MS..=2 * SEC).contains(&elapsed),
-        "deadline fired after {elapsed} ns"
-    );
 }
 
 #[test]
@@ -641,19 +612,8 @@ fn stack_udp_accessors() {
     let now = net.now;
     let a = &mut net.a;
     let u = a.udp_bind(5555).unwrap();
-    assert_eq!(
-        a.udp_remote(u),
-        Ok(None),
-        "unconnected socket reports a remote address"
-    );
-    assert_eq!(a.udp_send(u, b"x", now), Err(Error::NotConnected));
     assert_eq!(a.udp_local(u).unwrap().port, 5555);
-    a.udp_set_read_deadline(u, Some(now + 10 * MS)).unwrap();
-    assert_eq!(
-        a.udp_recv_from(u, &mut [0; 8], now + 10 * MS),
-        Err(Error::DeadlineExceeded)
-    );
-    a.udp_set_write_deadline(u, None).unwrap();
+    assert_eq!(a.udp_recv_from(u, &mut [0; 8], now), Err(Error::WouldBlock));
     let port0 = Endpoint { ip: IP_B, port: 0 };
     assert_eq!(
         a.udp_send_to(u, port0, b"x", now),
@@ -765,9 +725,13 @@ fn stack_self_dial_refused() {
 fn stack_self_dial_udp() {
     let mut net = Net::pair(1 << 20, 1 << 20);
     let srv = net.a.udp_bind(7002).unwrap();
-    let cl = net.a.udp_connect(IP_A, 7002).unwrap();
+    let cl = net.a.udp_bind(0).unwrap();
     let now = net.now;
-    net.a.udp_send(cl, b"ping", now).unwrap();
+    let to = Endpoint {
+        ip: IP_A,
+        port: 7002,
+    };
+    net.a.udp_send_to(cl, to, b"ping", now).unwrap();
     net.settle();
     let mut buf = [0u8; 256];
     let (k, from) = net.a.udp_recv_from(srv, &mut buf, now).unwrap();
@@ -775,7 +739,7 @@ fn stack_self_dial_udp() {
     reply.extend_from_slice(&buf[..k]);
     net.a.udp_send_to(srv, from, &reply, now).unwrap();
     net.settle();
-    let k = net.a.udp_recv(cl, &mut buf, now).unwrap();
+    let (k, _) = net.a.udp_recv_from(cl, &mut buf, now).unwrap();
     assert_eq!(&buf[..k], b"echo:ping", "udp loopback");
 }
 
@@ -1012,11 +976,12 @@ fn stack_zonder_gateway_faalt_meteen() {
         alloc::format!("{err}").contains("no gateway"),
         "fout zegt niet wat er mis is: {err}"
     );
-    let u = net.a.udp_connect([192, 168, 1, 1], 53).unwrap();
-    net.a
-        .udp_set_write_deadline(u, Some(now + 10 * SEC))
-        .unwrap();
-    let err = net.a.udp_send(u, b"query", now).unwrap_err();
+    let u = net.a.udp_bind(0).unwrap();
+    let to = Endpoint {
+        ip: [192, 168, 1, 1],
+        port: 53,
+    };
+    let err = net.a.udp_send_to(u, to, b"query", now).unwrap_err();
     assert!(
         alloc::format!("{err}").contains("no gateway"),
         "fout zegt niet wat er mis is: {err}"
@@ -1038,32 +1003,6 @@ fn sock_close_deblokkeer_read() {
         "close deblokkeerde de wachtende read niet"
     );
     assert_eq!(net.a.tcp_read(c, &mut [0; 16], net.now), Err(Error::Closed));
-}
-
-#[test]
-fn sock_deadline_raakt_lopende_read() {
-    let mut net = Net::pair(1 << 20, 1 << 20);
-    let (c, _, _) = connected(&mut net, 91);
-    let (w, woke) = counting_waker();
-    assert_eq!(
-        net.a.tcp_read(c, &mut [0; 16], net.now),
-        Err(Error::WouldBlock)
-    );
-    net.a.tcp_register_read_waker(c, &w).unwrap();
-    net.run_for(50 * MS);
-    let before = woke.count();
-    let dl = net.now + 100 * MS;
-    net.a.tcp_set_read_deadline(c, Some(dl)).unwrap();
-    net.a.tcp_register_read_waker(c, &w).unwrap();
-    let ok = net.run_until(2 * SEC, |n| n.now >= dl && woke.count() > before + 1);
-    assert!(
-        ok,
-        "de nieuw gezette deadline bereikte de lopende read niet"
-    );
-    assert_eq!(
-        net.a.tcp_read(c, &mut [0; 16], net.now),
-        Err(Error::DeadlineExceeded)
-    );
 }
 
 #[test]
@@ -1175,9 +1114,6 @@ fn tcp_full_close_deadline_ruimt_end_to_end_op() {
     // wacht dan in persist terwijl de peersocket in read wacht.
     net.a.conn_mut(c.idx).unwrap().tcp.snd_wnd = 0;
     let now = net.now;
-    net.b()
-        .tcp_set_read_deadline(srv, Some(now + 3 * SEC))
-        .unwrap();
     let (w, woke) = counting_waker();
     assert_eq!(
         net.b().tcp_read(srv, &mut [0; 1], now),
@@ -1205,7 +1141,7 @@ fn tcp_full_close_deadline_ruimt_end_to_end_op() {
             net.b().tcp_read(srv, &mut [0; 1], now)
         },
         Err(Error::WouldBlock),
-        "peer-read eindigde vóór de deadline"
+        "peer-read eindigde vóór de RST"
     );
 
     // Een gerichte timernaad: maak de al gezette deadline nu rijp.
@@ -1316,22 +1252,16 @@ fn stack_route_dood_breekt_de_verbinding() {
     net.a.arp.nt.remove(IP_B);
     write_all(&mut net, sa, c, b"de leegte in", SEC);
     let start = net.now;
-    net.a
-        .tcp_set_read_deadline(c, Some(start + 15 * SEC))
-        .unwrap();
     let mut res = Err(Error::WouldBlock);
     net.run_until(15 * SEC, |n| {
         res = n.a.tcp_read(c, &mut [0; 16], n.now);
         res != Err(Error::WouldBlock)
     });
     assert!(
-        res.is_err() && res != Err(Error::DeadlineExceeded),
+        res.is_err() && res != Err(Error::WouldBlock),
         "read gaf {res:?}: de verbinding hoort te breken als de route luid dood is"
     );
-    assert!(
-        net.now - start <= 12 * SEC,
-        "dat is de deadline, niet de route-dood"
-    );
+    assert!(net.now - start <= 12 * SEC, "de route-dood kwam te laat");
 }
 
 #[test]
@@ -1423,32 +1353,6 @@ fn stack_volle_loopback_is_geen_succes() {
         "een volle loopback meldde succes"
     );
     assert_eq!(s.stats.drop_reply_full, drops + 1, "drop niet geteld");
-}
-
-#[test]
-fn sock_deadline_verlengen_en_wissen() {
-    let mut net = Net::pair(1 << 20, 1 << 20);
-    let (c, _, _) = connected(&mut net, 90);
-    net.a
-        .tcp_set_read_deadline(c, Some(net.now + 150 * MS))
-        .unwrap();
-    net.run_for(50 * MS);
-    net.a.tcp_set_read_deadline(c, None).unwrap();
-    net.run_for(400 * MS);
-    assert_eq!(
-        net.a.tcp_read(c, &mut [0; 16], net.now),
-        Err(Error::WouldBlock),
-        "read gaf op een gewiste deadline"
-    );
-    net.a
-        .tcp_set_read_deadline(c, Some(net.now + 50 * MS))
-        .unwrap();
-    net.run_for(50 * MS);
-    assert_eq!(
-        net.a.tcp_read(c, &mut [0; 16], net.now),
-        Err(Error::DeadlineExceeded),
-        "de vervroegde deadline bereikte de read niet"
-    );
 }
 
 #[test]
@@ -1620,27 +1524,6 @@ fn socket_weigert_onzinnige_poort() {
 }
 
 #[test]
-fn connected_udp_filtert_bij_deliver() {
-    let mut net = Net::single(cfg_a(1 << 20), 7);
-    let u = net.a.udp_connect(IP_B, 53).unwrap();
-    let port = net.a.udp_local(u).unwrap().port;
-    let spoofed = (0..1000)
-        .filter(|_| {
-            net.a
-                .udp
-                .deliver(port, [10, 0, 0, 66], 6666, &[0u8; 512])
-                .is_some()
-        })
-        .count();
-    let echt = net.a.udp.deliver(port, IP_B, 53, b"antwoord").is_some();
-    assert_eq!(spoofed, 0, "gespoofde datagrammen kwamen de rij in");
-    assert!(
-        echt,
-        "de echte peer werd verdrongen: het filter zit te laat"
-    );
-}
-
-#[test]
 fn accept_ziet_snelle_sluiter() {
     let mut net = Net::single(cfg_a(1 << 20), 7);
     let l = net.a.tcp_listen(80).unwrap();
@@ -1766,34 +1649,23 @@ fn jumbo_frame_wordt_geweigerd() {
 }
 
 #[test]
-fn read_weigert_na_verstreken_deadline() {
-    let mut net = Net::pair(1 << 20, 1 << 20);
-    let (c, srv, _) = connected(&mut net, 92);
-    write_all(&mut net, sb, srv, b"wachtend", SEC);
-    net.run_for(200 * MS);
-    net.a.tcp_set_read_deadline(c, Some(net.now - SEC)).unwrap();
-    let r = net.a.tcp_read(c, &mut [0; 16], net.now);
-    assert_eq!(
-        r,
-        Err(Error::DeadlineExceeded),
-        "read leverde data ná een verstreken deadline"
-    );
-}
-
-#[test]
 fn udp_schrijver_wordt_gewekt_bij_arp_opgave() {
     let mut net = Net::pair(1 << 20, 1 << 20);
-    let u = net.a.udp_connect([10, 0, 0, 99], 53).unwrap();
+    let u = net.a.udp_bind(0).unwrap();
+    let to = Endpoint {
+        ip: [10, 0, 0, 99],
+        port: 53,
+    };
     let start = net.now;
-    net.a
-        .udp_set_write_deadline(u, Some(start + 30 * SEC))
-        .unwrap();
-    assert_eq!(net.a.udp_send(u, b"hallo", start), Err(Error::WouldBlock));
+    assert_eq!(
+        net.a.udp_send_to(u, to, b"hallo", start),
+        Err(Error::WouldBlock)
+    );
     let (w, woke) = counting_waker();
     let mut res = Err(Error::WouldBlock);
     net.run_until(30 * SEC, |n| {
         if woke.count() > 0 || n.now == start {
-            res = n.a.udp_send(u, b"hallo", n.now);
+            res = n.a.udp_send_to(u, to, b"hallo", n.now);
             if res == Err(Error::WouldBlock) {
                 n.a.udp_register_write_waker(u, &w).unwrap();
             }
@@ -1806,10 +1678,7 @@ fn udp_schrijver_wordt_gewekt_bij_arp_opgave() {
             hop: [10, 0, 0, 99]
         })
     );
-    assert!(
-        net.now - start <= 8 * SEC,
-        "de opgave-wek kwam te laat: de schrijver sliep tot zijn deadline"
-    );
+    assert!(net.now - start <= 8 * SEC, "de opgave-wek kwam te laat");
 }
 
 #[test]
@@ -1823,20 +1692,6 @@ fn socket_close_geeft_rx_direct_terug() {
     assert_eq!(
         net.a.pot.used, 0,
         "a's pot draagt nog bytes na de volle close"
-    );
-}
-
-#[test]
-fn connected_udp_weigert_write_to() {
-    let mut net = Net::pair(1 << 20, 1 << 20);
-    let u = net.a.udp_connect(IP_B, 53).unwrap();
-    let to = Endpoint {
-        ip: [10, 0, 0, 3],
-        port: 53,
-    };
-    assert_eq!(
-        net.a.udp_send_to(u, to, b"x", net.now),
-        Err(Error::WriteToConnected)
     );
 }
 

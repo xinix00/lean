@@ -47,7 +47,8 @@
 //!
 //! Alle tijd is monotone nanoseconden (`u64`) die de aanroeper levert, nooit
 //! wandtijd: SNTP die de klok verzet mag geen hertransmissie meteen of nooit
-//! laten vuren. Deadlines van sockets zijn absolute tijdstippen in dezelfde klok.
+//! laten vuren. De deadline van een dial is een absoluut tijdstip in dezelfde
+//! klok; andere I/O-deadlines zijn van de klok van de aanroeper.
 //!
 //! # Sockets
 //!
@@ -143,9 +144,10 @@
 //!
 //! # Niet in deze crate
 //!
-//! De opt-in IPv6-baan draagt UDP/ICMPv6/NDP/SLAAC en PIO/RIO-routes voor
-//! Matter/Thread. TCPv6, fragmentatie en extensieheaders blijven buiten het profiel.
-//! Zonder IPv6-socket of groepsjoin blijft IPv6 stille LAN-ruis. De TamaGo-`net.SocketFunc`-naad
+//! De IPv6-baan (de feature `ipv6`, standaard uit) draagt UDP/ICMPv6/NDP/SLAAC
+//! en PIO/RIO-routes voor Matter/Thread. TCPv6, fragmentatie en extensieheaders
+//! blijven buiten het profiel. Zonder de feature, of zonder IPv6-socket of
+//! groepsjoin, blijft IPv6 stille LAN-ruis. De TamaGo-`net.SocketFunc`-naad
 //! bestaat niet in Rust; de handvat-API hierboven vervangt hem.
 
 #![cfg_attr(not(test), no_std)]
@@ -165,6 +167,7 @@ extern crate alloc;
 mod arp;
 mod error;
 mod icmp;
+#[cfg(feature = "ipv6")]
 mod ipv6;
 mod multicast;
 mod neighbor;
@@ -176,6 +179,7 @@ mod tcp;
 mod udp;
 mod waker;
 pub mod wire;
+#[cfg(feature = "ipv6")]
 pub mod wire6;
 
 #[cfg(test)]
@@ -184,6 +188,7 @@ mod testnet;
 mod tests;
 
 pub use error::{Error, Result};
+#[cfg(feature = "ipv6")]
 pub use ipv6::{Endpoint6, NdpStats, Udp6Handle};
 pub use socket::{Endpoint, UDP_MAX_PAYLOAD};
 pub use stack::{

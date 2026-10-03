@@ -15,7 +15,7 @@ crates it joins and nothing else.
 | `leanrand` | Random for a node: bytes, an id, a bounded number, jitter on a wait. |
 | `leanelf` | ELF64 for a loader: PT_LOAD segments, bytes at a load address, symbols by name. |
 | `leandhcp` | DHCPv4 on raw ethernet frames: a lease before any netstack exists. |
-| `leannet` | TCP/IP for bare metal: Ethernet, IPv4 ARP/ICMP/UDP/TCP; opt-in IPv6 UDP/NDP/SLAAC and Thread routes, one bounded buffer budget. |
+| `leannet` | TCP/IP for bare metal: Ethernet, IPv4 ARP/ICMP/UDP/TCP; IPv6 UDP/NDP/SLAAC and Thread routes behind the feature `ipv6`, one bounded buffer budget. |
 | `leancookie` | A cookie jar (RFC 6265), host-only by default. |
 | `leanhttp` | HTTP/1.1 without TLS: client and server, sequential keep-alive, chunked responses and request bodies. |
 | `leantls` | TLS 1.3 for a network you own: one version, one suite, a pinned Ed25519 peer or a real chain; client and server (the server leaves the private key with the caller). |

@@ -55,7 +55,7 @@ not as a general capability of this stack. A caller that has a choice uses
 | Mux | method+path, exact/subtree, `{segment}`, `{rest...}`, `GET`→`HEAD`, `404`/`405`+`Allow` | canonical paths or rejection; immutable after start | host routing, `{$}`, escaped/dot routing, slash normalization, net/http compatibility work |
 | HTTP client | outbound HTTP/1.1, inbound 1.0/1.1, GET/HEAD redirects, response framing, deadlines, keep-alive pool | fixed-length streaming upload with a strict Expect decision; compression pass-through | request chunking, automatic decompression, CONNECT/upgrade, general retry state machine |
 | TLS/S3 | explicit trust model, SNI per connection, SigV4 and used object operations | TLS as a dialer composition; signed S3 calls never follow redirects | TLS server, silent skip-verify, multipart, streaming SigV4, SigV4a, presigned URLs, IMDS/IAM |
-| leannet | Ethernet; IPv4 ARP/ICMP/UDP/TCP with congestion control (slow start, congestion avoidance, fast retransmit) and link-local multicast; opt-in IPv6 UDP, ICMPv6/NDP, link-scoped multicast, one active SLAAC identity, and expiring PIO/RIO routing; deadlines, close, bounded memory | one IPv4 identity; one derived link-local plus one active SLAAC IPv6 identity; bounded simplified NDP and route state; fixed 1280-byte IPv6 packet ceiling | TCPv6, DHCPv6, extension headers, fragmentation, PMTUD, MLD/IGMP, wider multicast, dual-family sockets, full NUD and multi-address renumbering, timestamps, Nagle, SYN cookies, data-path logging |
+| leannet | Ethernet; IPv4 ARP/ICMP/UDP/TCP with congestion control (slow start, congestion avoidance, fast retransmit) and link-local multicast; opt-in IPv6 UDP, ICMPv6/NDP, link-scoped multicast, one active SLAAC identity, and expiring PIO/RIO routing; dial deadlines, close, bounded memory | one IPv4 identity; one derived link-local plus one active SLAAC IPv6 identity; bounded simplified NDP and route state; fixed 1280-byte IPv6 packet ceiling | TCPv6, DHCPv6, extension headers, fragmentation, PMTUD, MLD/IGMP, wider multicast, dual-family sockets, per-socket I/O deadlines, connected UDP, full NUD and multi-address renumbering, timestamps, Nagle, SYN cookies, data-path logging |
 
 The table is a summary; the boundaries below are normative.
 
@@ -373,13 +373,14 @@ IPv4 multicast MUST:
   concern.
 
 The IPv6 lane exists for one concrete path: Matter discovery and UDP traffic
-to a device ULA behind a Thread border router. It remains absent until the
-first IPv6 UDP socket or `JoinGroup6`; a v4-only stack pays no IPv6 state or
-timers.
+to a device ULA behind a Thread border router. It is the Cargo feature `ipv6`
+of leannet, off by default: a build without it carries no IPv6 code. With it,
+the lane remains absent until the first IPv6 UDP socket or `JoinGroup6`; a
+v4-only stack pays no IPv6 state or timers.
 
 The IPv6 lane MUST:
 
-- provide UDP through `AF_INET6`, `ListenUDP6`, and `DialUDP6`; sockets are
+- provide UDP through `AF_INET6` and `ListenUDP6`; sockets are
   wildcard-bound and v6-only, so a non-wildcard local address and an
   IPv4-mapped address fail loudly, while TCPv6 remains unsupported;
 - own one EUI-64 link-local address and at most one active SLAAC address from
@@ -418,7 +419,7 @@ The IPv6 lane MUST:
   SLAAC address is the only supported local loopback destination;
 - fail immediately when no usable source or route exists, fail after bounded
   NDP resolution when a neighbor is unreachable, and wake blocked operations
-  on resolution, failure, deadline, or close;
+  on resolution, failure, or close;
 - accept only unicast frames addressed to this interface's MAC and multicast
   frames addressed to the exact `33:33` mapping of an implicit or joined IPv6
   group.
@@ -433,7 +434,8 @@ The transport core MUST:
 - validate cumulative ACKs against bytes actually sent, including during a
   retransmission rewind;
 - return reset as an error, not EOF;
-- drive blocked I/O through wakeups and deadlines and unblock it on `Close`;
+- drive blocked I/O through wakeups, bound a dial by its deadline, and
+  unblock blocked I/O on `Close`; any other I/O deadline is the caller's clock;
 - use monotonic time exclusively for protocol timers;
 - perform ARP and NDP abandonment in the pump, fail loudly, and wake all
   waiters;
@@ -457,7 +459,7 @@ listener permanently refuse healthy handshakes.
 An open ESTABLISHED socket has no arbitrary idle reaper: silence alone does not
 prove either endpoint dead, so its handle remains caller-owned until `Close`, a
 reset, or bounded retransmission failure. Applications that impose an idle
-session policy must express it with socket deadlines and `Close`.
+session policy must express it with their own clock and `Close`.
 
 An owner that forwards frames (the NAT of HopOS) shares the one ARP table
 instead of keeping a second cache (Linux has one neighbour table, and

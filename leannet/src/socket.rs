@@ -5,10 +5,10 @@
 //! call synchroon en blokkeert nooit: "nog niet" is [`Error::WouldBlock`], en
 //! wie wil wachten registreert een waker op het handvat en probeert opnieuw
 //! als hij gewekt wordt. Een kleine wrapper elders maakt daar een `Future`
-//! van. De semantiek volgt `net.Conn` verder precies:
+//! van, met zijn eigen klok: deadlines per handvat zijn van de aanroeper,
+//! alleen de dial heeft er een ([`Stack::tcp_connect`]). De semantiek volgt
+//! `net.Conn` verder precies:
 //!
-//! - een verstreken deadline weigert ook klare I/O ([`Error::DeadlineExceeded`]);
-//! - een gesloten handvat gaat vóór een verstreken deadline ([`Error::Closed`]);
 //! - een lege leesbuffer keert meteen terug met `Ok(0)`;
 //! - EOF na de FIN van de peer is `Ok(0)` bij een niet-lege buffer, een reset
 //!   is [`Error::Reset`] en nooit EOF;
@@ -315,11 +315,6 @@ impl Stack {
             // `net.Conn` eist dat een lege read meteen terugkeert.
             return Ok(0);
         }
-        if c.rd_deadline.is_some_and(|d| now >= d) {
-            // Een verstreken deadline weigert ook klare I/O; anders zou een late
-            // read nog wachtende data verbruiken.
-            return Err(Error::DeadlineExceeded);
-        }
         match c.tcp.read(buf) {
             Ok(0) => Err(Error::WouldBlock),
             Ok(n) => {
@@ -360,9 +355,6 @@ impl Stack {
             .and_then(Option::as_mut)
             .filter(|c| c.generation == h.generation && c.app_owned)
             .ok_or(Error::Closed)?;
-        if c.wr_deadline.is_some_and(|d| now >= d) {
-            return Err(Error::DeadlineExceeded);
-        }
         let n = c.tcp.write(data, pot)?;
         if n > 0 {
             c.tcp.touch_close_wait(now);
@@ -443,30 +435,7 @@ impl Stack {
         })
     }
 
-    /// Zet de leesdeadline (monotone nanoseconden); `None` wist hem. Een
-    /// wachtende lezer wordt gewekt om de nieuwe deadline te zien.
-    pub fn tcp_set_read_deadline(&mut self, h: TcpHandle, deadline: Option<u64>) -> Result {
-        let c = self.sock(h)?;
-        c.rd_deadline = deadline;
-        c.read_waker.wake();
-        Ok(())
-    }
-
-    /// Zet de schrijfdeadline; `None` wist hem.
-    pub fn tcp_set_write_deadline(&mut self, h: TcpHandle, deadline: Option<u64>) -> Result {
-        let c = self.sock(h)?;
-        c.wr_deadline = deadline;
-        c.write_waker.wake();
-        Ok(())
-    }
-
-    /// Zet beide deadlines.
-    pub fn tcp_set_deadline(&mut self, h: TcpHandle, deadline: Option<u64>) -> Result {
-        self.tcp_set_read_deadline(h, deadline)?;
-        self.tcp_set_write_deadline(h, deadline)
-    }
-
-    /// Registreert wie op leesbare data (of EOF, reset, close, deadline) wacht.
+    /// Registreert wie op leesbare data (of EOF, reset, close) wacht.
     pub fn tcp_register_read_waker(&mut self, h: TcpHandle, w: &Waker) -> Result {
         self.sock(h)?.read_waker.register(w);
         Ok(())
@@ -476,8 +445,8 @@ impl Stack {
     /// bevestiging wacht.
     ///
     /// De waker gaat af bij elk segment dat de verbinding binnenkrijgt (dus
-    /// bij elke ACK, ook een die niets vrijgeeft), bij een deadline, en als de
-    /// stack de verbinding opruimt. Daarmee is hij ook de waker voor een flush
+    /// bij elke ACK, ook een die niets vrijgeeft), bij de dial-deadline, en als
+    /// de stack de verbinding opruimt. Daarmee is hij ook de waker voor een flush
     /// op [`Stack::tcp_unacked`]: registreren, opnieuw kijken, wachten. Een
     /// wek is een reden om te kijken, geen belofte van voortgang.
     ///
@@ -546,17 +515,6 @@ impl Stack {
         Ok(UdpHandle { idx, generation })
     }
 
-    /// Bindt een efemere poort aan één peer voor `udp_send` en `udp_recv`.
-    /// Datagrammen van anderen komen de rij niet in.
-    pub fn udp_connect(&mut self, ip: [u8; 4], port: u16) -> Result<UdpHandle> {
-        if port == 0 {
-            return Err(Error::InvalidPort);
-        }
-        let h = self.udp_bind(0)?;
-        self.udp_port(h)?.peer = Some((ip, port));
-        Ok(h)
-    }
-
     /// De lokale poort.
     pub fn udp_local(&mut self, h: UdpHandle) -> Result<Endpoint> {
         let ip = self.cfg.ip;
@@ -564,33 +522,17 @@ impl Stack {
         Ok(Endpoint { ip, port })
     }
 
-    /// De peer van een verbonden socket, of `None`.
-    pub fn udp_remote(&mut self, h: UdpHandle) -> Result<Option<Endpoint>> {
-        Ok(self
-            .udp_port(h)?
-            .peer
-            .map(|(ip, port)| Endpoint { ip, port }))
-    }
-
     /// Haalt het oudste datagram op: lengte en afzender. Is `buf` te klein,
-    /// dan valt de rest weg (UDP-semantiek).
+    /// dan valt de rest weg (UDP-semantiek). `_now` houdt de vorm van de
+    /// andere calls; een UDP-read kent geen klok.
     pub fn udp_recv_from(
         &mut self,
         h: UdpHandle,
         buf: &mut [u8],
-        now: u64,
+        _now: u64,
     ) -> Result<(usize, Endpoint)> {
-        let u = self.udp_port(h)?;
-        if u.rd_deadline.is_some_and(|d| now >= d) {
-            return Err(Error::DeadlineExceeded);
-        }
-        let (n, ip, port) = u.recv_from(buf).ok_or(Error::WouldBlock)?;
+        let (n, ip, port) = self.udp_port(h)?.recv_from(buf).ok_or(Error::WouldBlock)?;
         Ok((n, Endpoint { ip, port }))
-    }
-
-    /// Leest van een verbonden socket.
-    pub fn udp_recv(&mut self, h: UdpHandle, buf: &mut [u8], now: u64) -> Result<usize> {
-        self.udp_recv_from(h, buf, now).map(|(n, _)| n)
     }
 
     /// Of er een datagram klaarligt.
@@ -608,33 +550,7 @@ impl Stack {
         data: &[u8],
         now: u64,
     ) -> Result<usize> {
-        let u = self.udp_port(h)?;
-        if u.peer.is_some() {
-            // Een verbonden UDP-socket schrijft alleen naar zijn peer.
-            return Err(Error::WriteToConnected);
-        }
-        self.udp_send_inner(h, to, data, now)
-    }
-
-    /// Verstuurt één datagram naar de peer van een verbonden socket.
-    pub fn udp_send(&mut self, h: UdpHandle, data: &[u8], now: u64) -> Result<usize> {
-        let (ip, port) = self.udp_port(h)?.peer.ok_or(Error::NotConnected)?;
-        self.udp_send_inner(h, Endpoint { ip, port }, data, now)
-    }
-
-    /// Het gedeelde zendpad.
-    fn udp_send_inner(
-        &mut self,
-        h: UdpHandle,
-        to: Endpoint,
-        data: &[u8],
-        now: u64,
-    ) -> Result<usize> {
-        let u = self.udp_port(h)?;
-        let sport = u.port;
-        if u.wr_deadline.is_some_and(|d| now >= d) {
-            return Err(Error::DeadlineExceeded);
-        }
+        let sport = self.udp_port(h)?.port;
         if to.port == 0 {
             return Err(Error::InvalidPort);
         }
@@ -682,28 +598,6 @@ impl Stack {
             u.write_waker.wake();
         }
         self.notify();
-    }
-
-    /// Zet de leesdeadline; `None` wist hem.
-    pub fn udp_set_read_deadline(&mut self, h: UdpHandle, deadline: Option<u64>) -> Result {
-        let u = self.udp_port(h)?;
-        u.rd_deadline = deadline;
-        u.read_waker.wake();
-        Ok(())
-    }
-
-    /// Zet de schrijfdeadline; `None` wist hem.
-    pub fn udp_set_write_deadline(&mut self, h: UdpHandle, deadline: Option<u64>) -> Result {
-        let u = self.udp_port(h)?;
-        u.wr_deadline = deadline;
-        u.write_waker.wake();
-        Ok(())
-    }
-
-    /// Zet beide deadlines.
-    pub fn udp_set_deadline(&mut self, h: UdpHandle, deadline: Option<u64>) -> Result {
-        self.udp_set_read_deadline(h, deadline)?;
-        self.udp_set_write_deadline(h, deadline)
     }
 
     /// Registreert wie op een datagram wacht.

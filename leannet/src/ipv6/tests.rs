@@ -165,7 +165,7 @@ fn multicast_requires_join_and_returns_local_copy() {
     assert_eq!(b.udp6_recv_from(bh, &mut buf, NOW).unwrap().0, 5);
 }
 #[test]
-fn families_rebind_generation_budget_and_deadlines() {
+fn families_rebind_generation_and_budget() {
     let mut s = stack();
     let free = s.budget_free();
     let v4 = s.udp_bind(5353).unwrap();
@@ -176,10 +176,9 @@ fn families_rebind_generation_budget_and_deadlines() {
     assert!(c.count() > 0);
     let again = s.udp6_bind(5353, NOW).unwrap();
     assert_eq!(s.udp6_recv_from(v6, &mut [0; 1], NOW), Err(Error::Closed));
-    s.udp6_set_read_deadline(again, Some(NOW)).unwrap();
     assert_eq!(
         s.udp6_recv_from(again, &mut [0; 1], NOW),
-        Err(Error::DeadlineExceeded)
+        Err(Error::WouldBlock)
     );
     s.udp6_close(again);
     s.udp_close(v4);

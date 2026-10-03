@@ -195,8 +195,6 @@ pub(crate) struct Conn {
     /// De applicatie houdt een handvat vast.
     pub(crate) app_owned: bool,
     pub(crate) dial: Option<Dial>,
-    pub(crate) rd_deadline: Option<u64>,
-    pub(crate) wr_deadline: Option<u64>,
     pub(crate) read_waker: WakerSlot,
     pub(crate) write_waker: WakerSlot,
 }
@@ -268,7 +266,9 @@ pub struct Stack {
     pub(crate) conns: Vec<Option<Conn>>,
     pub(crate) listeners: Vec<Option<Listener>>,
     pub(crate) udp: UdpTable,
+    #[cfg(feature = "ipv6")]
     pub(crate) v6: Option<crate::ipv6::State>,
+    #[cfg(feature = "ipv6")]
     pub(crate) ndp_closed: crate::NdpStats,
     /// Verbindingsloze antwoorden: `[dst 4][proto 1][IP-payload]`.
     pub(crate) out: RecordQueue,
@@ -356,7 +356,9 @@ impl Stack {
             conns: Vec::new(),
             listeners: Vec::new(),
             udp: UdpTable::new(),
+            #[cfg(feature = "ipv6")]
             v6: None,
+            #[cfg(feature = "ipv6")]
             ndp_closed: crate::NdpStats::default(),
             out: RecordQueue::new(OUT_QUEUE_CAP, OUT_QUEUE_CAP * 256 + 2 * frame),
             udp_out: RecordQueue::new(
@@ -467,12 +469,15 @@ impl Stack {
                 u.write_waker.wake();
             }
         }
-        self.ndp_closed = self.ndp_stats();
-        if let Some(mut v) = self.v6.take() {
-            for i in 0..v.udp.ports.len() {
-                if let Some(mut u) = v.udp.close(i, &mut self.pot) {
-                    u.read_waker.wake();
-                    u.write_waker.wake();
+        #[cfg(feature = "ipv6")]
+        {
+            self.ndp_closed = self.ndp_stats();
+            if let Some(mut v) = self.v6.take() {
+                for i in 0..v.udp.ports.len() {
+                    if let Some(mut u) = v.udp.close(i, &mut self.pot) {
+                        u.read_waker.wake();
+                        u.write_waker.wake();
+                    }
                 }
             }
         }
@@ -665,6 +670,7 @@ impl Stack {
                     _ => self.stats.drop_bad_frame += 1,
                 }
             }
+            #[cfg(feature = "ipv6")]
             wire::ETHERTYPE_IPV6 => {
                 if let Some(v) = &mut self.v6 {
                     match crate::wire6::parse(eth.payload()) {
@@ -730,7 +736,6 @@ impl Stack {
                     }
                 };
                 self.learn(src, src_mac, now);
-                // Verbonden UDP deelt de poorttabel; `deliver` past het filter toe.
                 match self
                     .udp
                     .deliver(f.dst_port(), src, f.src_port(), f.payload())
@@ -1045,8 +1050,6 @@ impl Stack {
             live: true,
             app_owned: false,
             dial: None,
-            rd_deadline: None,
-            wr_deadline: None,
             read_waker: WakerSlot::default(),
             write_waker: WakerSlot::default(),
         };
@@ -1149,6 +1152,7 @@ impl Stack {
         if let Some(n) = self.udp_out.pop(frame) {
             if self.udp_out_waiters {
                 self.udp_out_waiters = false;
+                #[cfg(feature = "ipv6")]
                 if let Some(v) = &mut self.v6 {
                     for u in v.udp.ports.iter_mut().flatten() {
                         u.write_waker.wake();
@@ -1163,6 +1167,7 @@ impl Stack {
         if let Some(n) = self.drain_arp(now, frame) {
             return Some(n);
         }
+        #[cfg(feature = "ipv6")]
         if let Some(v) = &mut self.v6
             && let Some(n) = v.emit(now, frame)
         {
@@ -1253,27 +1258,16 @@ impl Stack {
         None
     }
 
-    /// Onderhoud vóór het zenden: socketdeadlines wekken, eigenaarloze en
+    /// Onderhoud vóór het zenden: verlopen dials wekken, eigenaarloze en
     /// verlopen verbindingen opruimen, en verbindingen zonder route afbreken.
     fn maintain(&mut self, now: u64) {
+        #[cfg(feature = "ipv6")]
         if let Some(v) = &mut self.v6 {
-            v.tick(now);
+            v.expire(now);
         }
         for c in self.conns.iter_mut().flatten() {
-            if c.rd_deadline.is_some_and(|d| now >= d) {
-                c.read_waker.wake();
-            }
-            let dial_due = c.dial.is_some_and(|d| now >= d.deadline);
-            if dial_due || c.wr_deadline.is_some_and(|d| now >= d) {
+            if c.dial.is_some_and(|d| now >= d.deadline) {
                 c.write_waker.wake();
-            }
-        }
-        for u in self.udp.ports.iter_mut().flatten() {
-            if u.rd_deadline.is_some_and(|d| now >= d) {
-                u.read_waker.wake();
-            }
-            if u.wr_deadline.is_some_and(|d| now >= d) {
-                u.write_waker.wake();
             }
         }
         for i in 0..self.conns.len() {
@@ -1332,14 +1326,9 @@ impl Stack {
                 .dial
                 .map(|d| d.deadline)
                 .filter(|_| c.write_waker.is_set()));
-            add(c.rd_deadline.filter(|_| c.read_waker.is_set()));
-            add(c.wr_deadline.filter(|_| c.write_waker.is_set()));
-        }
-        for u in self.udp.ports.iter().flatten() {
-            add(u.rd_deadline.filter(|_| u.read_waker.is_set()));
-            add(u.wr_deadline.filter(|_| u.write_waker.is_set()));
         }
         add(self.arp.nt.next_deadline());
+        #[cfg(feature = "ipv6")]
         if let Some(v) = &self.v6
             && let Some(t) = v.deadline()
         {
@@ -1490,6 +1479,7 @@ impl Stack {
                 }
             }
         }
+        #[cfg(feature = "ipv6")]
         if ether_type == wire::ETHERTYPE_IPV6 && dst[..2] == [51, 51] {
             let joined = crate::wire6::parse(bytes.get(SIZE_ETH..).unwrap_or(&[]))
                 .is_ok_and(|p| self.v6.as_ref().is_some_and(|v| v.accepts(p.dst)));

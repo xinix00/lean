@@ -7,6 +7,13 @@ license.workspace = true
 repository.workspace = true
 description = "TCP/IP voor bare metal: Ethernet, IPv4 ARP/ICMP/UDP/TCP, een begrensd bufferbudget."
 
+[features]
+default = []
+# De IPv6-baan (src/ipv6.rs, src/wire6.rs): UDP, ICMPv6, NDP, SLAAC en de
+# PIO/RIO-routes voor Matter/Thread. Standaard uit: een stack zonder
+# IPv6-socket betaalt dan ook geen code. Wie `enable_ipv6` roept, zet hem aan.
+ipv6 = []
+
 [dependencies]
 
 [lints]

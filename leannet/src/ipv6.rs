@@ -281,30 +281,7 @@ impl State {
         for r in self.routes.iter().flatten() {
             add(r.until);
         }
-        for u in self.udp.ports.iter().flatten() {
-            if u.read_waker.is_set()
-                && let Some(t) = u.rd_deadline
-            {
-                add(t);
-            }
-            if u.write_waker.is_set()
-                && let Some(t) = u.wr_deadline
-            {
-                add(t);
-            }
-        }
         d
-    }
-    pub(crate) fn tick(&mut self, now: u64) {
-        self.expire(now);
-        for u in self.udp.ports.iter_mut().flatten() {
-            if u.rd_deadline.is_some_and(|t| now >= t) {
-                u.read_waker.wake();
-            }
-            if u.wr_deadline.is_some_and(|t| now >= t) {
-                u.write_waker.wake();
-            }
-        }
     }
     fn queue_icmp(&mut self, mac: [u8; 6], src: [u8; 16], dst: [u8; 16], hop: u8, p: &[u8]) {
         let mut head = [0; 54];
@@ -754,41 +731,21 @@ impl Stack {
         let ip = [0; 16];
         Ok(Endpoint6 { ip, port })
     }
-    /// Verbindt een IPv6-socket aan één peer en filtert andere afzenders voor de rij.
-    pub fn udp6_connect(&mut self, to: Endpoint6, now: u64) -> Result<Udp6Handle> {
-        if to.port == 0 {
-            return Err(Error::InvalidPort);
-        }
-        if !w::is_unicast(to.ip) && !w::is_link_group(to.ip) {
-            return Err(Error::InvalidIpv6);
-        }
-        let h = self.udp6_bind(0, now)?;
-        self.udp6_port(h)?.peer = Some((to.ip, to.port));
-        Ok(h)
-    }
     /// Ontvangt één volledig record; een korte buffer kapt uitsluitend dat record af.
+    /// `_now` houdt de vorm van de IPv4-tegenhanger.
     pub fn udp6_recv_from(
         &mut self,
         h: Udp6Handle,
         buf: &mut [u8],
-        now: u64,
+        _now: u64,
     ) -> Result<(usize, Endpoint6)> {
-        let u = self.udp6_port(h)?;
-        if u.rd_deadline.is_some_and(|d| now >= d) {
-            return Err(Error::DeadlineExceeded);
-        }
-        let (n, ip, port) = u.recv_from(buf).ok_or(Error::WouldBlock)?;
+        let (n, ip, port) = self.udp6_port(h)?.recv_from(buf).ok_or(Error::WouldBlock)?;
         Ok((n, Endpoint6 { ip, port }))
     }
     /// Of er een datagram klaarligt; verbruikt niets (de IPv6-tegenhanger
     /// van [`Stack::udp_readable`](crate::Stack::udp_readable)).
     pub fn udp6_readable(&mut self, h: Udp6Handle) -> Result<bool> {
         Ok(self.udp6_port(h)?.has_data())
-    }
-    /// Stuurt naar de vastgelegde peer.
-    pub fn udp6_send(&mut self, h: Udp6Handle, data: &[u8], now: u64) -> Result<usize> {
-        let (ip, port) = self.udp6_port(h)?.peer.ok_or(Error::NotConnected)?;
-        self.udp6_write(h, Endpoint6 { ip, port }, data, now)
     }
     /// Stuurt één datagram; NDP-wachten en volle zendrijen geven WouldBlock.
     pub fn udp6_send_to(
@@ -798,17 +755,7 @@ impl Stack {
         data: &[u8],
         now: u64,
     ) -> Result<usize> {
-        if self.udp6_port(h)?.peer.is_some() {
-            return Err(Error::WriteToConnected);
-        }
-        self.udp6_write(h, to, data, now)
-    }
-    fn udp6_write(&mut self, h: Udp6Handle, to: Endpoint6, data: &[u8], now: u64) -> Result<usize> {
-        let u = self.udp6_port(h)?;
-        let port = u.port;
-        if u.wr_deadline.is_some_and(|d| now >= d) {
-            return Err(Error::DeadlineExceeded);
-        }
+        let port = self.udp6_port(h)?.port;
         if to.port == 0 {
             return Err(Error::InvalidPort);
         }
@@ -872,20 +819,6 @@ impl Stack {
             u.write_waker.wake();
         }
         self.notify();
-    }
-    /// Zet de absolute leesdeadline.
-    pub fn udp6_set_read_deadline(&mut self, h: Udp6Handle, d: Option<u64>) -> Result {
-        let u = self.udp6_port(h)?;
-        u.rd_deadline = d;
-        u.read_waker.wake();
-        Ok(())
-    }
-    /// Zet de absolute schrijfdeadline.
-    pub fn udp6_set_write_deadline(&mut self, h: Udp6Handle, d: Option<u64>) -> Result {
-        let u = self.udp6_port(h)?;
-        u.wr_deadline = d;
-        u.write_waker.wake();
-        Ok(())
     }
     /// Registreert de lezer zonder verloren wek.
     pub fn udp6_register_read_waker(&mut self, h: Udp6Handle, w: &Waker) -> Result {

@@ -16,10 +16,13 @@ use core::fmt;
 #[non_exhaustive]
 pub enum Error {
     /// Een ongeldig of niet-ondersteund IPv6-pakket/adres.
+    #[cfg(feature = "ipv6")]
     InvalidIpv6,
     /// Geen bruikbare bron of route naar de IPv6-bestemming.
+    #[cfg(feature = "ipv6")]
     NoRoute6,
     /// De IPv6-buur gaf geen antwoord binnen vijf pogingen.
+    #[cfg(feature = "ipv6")]
     Unreachable6,
 
     /// Een frame of header is korter dan zijn vaste deel of zijn lengteveld.
@@ -47,7 +50,7 @@ pub enum Error {
     },
     /// Nog niet klaar: registreer een waker en probeer het opnieuw.
     WouldBlock,
-    /// De deadline van deze operatie is verstreken.
+    /// De deadline van een dial is verstreken ([`crate::Stack::tcp_poll_connect`]).
     DeadlineExceeded,
     /// Het handvat is gesloten of bestaat niet meer.
     Closed,
@@ -128,10 +131,6 @@ pub enum Error {
         /// Maximum.
         max: usize,
     },
-    /// Schrijven zonder bestemming op een niet-verbonden UDP-socket.
-    NotConnected,
-    /// Een verbonden UDP-socket schrijft alleen naar zijn peer.
-    WriteToConnected,
     /// Een seed buiten het subnet zou nooit geraadpleegd worden.
     SeedOffSubnet {
         /// Het geweigerde adres.
@@ -179,8 +178,11 @@ impl fmt::Display for Ip {
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match *self {
+            #[cfg(feature = "ipv6")]
             Self::InvalidIpv6 => write!(f, "invalid or unsupported IPv6 packet/address"),
+            #[cfg(feature = "ipv6")]
             Self::NoRoute6 => write!(f, "no IPv6 route or source address"),
+            #[cfg(feature = "ipv6")]
             Self::Unreachable6 => write!(f, "IPv6 neighbor did not answer"),
             Error::ShortFrame { len, need } => {
                 write!(f, "leannet: frame too short ({len} < {need} bytes)")
@@ -239,10 +241,6 @@ impl fmt::Display for Error {
             }
             Error::DatagramTooLarge { len, max } => {
                 write!(f, "leannet: udp datagram exceeds mtu ({len} > {max} bytes)")
-            }
-            Error::NotConnected => f.write_str("leannet: write on unconnected udp socket"),
-            Error::WriteToConnected => {
-                f.write_str("leannet: use of WriteTo with pre-connected connection")
             }
             Error::SeedOffSubnet { ip } => write!(
                 f,
