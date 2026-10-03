@@ -119,7 +119,7 @@ where
     /// Schrijft de buffer leeg. Elke fout plakt: de teller van het record is
     /// verbruikt en de ciphertext kan half verstuurd zijn, dus een latere
     /// poging kan deze stroom niet veilig hervatten.
-    pub(crate) fn poll_flush(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), ConnError<E>>> {
+    pub fn poll_flush(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), ConnError<E>>> {
         while self.wstart < self.wend {
             if let Some(e) = self.write_err {
                 return Poll::Ready(Err(e.into()));

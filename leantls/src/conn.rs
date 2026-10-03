@@ -37,6 +37,7 @@ pub(crate) const HS_KEY_UPDATE: u8 = 24;
 pub struct Conn<T> {
     /// Het transport.
     pub(crate) io: T,
+    pub(crate) server: bool,
 
     /// Het binnenkomende record: header plus hoogstens [`MAX_CIPHER`].
     pub(crate) rbuf: Vec<u8>,
@@ -91,6 +92,7 @@ impl<T> Conn<T> {
     pub(crate) fn new(io: T) -> Result<Self> {
         Ok(Self {
             io,
+            server: false,
             rbuf: zeroed(HEADER + MAX_CIPHER)?,
             rfill: 0,
             plain: (0, 0),
@@ -120,6 +122,11 @@ impl<T> Conn<T> {
     /// Go-versie gaf `Grown` door).
     pub fn get_ref(&self) -> &T {
         &self.io
+    }
+
+    /// Mutable transport access for deadlines; never bypass TLS to write application bytes.
+    pub fn get_mut(&mut self) -> &mut T {
+        &mut self.io
     }
 
     /// Geeft het transport terug; sleutels en buffers worden gewist en
@@ -196,12 +203,12 @@ where
             let consumed = (end - pos) - r.rest().len();
             match typ {
                 // Hervatting bestaat hier niet, maar tickets sturen mag.
-                HS_NEW_SESSION_TICKET => {}
+                HS_NEW_SESSION_TICKET if !self.server => {}
                 HS_KEY_UPDATE => {
                     // RFC 8446 §4.6.3: vernieuw de leessleutels en antwoord
                     // als daarom gevraagd wordt.
                     let request = body.u8()?;
-                    if request > 1 {
+                    if request > 1 || !body.is_empty() {
                         return Err(Error::KeyUpdateValue(request));
                     }
                     let next = self
@@ -298,7 +305,7 @@ where
     }
 
     /// Schrijft de buffer leeg, als future.
-    pub(crate) async fn flush(&mut self) -> Result<(), ConnError<E>> {
+    pub async fn flush(&mut self) -> Result<(), ConnError<E>> {
         poll_fn(|cx| self.poll_flush(cx)).await
     }
 }

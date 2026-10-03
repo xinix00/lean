@@ -8,7 +8,7 @@
 //!
 //! Wat hij toetst, in deze volgorde:
 //!
-//! 1. de servernaam is een DNS-naam (geen IP-adres) en staat in de
+//! 1. de DNS-naam of het IP-adres staat in de bijbehorende tag van de
 //!    SubjectAltName van het blad, wildcard alleen links (zie `name`);
 //! 2. elk certificaat is strikte DER en het blad heeft een sleutel die hier
 //!    bestaat (P-256, P-384, RSA 2048-4096, Ed25519);
@@ -128,7 +128,7 @@ pub enum X509Error {
     TooManyCertificates(usize),
     /// Meer wortels dan [`MAX_ROOTS`], of geen enkele.
     RootCount(usize),
-    /// De servernaam is een IP-adres.
+    /// Een IP-achtig adres heeft geen geldige binaire vorm.
     IpAddress,
     /// De servernaam is geen geldige DNS-naam.
     ServerName,
@@ -210,9 +210,7 @@ impl fmt::Display for X509Error {
             X509Error::RootCount(n) => {
                 write!(f, "{n} roots; need between 1 and {MAX_ROOTS}")
             }
-            X509Error::IpAddress => {
-                f.write_str("certificate validation against a bare IP address is not supported")
-            }
+            X509Error::IpAddress => f.write_str("invalid IP address in certificate validation"),
             X509Error::ServerName => f.write_str("server name is not a valid DNS name"),
             X509Error::NameMismatch { dns_names } => write!(
                 f,
@@ -408,10 +406,10 @@ impl<'a> ChainVerifier<'a> {
         chain: CertChain<'_>,
         server_name: &str,
     ) -> core::result::Result<(), X509Error> {
-        if name::is_ip(server_name) {
+        if name::is_ip(server_name) && server_name.parse::<core::net::IpAddr>().is_err() {
             return Err(X509Error::IpAddress);
         }
-        if !name::is_valid_host(server_name) {
+        if !name::is_ip(server_name) && !name::is_valid_host(server_name) {
             return Err(X509Error::ServerName);
         }
         let mut wire: [&[u8]; MAX_CHAIN] = [&[]; MAX_CHAIN];
@@ -456,7 +454,13 @@ impl<'a> ChainVerifier<'a> {
 /// De eisen aan het blad die niet van het pad afhangen.
 fn check_leaf(leaf: &Cert<'_>, server_name: &str) -> core::result::Result<(), X509Error> {
     let cert = CertRef::Chain(0);
-    if !leaf.dns_names().any(|p| name::matches(p, server_name)) {
+    let matches = match server_name.parse::<core::net::IpAddr>() {
+        Ok(ip) => leaf
+            .ip_addresses()
+            .any(|address| name::matches_ip(address, ip)),
+        Err(_) => leaf.dns_names().any(|p| name::matches(p, server_name)),
+    };
+    if !matches {
         return Err(X509Error::NameMismatch {
             dns_names: leaf.dns_names().count(),
         });

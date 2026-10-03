@@ -397,8 +397,11 @@ fn go_rejects() {
 #[test]
 fn server_name_rules() {
     let run = |h| check(&[ECDSA_ROOT], &[ECDSA_LEAF, ECDSA_INTER], h, NOW);
-    assert_eq!(run("127.0.0.1"), Err(X509Error::IpAddress));
-    assert_eq!(run("::1"), Err(X509Error::IpAddress));
+    assert!(matches!(
+        run("127.0.0.1"),
+        Err(X509Error::NameMismatch { .. })
+    ));
+    assert!(matches!(run("::1"), Err(X509Error::NameMismatch { .. })));
     assert_eq!(run("a..b"), Err(X509Error::ServerName));
     let roots = Roots::from_list(&[ECDSA_ROOT]).unwrap();
     let body = message(&[ECDSA_LEAF, ECDSA_INTER]);

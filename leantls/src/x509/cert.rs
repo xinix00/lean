@@ -352,6 +352,19 @@ impl<'a> Cert<'a> {
         })
     }
 
+    /// IP-adressen uit de eigen SAN-tag, nooit uit dNSName of CommonName.
+    pub(crate) fn ip_addresses(&self) -> impl Iterator<Item = &'a [u8]> + use<'a> {
+        let mut d = Der::new(self.san.unwrap_or(&[]));
+        core::iter::from_fn(move || {
+            while let Ok(t) = d.any() {
+                if t.tag == implicit(7) {
+                    return Some(t.body);
+                }
+            }
+            None
+        })
+    }
+
     /// Heeft de KeyUsage dit bit, of ontbreekt de extensie (dan mag alles)?
     pub(crate) fn allows(&self, usage: u16) -> bool {
         self.key_usage.is_none_or(|ku| ku & usage != 0)
@@ -443,7 +456,10 @@ fn subject_alt_name(value: &[u8]) -> ParseResult<&[u8]> {
         return Err("subjectAltName (empty)");
     }
     while !d.is_empty() {
-        d.any().field("subjectAltName")?;
+        let name = d.any().field("subjectAltName")?;
+        if name.tag == implicit(7) && !matches!(name.body.len(), 4 | 16) {
+            return Err("subjectAltName (invalid IP length)");
+        }
     }
     Ok(seq.body)
 }

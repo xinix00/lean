@@ -1,7 +1,8 @@
 //! TLS 1.3 voor een netwerk dat je bezit: een versie, een suite, een gepinde
 //! Ed25519-peer of een echte keten.
 //!
-//! Een client, zonder std en zonder externe crates. Precies één combinatie:
+//! Client en server ([`server`]); de server laat de privésleutel bij de aanroeper.
+//! De oorspronkelijke client gebruikt geen externe crates. Precies één combinatie:
 //! TLS 1.3, `TLS_AES_128_GCM_SHA256`, X25519, en in gepinde modus Ed25519.
 //! Geen downgrade, hervatting, PSK, 0-RTT, clientcertificaat,
 //! HelloRetryRequest of renegotiatie; wat de server anders kiest, faalt luid.
@@ -88,6 +89,8 @@ mod handshake;
 mod io;
 mod record;
 mod schedule;
+/// De begrensde serverhandshake, boven dezelfde recordlaag als de gepinde Lean-client.
+pub mod server;
 mod spki;
 mod trust;
 mod wire;

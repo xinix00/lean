@@ -545,6 +545,8 @@ struct MockState {
     fail_write_at: Option<usize>,
     block_writes: bool,
     block_reads: bool,
+    /// Leeg na de laatste byte: `Pending` in plaats van EOF (een peer die wacht).
+    pending_at_eof: bool,
     dropped: usize,
     touched: bool,
 }
@@ -566,7 +568,7 @@ impl AsyncRead for Mock {
     ) -> Poll<Result<usize, MockErr>> {
         let mut s = self.0.borrow_mut();
         s.touched = true;
-        if s.block_reads {
+        if s.block_reads || (s.pending_at_eof && s.pos == s.input.len()) {
             return Poll::Pending;
         }
         let n = buf.len().min(s.input.len() - s.pos);
@@ -1014,4 +1016,109 @@ fn certificate_list_structure() {
         c.iter().collect::<Vec<_>>(),
         vec![&[0xaa, 0xbb][..], &[0xcc][..]]
     );
+}
+
+// --- Server -----------------------------------------------------------------
+
+/// Een identiteit zonder privésleutel: de handtekening is onzin, maar de
+/// test hieronder komt niet verder dan de client-Finished.
+struct Unsigned(Vec<Vec<u8>>);
+
+impl crate::server::Identity for Unsigned {
+    fn certificates(&self) -> &[Vec<u8>] {
+        &self.0
+    }
+    fn signature_scheme(&self) -> u16 {
+        0x0403
+    }
+    fn sign(&self, _: &[u8], _: [u8; 32]) -> Result<Vec<u8>> {
+        Ok(vec![0x30, 0x06, 0x02, 0x01, 0x01, 0x02, 0x01, 0x01])
+    }
+}
+
+/// Geen applicatiebyte voordat de client-Finished klopt: een vervalste
+/// Finished, applicatiedata in plaats van Finished en een kapot record falen
+/// alle drie, en de server laat het transport niet lekken.
+#[test]
+fn server_refuses_a_client_without_a_valid_finished() {
+    let cert = std::fs::read(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("testdata/ecdsa-p256-cert.der"),
+    )
+    .unwrap();
+    refuses_unproven_client(&Unsigned(vec![cert]));
+}
+
+fn refuses_unproven_client(identity: &impl crate::server::Identity) {
+    use crate::crypto::x25519::{BASEPOINT, x25519};
+    let private = [3; 32];
+    let session = [9; 32];
+    let ch = crate::handshake::client_hello(
+        &[8; 32],
+        &session,
+        &x25519(&private, &BASEPOINT),
+        "leantls.test",
+        &[identity.signature_scheme()],
+    )
+    .unwrap();
+    for attack in [0, 1, 2] {
+        let (raw, state) = mock();
+        {
+            let mut s = state.borrow_mut();
+            s.input.extend_from_slice(&[22, 3, 1]);
+            s.input.extend_from_slice(&(ch.len() as u16).to_be_bytes());
+            s.input.extend_from_slice(&ch);
+            s.pending_at_eof = true;
+        }
+        let mut accepting = Box::pin(crate::server::accept(raw, identity, entropy(), false));
+        assert!(
+            poll_once(accepting.as_mut()).is_pending(),
+            "server exposed connection without client Finished"
+        );
+        let output = state.borrow().output.clone();
+        let n = usize::from(u16::from_be_bytes([output[3], output[4]]));
+        let sh = &output[5..5 + n];
+        let share = crate::handshake::parse_server_hello(&sh[4..], &session).unwrap();
+        let secrets = crate::schedule::new_secrets(&x25519(&private, &share)).unwrap();
+        let mut hash = crate::crypto::sha256::Sha256::new();
+        hash.update(&ch);
+        hash.update(sh);
+        let keys = TrafficKeys::from_secret(
+            crate::schedule::derive_secret(&secrets.handshake, b"c hs traffic", &hash.finish())
+                .unwrap(),
+        )
+        .unwrap();
+        let mut sender = Conn::new(mock().0).unwrap();
+        sender.write = Some(Direction::new(keys));
+        let mut finished = [0; 36];
+        finished[..4].copy_from_slice(&[20, 0, 0, 32]);
+        sender
+            .queue_record(
+                if attack == 1 {
+                    REC_APP_DATA
+                } else {
+                    REC_HANDSHAKE
+                },
+                &finished,
+            )
+            .unwrap();
+        let mut record = sender.wbuf[sender.wstart..sender.wend].to_vec();
+        if attack == 2 {
+            *record.last_mut().unwrap() ^= 1;
+        }
+        state.borrow_mut().input.extend_from_slice(&record);
+        let Poll::Ready(Err(error)) = poll_once(accepting.as_mut()) else {
+            panic!("forged client accepted or hung")
+        };
+        match attack {
+            0 => assert!(error == Error::FinishedMismatch),
+            1 => assert!(error == Error::UnexpectedRecord(REC_APP_DATA)),
+            _ => assert!(matches!(error, ConnError::Tls(Error::Decrypt(_)))),
+        }
+        drop(accepting);
+        assert_eq!(
+            state.borrow().dropped,
+            1,
+            "failed handshake leaked transport"
+        );
+    }
 }

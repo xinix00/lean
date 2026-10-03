@@ -1,10 +1,16 @@
 //! AES-128-GCM (NIST SP 800-38D) met een nonce van 96 bits.
 //!
-//! GHASH vermenigvuldigt bit voor bit met maskers, zonder tabel en zonder
-//! sprong op de sleutel H of de data: constant-time. De tag wordt
+//! GHASH is BearSSL's `ghash_ctmul64` (Thomas Pornin, MIT,
+//! <https://www.bearssl.org/constanttime.html#ghash-for-gcm>): de
+//! carry-less vermenigvuldiging als vier gewone 64-bitsvermenigvuldigingen
+//! met om de vier bits gemaskeerde operanden, en de reductie met schuiven.
+//! Geen tabel en geen sprong op H of de data, dus constant-time zolang de
+//! vermenigvuldiginstructie dat is (op de C906 en ARMv8 wel). Tot 03-10
+//! vermenigvuldigde deze module bit voor bit: 128 rondes per blok. De
+//! tellermodus versleutelt vier blokken per AES-aanroep. De tag wordt
 //! constant-time vergeleken, en bij een foute tag wordt niets ontsleuteld.
 
-use super::aes::Aes128;
+use super::aes::{Aes128, Blocks};
 use super::ct;
 
 /// Lengte van de tag.
@@ -55,18 +61,22 @@ impl Gcm {
         Ok(())
     }
 
-    /// De tellermodus vanaf teller 2 (teller 1 is voor de tag).
+    /// De tellermodus vanaf teller 2 (teller 1 is voor de tag), vier blokken
+    /// per AES-aanroep.
     fn ctr(&self, nonce: &[u8; 12], data: &mut [u8]) {
         let mut counter = 2u32;
-        for chunk in data.chunks_mut(16) {
-            let mut ks = [0u8; 16];
-            ks[..12].copy_from_slice(nonce);
-            ks[12..].copy_from_slice(&counter.to_be_bytes());
-            self.aes.encrypt(&mut ks);
-            for (d, k) in chunk.iter_mut().zip(ks) {
+        for chunk in data.chunks_mut(64) {
+            let mut ks: Blocks = [[0u8; 16]; 4];
+            for block in &mut ks {
+                block[..12].copy_from_slice(nonce);
+                block[12..].copy_from_slice(&counter.to_be_bytes());
+                counter = counter.wrapping_add(1);
+            }
+            self.aes.encrypt4(&mut ks);
+            for (d, k) in chunk.iter_mut().zip(ks.iter().flatten()) {
                 *d ^= k;
             }
-            counter = counter.wrapping_add(1);
+            ct::wipe(ks.as_flattened_mut());
         }
     }
 
@@ -98,8 +108,68 @@ impl Drop for Gcm {
     }
 }
 
-/// x * y in GF(2^128) met de GCM-bitvolgorde (SP 800-38D algoritme 1).
+/// x * y in GF(2^128) met de GCM-bitvolgorde: BearSSL's `ghash_ctmul64`
+/// voor één blok (`x` is het al ge-xorde blok, `y` is H).
 fn gf128_mul(x: u128, y: u128) -> u128 {
+    let (x1, x0) = ((x >> 64) as u64, x as u64);
+    let (h1, h0) = ((y >> 64) as u64, y as u64);
+    let (h0r, h1r) = (rev64(h0), rev64(h1));
+    let (h2, h2r) = (h0 ^ h1, h0r ^ h1r);
+    let (x0r, x1r) = (rev64(x0), rev64(x1));
+    let (x2, x2r) = (x0 ^ x1, x0r ^ x1r);
+    let z0 = bmul64(x0, h0);
+    let z1 = bmul64(x1, h1);
+    let mut z2 = bmul64(x2, h2);
+    let mut z0h = bmul64(x0r, h0r);
+    let mut z1h = bmul64(x1r, h1r);
+    let mut z2h = bmul64(x2r, h2r);
+    z2 ^= z0 ^ z1;
+    z2h ^= z0h ^ z1h;
+    z0h = rev64(z0h) >> 1;
+    z1h = rev64(z1h) >> 1;
+    z2h = rev64(z2h) >> 1;
+    let (mut v0, mut v1, mut v2, mut v3) = (z0, z0h ^ z2, z1 ^ z2h, z1h);
+    // Het product van twee bitomgekeerde polynomen van 128 bits is het
+    // omgekeerde over 255 bits: één bit terugschuiven (BearSSL).
+    v3 = (v3 << 1) | (v2 >> 63);
+    v2 = (v2 << 1) | (v1 >> 63);
+    v1 = (v1 << 1) | (v0 >> 63);
+    v0 <<= 1;
+    // Reductie modulo x^128 + x^7 + x^2 + x + 1.
+    v2 ^= v0 ^ (v0 >> 1) ^ (v0 >> 2) ^ (v0 >> 7);
+    v1 ^= (v0 << 63) ^ (v0 << 62) ^ (v0 << 57);
+    v3 ^= v1 ^ (v1 >> 1) ^ (v1 >> 2) ^ (v1 >> 7);
+    v2 ^= (v1 << 63) ^ (v1 << 62) ^ (v1 << 57);
+    (u128::from(v3) << 64) | u128::from(v2)
+}
+
+/// Carry-less 64x64 (onderste 64 bits) met gewone vermenigvuldigingen: elke
+/// operand in vier delen met om de vier bits een gat, zodat de dragers van de
+/// gewone vermenigvuldiging in de gaten vallen en weggemaskeerd worden.
+fn bmul64(x: u64, y: u64) -> u64 {
+    const M0: u64 = 0x1111_1111_1111_1111;
+    const M1: u64 = 0x2222_2222_2222_2222;
+    const M2: u64 = 0x4444_4444_4444_4444;
+    const M3: u64 = 0x8888_8888_8888_8888;
+    let (x0, x1, x2, x3) = (x & M0, x & M1, x & M2, x & M3);
+    let (y0, y1, y2, y3) = (y & M0, y & M1, y & M2, y & M3);
+    let m = u64::wrapping_mul;
+    let z0 = m(x0, y0) ^ m(x1, y3) ^ m(x2, y2) ^ m(x3, y1);
+    let z1 = m(x0, y1) ^ m(x1, y0) ^ m(x2, y3) ^ m(x3, y2);
+    let z2 = m(x0, y2) ^ m(x1, y1) ^ m(x2, y0) ^ m(x3, y3);
+    let z3 = m(x0, y3) ^ m(x1, y2) ^ m(x2, y1) ^ m(x3, y0);
+    (z0 & M0) | (z1 & M1) | (z2 & M2) | (z3 & M3)
+}
+
+/// De bits van een woord omgekeerd.
+fn rev64(x: u64) -> u64 {
+    x.reverse_bits()
+}
+
+/// De vorige vermenigvuldiger (SP 800-38D algoritme 1, bit voor bit), als
+/// onafhankelijke referentie voor de tests.
+#[cfg(test)]
+fn gf128_mul_reference(x: u128, y: u128) -> u128 {
     let mut z = 0u128;
     let mut v = y;
     for i in (0..128).rev() {
@@ -114,6 +184,62 @@ fn gf128_mul(x: u128, y: u128) -> u128 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Doorvoer van seal over 1 MiB; draai met
+    /// `cargo test -p leantls --release -- --ignored seal_throughput --nocapture`.
+    #[test]
+    #[ignore = "meting, geen toets"]
+    fn seal_throughput() {
+        let g = Gcm::new(&[7u8; 16]);
+        let mut data = vec![0x5au8; 1 << 20];
+        let t0 = std::time::Instant::now();
+        let rounds: u32 = 8;
+        for _ in 0..rounds {
+            let _ = g.seal(&[1u8; 12], b"aad", &mut data);
+        }
+        let dt = t0.elapsed().as_secs_f64();
+        std::println!("seal: {:.1} MB/s", f64::from(rounds) / dt);
+    }
+
+    /// De nieuwe vermenigvuldiger tegen de oude bit-voor-bit, op willekeurige
+    /// en randwaarden.
+    #[test]
+    fn ctmul64_matches_the_bitwise_reference() {
+        let mut seed = 0x0123_4567_89ab_cdef_u64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let mut wide = || (u128::from(next()) << 64) | u128::from(next());
+        let edges = [
+            0,
+            1,
+            u128::MAX,
+            1 << 127,
+            1 << 64,
+            (1 << 64) - 1,
+            0xe1 << 120,
+        ];
+        for x in edges {
+            for y in edges {
+                assert_eq!(
+                    gf128_mul(x, y),
+                    gf128_mul_reference(x, y),
+                    "{x:#x} * {y:#x}"
+                );
+            }
+        }
+        for _ in 0..20_000 {
+            let (x, y) = (wide(), wide());
+            assert_eq!(
+                gf128_mul(x, y),
+                gf128_mul_reference(x, y),
+                "{x:#x} * {y:#x}"
+            );
+        }
+    }
     use crate::crypto::testutil::unhex;
 
     fn key(hex: &str) -> [u8; 16] {

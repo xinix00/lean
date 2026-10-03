@@ -44,6 +44,36 @@ pub(crate) fn wipe<T: Copy + Default>(buf: &mut [T]) {
     compiler_fence(Ordering::SeqCst);
 }
 
+/// Een geheim van `N` bytes dat zichzelf bij `Drop` wist (via [`wipe`]); de
+/// vervanger van `zeroize::Zeroizing` zonder externe crate.
+pub(crate) struct Secret<const N: usize>([u8; N]);
+
+impl<const N: usize> Secret<N> {
+    /// Neemt `bytes` in bewaring.
+    pub(crate) fn new(bytes: [u8; N]) -> Self {
+        Self(bytes)
+    }
+}
+
+impl<const N: usize> core::ops::Deref for Secret<N> {
+    type Target = [u8; N];
+    fn deref(&self) -> &[u8; N] {
+        &self.0
+    }
+}
+
+impl<const N: usize> core::ops::DerefMut for Secret<N> {
+    fn deref_mut(&mut self) -> &mut [u8; N] {
+        &mut self.0
+    }
+}
+
+impl<const N: usize> Drop for Secret<N> {
+    fn drop(&mut self) {
+        wipe(&mut self.0);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -173,7 +173,7 @@ where
         server_name: &str,
         entropy: Entropy,
     ) -> Result<(), ConnError<E>> {
-        let mut private = [0u8; 32];
+        let mut private = crate::crypto::ct::Secret::new([0u8; 32]);
         let mut random = [0u8; 32];
         let mut session_id = [0u8; 32];
         private.copy_from_slice(&entropy.bytes[..32]);
@@ -197,14 +197,14 @@ where
         self.require_boundary()?;
 
         // --- Sleutels ------------------------------------------------------
-        let mut shared = x25519(&private, &server_share);
-        ct::wipe(&mut private);
+        let shared = crate::crypto::ct::Secret::new(x25519(&private, &server_share));
+        drop(private);
         // RFC 8446 §7.4.2: een nul-uitkomst betekent een zwak punt; afbreken.
-        if ct::eq(&shared, &[0u8; 32]) {
+        if ct::eq(&shared[..], &[0u8; 32]) {
             return Err(Error::KeyShare.into());
         }
         let secrets = schedule::new_secrets(&shared);
-        ct::wipe(&mut shared);
+        drop(shared);
         let secrets = secrets?;
         let chsh = self.transcript.clone().finish();
         let c_hs =
@@ -232,6 +232,10 @@ where
         let verifier = self.trust_decision(trust, server_name, len);
         self.consume(len);
         let verifier = verifier?;
+        // De ketenverificatie is het zwaarste rekenwerk van de handshake; één
+        // beurt voor de buren op dezelfde executor voordat de handtekening
+        // volgt (HopOS docs/apps.md).
+        cooperate().await;
 
         // CertificateVerify dekt het transcript tot en met Certificate.
         let before_cv = self.transcript.clone().finish();
@@ -239,6 +243,7 @@ where
         let checked = verify_certificate_verify(self.body(len), &verifier, &before_cv);
         self.consume(len);
         checked?;
+        cooperate().await;
 
         let before_fin = self.transcript.clone().finish();
         let len = self.expect(HS_FINISHED).await?;
@@ -316,18 +321,18 @@ where
     }
 
     /// De inhoud van het bericht vooraan in de handshake-buffer.
-    fn body(&self, len: usize) -> &[u8] {
+    pub(crate) fn body(&self, len: usize) -> &[u8] {
         self.hs.get(4..4 + len).unwrap_or(&[])
     }
 
     /// Haalt het bericht vooraan uit de handshake-buffer.
-    fn consume(&mut self, len: usize) {
+    pub(crate) fn consume(&mut self, len: usize) {
         let n = (4 + len).min(self.hs.len());
         self.hs.drain(..n);
     }
 
     /// Eist dat er geen half bericht over een sleutelwissel heen hangt.
-    fn require_boundary(&self) -> Result {
+    pub(crate) fn require_boundary(&self) -> Result {
         match self.hs.first() {
             None => Ok(()),
             Some(t) => Err(Error::UnexpectedMessage { want: 0, got: *t }),
@@ -336,7 +341,7 @@ where
 
     /// Leest één handshake-bericht van het vereiste type en geeft zijn
     /// lengte.
-    async fn expect(&mut self, want: u8) -> Result<usize, ConnError<E>> {
+    pub(crate) async fn expect(&mut self, want: u8) -> Result<usize, ConnError<E>> {
         let (got, len) = self.read_handshake().await?;
         if got != want {
             return Err(Error::UnexpectedMessage { want, got }.into());
@@ -412,7 +417,7 @@ pub(crate) fn client_hello(
     b.bytes(&[1, 0])?; // Compressie: alleen "geen".
 
     let exts = b.open(2)?;
-    if !server_name.is_empty() {
+    if !server_name.is_empty() && server_name.parse::<core::net::IpAddr>().is_err() {
         b.u16(EXT_SERVER_NAME)?;
         let ext = b.open(2)?;
         let list = b.open(2)?;
@@ -535,4 +540,21 @@ fn verify_certificate_verify(
         }
         Verifier::Chain(v, leaf) => v.verify_signature(leaf, alg, &content, sig),
     }
+}
+
+/// Eén beurt aan de executor: de taak meldt zich meteen weer en gaat
+/// verder zodra de anderen hun beurt hadden. Zonder executor-afhankelijkheid,
+/// zodat deze crate `no_std` en vrij van runtimes blijft.
+async fn cooperate() {
+    let mut yielded = false;
+    core::future::poll_fn(|cx| {
+        if yielded {
+            core::task::Poll::Ready(())
+        } else {
+            yielded = true;
+            cx.waker().wake_by_ref();
+            core::task::Poll::Pending
+        }
+    })
+    .await;
 }

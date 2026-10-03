@@ -10,13 +10,28 @@
 pub(crate) const MAX_NAME: usize = 253;
 
 /// Is `name` een IP-adres (IPv4 met punten of iets met een dubbele punt)?
-/// Die worden niet tegen DNS-namen getoetst; KAM zegt: luid weigeren.
+/// Die worden uitsluitend tegen IP SANs getoetst, nooit tegen DNS-namen.
 pub(crate) fn is_ip(name: &str) -> bool {
     name.contains(':')
         || (name.split('.').count() == 4
             && name
                 .split('.')
                 .all(|l| !l.is_empty() && l.bytes().all(|b| b.is_ascii_digit())))
+}
+
+/// IP-SANs zijn 4 of 16 ruwe bytes; IPv4-mapped IPv6 volgt dezelfde canonieke vergelijking als Go.
+pub(crate) fn matches_ip(raw: &[u8], host: core::net::IpAddr) -> bool {
+    use core::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+    let candidate = match raw.len() {
+        4 => <[u8; 4]>::try_from(raw)
+            .ok()
+            .map(|b| IpAddr::V4(Ipv4Addr::from(b))),
+        16 => <[u8; 16]>::try_from(raw)
+            .ok()
+            .map(|b| IpAddr::V6(Ipv6Addr::from(b))),
+        _ => None,
+    };
+    candidate.is_some_and(|ip| ip.to_canonical() == host.to_canonical())
 }
 
 /// Is `name` een bruikbare hostnaam: labels van 1 tot 63 tekens uit
@@ -103,5 +118,25 @@ mod tests {
         assert!(!is_valid_host("*.example"));
         assert!(!is_valid_host(&"a".repeat(64)));
         assert!(!is_valid_host(&["a"; 128].join(".")), "255 tekens");
+    }
+}
+
+#[cfg(test)]
+mod ip_tests {
+    use super::*;
+    #[test]
+    fn addresses_match_only_binary_ip_sans() {
+        let v4 = "127.0.0.1".parse().unwrap();
+        let mapped = "::ffff:127.0.0.1".parse().unwrap();
+        let v6 = "::1".parse().unwrap();
+        assert!(matches_ip(&[127, 0, 0, 1], v4));
+        assert!(matches_ip(&[127, 0, 0, 1], mapped));
+        assert!(!matches_ip(b"127.0.0.1", v4));
+        assert!(!matches_ip(&[127, 0, 0, 2], v4));
+        assert!(!matches_ip(&[127, 0, 0, 1], v6));
+        assert!(matches_ip(
+            &[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+            v6
+        ));
     }
 }
