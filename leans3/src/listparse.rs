@@ -150,6 +150,8 @@ pub(crate) struct ListPage {
     pub(crate) next_token: String,
     /// De sleutels onder `Contents`, in volgorde.
     pub(crate) keys: Vec<String>,
+    /// Immediate child prefixes from a delimiter listing.
+    pub(crate) prefixes: Vec<String>,
 }
 
 /// Leest de velden die [`crate::Client::list`] nodig heeft. De lezer kijkt naar
@@ -250,7 +252,10 @@ pub(crate) fn parse_list_page(b: &[u8]) -> Result<ListPage, XmlError> {
 fn is_wanted(stack: &[&[u8]]) -> bool {
     match stack {
         [_, field] => *field == b"IsTruncated" || *field == b"NextContinuationToken",
-        [_, contents, key] => *contents == b"Contents" && *key == b"Key",
+        [_, contents, key] => {
+            (*contents == b"Contents" && *key == b"Key")
+                || (*contents == b"CommonPrefixes" && *key == b"Prefix")
+        }
         _ => false,
     }
 }
@@ -276,11 +281,16 @@ fn store(out: &mut ListPage, stack: &[&[u8]], value: String) -> Result<(), XmlEr
             if value.len() > MAX_KEY_BYTES {
                 return Err(XmlError::KeyTooLong);
             }
-            if out.keys.len() == MAX_PAGE_KEYS {
+            if out.keys.len() + out.prefixes.len() == MAX_PAGE_KEYS {
                 return Err(XmlError::TooManyKeys);
             }
-            out.keys.try_reserve(1).map_err(|_| XmlError::OutOfMemory)?;
-            out.keys.push(value);
+            let values = if stack[1] == b"CommonPrefixes" {
+                &mut out.prefixes
+            } else {
+                &mut out.keys
+            };
+            values.try_reserve(1).map_err(|_| XmlError::OutOfMemory)?;
+            values.push(value);
         }
         _ => {}
     }
@@ -435,6 +445,7 @@ mod tests {
             is_truncated: truncated,
             next_token: token.into(),
             keys: keys.iter().map(|k| (*k).to_owned()).collect(),
+            prefixes: Vec::new(),
         }
     }
 

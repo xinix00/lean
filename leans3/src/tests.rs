@@ -633,6 +633,59 @@ fn list_eist_een_positieve_cap() {
 }
 
 #[test]
+fn directories_page_past_root_objects_and_ignore_data_keys() {
+    let mut t = mock(|seen| {
+        assert_eq!(seen.query("delimiter"), "/");
+        assert_eq!(seen.query("prefix"), "gen/");
+        if seen.query("continuation-token").is_empty() {
+            ok(b"<ListBucketResult><IsTruncated>true</IsTruncated><NextContinuationToken>two</NextContinuationToken><Contents><Key>gen/marker</Key></Contents></ListBucketResult>")
+        } else {
+            ok(b"<ListBucketResult><IsTruncated>false</IsTruncated><CommonPrefixes><Prefix>gen/one&amp;two/</Prefix></CommonPrefixes><Contents><Key>gen/other</Key></Contents></ListBucketResult>")
+        }
+    });
+    assert_eq!(
+        block_on(klant().list_directories(&mut t, "gen/", 10)).unwrap(),
+        (vec!["gen/one&two/".into()], false)
+    );
+    assert_eq!(t.seen.borrow().len(), 2);
+}
+
+#[test]
+fn directories_preserve_caps_and_stuck_token_detection() {
+    let mut t = mock(|_| {
+        ok(b"<ListBucketResult><CommonPrefixes><Prefix>gen/one/</Prefix></CommonPrefixes><CommonPrefixes><Prefix>gen/two/</Prefix></CommonPrefixes></ListBucketResult>")
+    });
+    assert!(matches!(
+        block_on(Client::default().list_directories(&mut t, "gen/", 0)),
+        Err(Error::ListMaxZero)
+    ));
+    assert_eq!(
+        block_on(klant().list_directories(&mut t, "gen/", 1)).unwrap(),
+        (vec!["gen/one/".into()], true)
+    );
+    let mut t = mock(|_| {
+        ok(b"<ListBucketResult><IsTruncated>true</IsTruncated><NextContinuationToken>same</NextContinuationToken><CommonPrefixes><Prefix>gen/one/</Prefix></CommonPrefixes></ListBucketResult>")
+    });
+    assert!(matches!(
+        block_on(klant().list_directories(&mut t, "gen/", 10)),
+        Err(Error::ListTokenStuck)
+    ));
+    assert_eq!(t.seen.borrow().len(), 2);
+}
+
+#[test]
+fn ordinary_list_ignores_common_prefixes() {
+    let mut t = mock(|seen| {
+        assert_eq!(seen.query("delimiter"), "");
+        ok(b"<ListBucketResult><CommonPrefixes><Prefix>gen/child/</Prefix></CommonPrefixes><Contents><Key>gen/item</Key></Contents></ListBucketResult>")
+    });
+    assert_eq!(
+        block_on(klant().list(&mut t, "gen/", 10)).unwrap(),
+        (vec!["gen/item".into()], false)
+    );
+}
+
+#[test]
 fn list_weigert_token_zonder_voortgang() {
     let mut t = mock(|_| {
         ok(b"<ListBucketResult><IsTruncated>true</IsTruncated>\

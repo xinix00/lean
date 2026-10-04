@@ -786,15 +786,42 @@ impl Client {
         prefix: &str,
         max: usize,
     ) -> Result<(Vec<String>, bool)> {
+        self.list_inner(t, prefix, max, false).await
+    }
+
+    /// Somt directe kindprefixen op met S3's delimiter, zonder de onderliggende objectsleutels.
+    pub async fn list_directories<T: Transport>(
+        &self,
+        t: &mut T,
+        prefix: &str,
+        max: usize,
+    ) -> Result<(Vec<String>, bool)> {
+        self.list_inner(t, prefix, max, true).await
+    }
+
+    async fn list_inner<T: Transport>(
+        &self,
+        t: &mut T,
+        prefix: &str,
+        max: usize,
+        directories: bool,
+    ) -> Result<(Vec<String>, bool)> {
         if max == 0 {
             return Err(Error::ListMaxZero);
         }
         let mut keys: Vec<String> = Vec::new();
         let mut token = String::new();
         loop {
-            let page = self.list_page(t, prefix, &token).await?;
-            let progressed = !page.keys.is_empty();
-            for key in page.keys {
+            let page = self.list_page(t, prefix, &token, directories).await?;
+            // Een delimiterpagina kan alleen losse objecten bevatten. Ook die
+            // pagina levert voortgang, hoewel de caller alleen prefixen krijgt.
+            let progressed = !page.keys.is_empty() || !page.prefixes.is_empty();
+            let entries = if directories {
+                page.prefixes
+            } else {
+                page.keys
+            };
+            for key in entries {
                 if keys.len() >= max {
                     return Ok((keys, true));
                 }
@@ -826,6 +853,7 @@ impl Client {
         t: &mut T,
         prefix: &str,
         token: &str,
+        directories: bool,
     ) -> Result<listparse::ListPage> {
         let mut url = self.bucket_url()?;
         // De query staat meteen in canonieke vorm, gesorteerd op sleutel; dan
@@ -834,6 +862,9 @@ impl Client {
             push_str(&mut url.query, "continuation-token=")?;
             sigv4::uri_escape(&mut url.query, token.as_bytes(), true)?;
             push_str(&mut url.query, "&")?;
+        }
+        if directories {
+            push_str(&mut url.query, "delimiter=%2F&")?;
         }
         push_str(&mut url.query, "list-type=2")?;
         if !prefix.is_empty() {
