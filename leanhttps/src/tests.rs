@@ -57,6 +57,7 @@ impl Close for Raw {
 struct Tcp {
     dials: Vec<(String, u16)>,
     written: Vec<Rc<RefCell<Vec<u8>>>>,
+    timeouts: Vec<Rc<RefCell<Vec<Option<Duration>>>>>,
 }
 
 impl Dial for Tcp {
@@ -66,9 +67,11 @@ impl Dial for Tcp {
         self.dials.push((target.host.to_owned(), target.port));
         let written = Rc::new(RefCell::new(Vec::new()));
         self.written.push(written.clone());
+        let timeouts = Rc::new(RefCell::new(Vec::new()));
+        self.timeouts.push(timeouts.clone());
         Ok(Raw {
             written,
-            timeouts: Rc::default(),
+            timeouts,
             closed: Rc::default(),
         })
     }
@@ -272,4 +275,56 @@ fn is_ip_randen() {
     ] {
         assert_eq!(is_ip(host), want, "{host}");
     }
+}
+
+/// Een lege, geldige wortelset: de keten faalt toch al op het einde van de stroom.
+const NO_ROOTS: &[u8] = &[];
+
+#[test]
+fn web_dial_is_plain_for_http_and_refuses_https_without_name_clock_or_entropy() {
+    let clock = || Some(1_790_000_000);
+    let fresh = || Some(entropy());
+    let mut web = WebDial::new(Tcp::default(), NO_ROOTS, clock, fresh);
+    let plain = Target {
+        https: false,
+        host: "minio.lan",
+        port: 9000,
+    };
+    assert!(matches!(block_on(web.dial(plain)), Ok(Link::Plain(_))));
+    assert!(matches!(
+        block_on(web.dial(target("10.0.0.1"))),
+        Err(leanhttp::Error::NoHost)
+    ));
+    assert_eq!(web.last_error(), Some(Error::ChainWithoutName));
+    let mut no_clock = WebDial::new(Tcp::default(), NO_ROOTS, || None, fresh);
+    assert!(matches!(
+        block_on(no_clock.dial(target("s3.example.test"))),
+        Err(leanhttp::Error::Connect)
+    ));
+    let mut no_entropy = WebDial::new(Tcp::default(), NO_ROOTS, clock, || None);
+    assert!(matches!(
+        block_on(no_entropy.dial(target("s3.example.test"))),
+        Err(leanhttp::Error::Connect)
+    ));
+    // Alleen de http-dial raakte de netstack.
+    assert_eq!(web.inner.dials.len(), 1);
+    assert!(no_clock.inner.dials.is_empty() && no_entropy.inner.dials.is_empty());
+}
+
+#[test]
+fn web_dial_sends_sni_under_a_handshake_deadline() {
+    let mut web = WebDial::new(
+        Tcp::default(),
+        leantls::MOZILLA_ROOTS,
+        || Some(1_790_000_000),
+        || Some(entropy()),
+    );
+    // De peer zwijgt en sluit: de handshake faalt, maar de ClientHello ging uit.
+    assert!(block_on(web.dial(target("s3.example.test"))).is_err());
+    assert!(web.last_error().is_some());
+    assert!(contains(&web.inner.written[0].borrow(), b"s3.example.test"));
+    assert_eq!(
+        web.inner.timeouts[0].borrow().first(),
+        Some(&Some(Duration::from_secs(20)))
+    );
 }

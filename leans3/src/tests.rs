@@ -1042,3 +1042,64 @@ fn debug_lekt_geen_geheim() {
         "{shown}"
     );
 }
+
+/// Eén keer `Pending`, daarna klaar: genoeg om overlap zichtbaar te maken.
+struct Once(bool);
+
+impl Future for Once {
+    type Output = ();
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        if core::mem::replace(&mut self.0, true) {
+            Poll::Ready(())
+        } else {
+            cx.waker().wake_by_ref();
+            Poll::Pending
+        }
+    }
+}
+
+/// Een transport dat één poll op het net wacht en zijn begin en einde logt.
+struct Slow {
+    inner: Mock,
+    log: Rc<RefCell<Vec<String>>>,
+}
+
+impl Transport for Slow {
+    type Response = MockResponse;
+
+    async fn send(&mut self, request: Request<'_, '_>) -> Result<MockResponse, IoError> {
+        self.log
+            .borrow_mut()
+            .push(format!("start {}", request.target));
+        Once(false).await;
+        self.log
+            .borrow_mut()
+            .push(format!("end {}", request.target));
+        self.inner.send(request).await
+    }
+}
+
+#[test]
+fn get_to_all_overlaps_and_keeps_each_reply_in_place() {
+    let log = Rc::new(RefCell::new(Vec::new()));
+    let slow = |status: u16, body: &'static [u8]| Slow {
+        inner: mock(move |_| Canned { status, ..ok(body) }),
+        log: log.clone(),
+    };
+    let (mut a, mut b, mut c) = (slow(200, b"aa"), slow(404, b""), slow(200, b"cccc"));
+    let (mut x, mut y, mut z) = (Buffer::default(), Buffer::default(), Buffer::default());
+    let replies = block_on(klant().get_to_all([
+        (&mut a, "k/a", &mut x),
+        (&mut b, "k/b", &mut y),
+        (&mut c, "k/c", &mut z),
+    ]))
+    .unwrap();
+    assert_eq!(replies[0].as_ref().unwrap().0, 2);
+    assert_eq!(replies[1], Err(Error::NotFound));
+    assert_eq!(replies[2].as_ref().unwrap().0, 4);
+    assert_eq!((x.0, z.0), (b"aa".to_vec(), b"cccc".to_vec()));
+    // Alle drie gestart voordat er één klaar was: echt tegelijk.
+    let log = log.borrow();
+    assert!(log[..3].iter().all(|l| l.starts_with("start")), "{log:?}");
+    assert!(log[3..].iter().all(|l| l.starts_with("end")), "{log:?}");
+}

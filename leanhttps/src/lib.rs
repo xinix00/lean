@@ -151,19 +151,12 @@ where
             return Err(leanhttp::Error::NoHost);
         }
         let raw = self.inner.dial(target).await?;
-        let wire = Wire {
-            conn: raw,
-            pending: Cell::new(Pending::default()),
-        };
-        match leantls::connect(wire, &self.trust, host, (self.entropy)()).await {
-            Ok(tls) => {
+        match wrap(raw, &self.trust, host, (self.entropy)()).await {
+            Ok(conn) => {
                 self.last_error = None;
-                Ok(TlsConn {
-                    state: State::Open(tls),
-                })
+                Ok(conn)
             }
-            Err(e) => {
-                let (mine, theirs) = split(e);
+            Err((mine, theirs)) => {
                 self.last_error = Some(mine);
                 Err(leanhttp::Error::Io(theirs))
             }
@@ -360,6 +353,25 @@ impl<C: leanhttp::Conn + Unpin> Close for TlsConn<C> {
     }
 }
 
+/// De handshake op een kale verbinding, met SNI `host`.
+async fn wrap<C: leanhttp::Conn + Unpin>(
+    raw: C,
+    trust: &Trust<'_>,
+    host: &str,
+    entropy: Entropy,
+) -> core::result::Result<TlsConn<C>, (Error, IoError)> {
+    let wire = Wire {
+        conn: raw,
+        pending: Cell::new(Pending::default()),
+    };
+    match leantls::connect(wire, trust, host, entropy).await {
+        Ok(tls) => Ok(TlsConn {
+            state: State::Open(tls),
+        }),
+        Err(e) => Err(split(e)),
+    }
+}
+
 /// Splitst een verbindingsfout in de rijke vorm van deze crate en de vorm die
 /// leanhttp kan dragen.
 fn split(e: ConnError<IoError>) -> (Error, IoError) {
@@ -389,6 +401,9 @@ fn is_ip(host: &str) -> bool {
     }
     parts == 4
 }
+
+mod web;
+pub use web::{Link, WebDial};
 
 #[cfg(test)]
 mod tests;

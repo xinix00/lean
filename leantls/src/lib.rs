@@ -105,3 +105,10 @@ pub use handshake::connect;
 pub use io::{AsyncRead, AsyncWrite};
 pub use trust::{CertChain, CertIter, Entropy, PeerKey, Trust, VerifyPeer};
 pub use x509::{ChainVerifier, Roots, X509Error};
+
+/// De Mozilla NSS-wortels als aaneengeschakelde DER, voor
+/// [`Roots::from_concatenated_der`]: het vertrouwen van een gewone
+/// HTTPS-client. Alleen met de feature `mozilla-roots` (127 KiB in het
+/// binaire bestand); wie zijn peer pint, betaalt er niet voor.
+#[cfg(any(test, feature = "mozilla-roots"))]
+pub const MOZILLA_ROOTS: &[u8] = include_bytes!("../roots/mozilla.der");

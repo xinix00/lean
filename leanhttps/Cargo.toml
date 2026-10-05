@@ -11,5 +11,12 @@ description = "Een compositie: leanhttp over leantls, en niets anders."
 leanhttp = { path = "../leanhttp" }
 leantls = { path = "../leantls" }
 
+[dev-dependencies]
+leantls = { path = "../leantls", features = ["mozilla-roots"] }
+
+[features]
+# `leantls::MOZILLA_ROOTS` voor een gewone webclient (WebDial).
+mozilla-roots = ["leantls/mozilla-roots"]
+
 [lints]
 workspace = true

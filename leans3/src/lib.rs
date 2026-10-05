@@ -53,6 +53,7 @@ mod sigv4;
 #[cfg(test)]
 mod tests;
 
+use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt;
@@ -651,6 +652,49 @@ impl Client {
         }
         check_length(length, written, Op::Get)?;
         Ok((written, etag))
+    }
+
+    /// Stroomt meerdere objecten tegelijk, ieder over zijn eigen transport en
+    /// naar zijn eigen schrijver, met de fouten van [`Client::get_to`]. Een
+    /// verbinding draagt één verzoek tegelijk, dus wie er acht tegelijk wil,
+    /// geeft acht transports (een S3-dienst levert vaak per stroom een vaste
+    /// snelheid). Ieder antwoord staat op de plaats van zijn verzoek; de
+    /// buitenste fout is alleen geheugen.
+    pub async fn get_to_all<'a, T, W>(
+        &self,
+        gets: impl IntoIterator<Item = (&'a mut T, &'a str, &'a mut W)>,
+    ) -> Result<Vec<Result<(u64, Option<String>)>>>
+    where
+        T: Transport + 'a,
+        W: AsyncWrite + Unpin + ?Sized + 'a,
+    {
+        let mut futures = Vec::new();
+        for (t, key, sink) in gets {
+            futures.try_reserve(1).map_err(|_| Error::OutOfMemory)?;
+            futures.push(Box::pin(self.get_to(t, key, sink)));
+        }
+        let mut done = Vec::new();
+        done.try_reserve_exact(futures.len())
+            .map_err(|_| Error::OutOfMemory)?;
+        done.resize_with(futures.len(), || None);
+        poll_fn(|cx| {
+            let mut pending = false;
+            for (future, slot) in futures.iter_mut().zip(done.iter_mut()) {
+                if slot.is_none() {
+                    match future.as_mut().poll(cx) {
+                        Poll::Ready(result) => *slot = Some(result),
+                        Poll::Pending => pending = true,
+                    }
+                }
+            }
+            if pending {
+                Poll::Pending
+            } else {
+                Poll::Ready(())
+            }
+        })
+        .await;
+        Ok(done.into_iter().flatten().collect())
     }
 
     /// Schrijft `data` naar `key` en geeft de ETag van de server, als die er

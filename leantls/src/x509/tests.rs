@@ -29,7 +29,7 @@ const ECDSA_LEAF: &[u8] = chain_file!("ecdsa-leaf.der");
 const RSA_ROOT: &[u8] = chain_file!("rsa-root.der");
 const RSA_INTER: &[u8] = chain_file!("rsa-inter.der");
 const RSA_LEAF: &[u8] = chain_file!("rsa-leaf.der");
-const MOZILLA: &[u8] = github_file!("mozilla-roots.der");
+const MOZILLA: &[u8] = crate::MOZILLA_ROOTS;
 
 /// Bouwt de inhoud van een TLS 1.3 Certificate-bericht.
 fn message(certs: &[&[u8]]) -> Vec<u8> {

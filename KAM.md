@@ -281,6 +281,14 @@ write to 250 milliseconds and always closes the transport. Before shutdown, any
 TLS record write error is terminal for that connection; later writes return the
 stored error and never attempt to continue a partially written record stream.
 
+`WebDial` is the ordinary web client over any bare `leanhttp::Dial`:
+`http://` stays plain, `https://` gets chain verification against caller roots
+(the `mozilla-roots` feature exposes `leantls::MOZILLA_ROOTS`) on the caller's
+wall clock, with fresh caller entropy per handshake and a 20-second handshake
+deadline on the transport. A missing clock or entropy fails the dial before
+any connection opens; a bare IP address with chain trust fails as
+`ChainWithoutName`. It replaces the per-application copies of the same dialer.
+
 ### leans3
 
 `leans3` provides SigV4 with static credentials and an optional session token,
@@ -325,6 +333,37 @@ Buffered `Get` has a fixed 4 MiB allocation cap and returns
 Each LIST page is limited to 4 MiB, 1,000 keys, 1,024 bytes per key, and 16 KiB
 per continuation token. `List` requires a positive result cap and rejects an
 empty-progress page or an unchanged continuation token.
+
+`Client::get_to_all` streams several objects at once, one request per caller
+transport, each into its own sink, with the errors of `GetTo` in request order.
+One connection carries one request at a time, so concurrency is exactly the
+number of transports the caller supplies.
+
+### leans3http
+
+`leans3http` is the default `leans3::Transport` over `leanhttp`: one
+keep-alive connection per transport, never a redirect, a bounded in-memory
+body (32 MiB by default), a total deadline per attempt (60 s; header 30 s) on a
+caller `Clock`, and an optional per-target byte observer. Streamed PUT bodies
+go through `Expect: 100-continue` as in `leanhttp`.
+
+### Change rule, filled in: GET retry and parallel streams
+
+1. **Consumer.** Replica on Bunny Storage: about 10 MB/s per stream; measured
+   2026-10-05 with 4 MiB parts, 1 stream 10.6 MB/s, 8 streams 53, 16 streams
+   69. Spin's own transport already retried GET on 429/5xx and broken
+   connections because Bunny returns them under load.
+2. **Smallest contract.** `get_to_all` over caller transports; in
+   `leans3http`, GET and HEAD (LIST is a GET) retry up to `Limits::attempts`
+   (4) on 429/500/502/503/504 and on connect, I/O, or EOF errors, waiting 1,
+   2, 4 s. Every other method is sent once.
+3. **Tests.** Overlap and in-place replies for `get_to_all`; one pooled
+   connection, retry with growing waits, PUT sent once, deadline on a silent
+   server, and a streamed PUT in `leans3http`.
+4. **Decision.** KEEP for both; this narrows "no S3-level retry" to mutating
+   operations.
+5. **Hard rejection.** PUT and DELETE are never repeated, a body above the
+   limit fails as a transport error, and a redirect returns to the caller.
 
 ### Change rule, filled in: cancellable calls
 
