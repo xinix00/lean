@@ -249,3 +249,46 @@ impl leans3::AsyncRead for Source<'_> {
         Poll::Ready(Ok(n))
     }
 }
+
+/// Een schrijver die alleen telt.
+#[derive(Default)]
+struct Count(u64);
+
+impl leans3::AsyncWrite for Count {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        _: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<Result<usize, IoError>> {
+        self.0 += buf.len() as u64;
+        Poll::Ready(Ok(buf.len()))
+    }
+}
+
+#[test]
+fn a_body_above_the_old_buffer_limit_streams_and_counts() {
+    // 40 MiB: meer dan de 32 MiB die in het geheugen paste.
+    let len = 40usize << 20;
+    let mut answer =
+        std::format!("HTTP/1.1 200 OK\r\nContent-Length: {len}\r\nETag: \"big\"\r\n\r\n")
+            .into_bytes();
+    answer.resize(answer.len() + len, 7);
+    let answer: &'static [u8] = Box::leak(answer.into_boxed_slice());
+    let net = net(vec![vec![Turn::Answer(answer), Turn::Answer(OK)]]);
+    let seen = Rc::new(Cell::new(0usize));
+    let total = seen.clone();
+    let mut http =
+        Http::new(net.clone(), Still::default()).observe(move |_, n| total.set(total.get() + n));
+    let mut sink = Count::default();
+    let (n, etag) = block_on(client().get_to(&mut http, "data/big", &mut sink)).unwrap();
+    assert_eq!(
+        (n, sink.0, etag.as_deref()),
+        (len as u64, len as u64, Some("\"big\""))
+    );
+    // De teller liep mee per stuk, niet in één keer aan het eind.
+    assert_eq!(seen.get(), len);
+    // De verbinding ging na de laatste byte terug in de pool.
+    let (body, _) = block_on(client().get(&mut http, "data/a")).unwrap();
+    assert_eq!(body, b"hello");
+    assert_eq!(net.dials.get(), 1);
+}

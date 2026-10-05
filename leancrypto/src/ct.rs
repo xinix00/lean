@@ -10,7 +10,7 @@ use core::sync::atomic::{Ordering, compiler_fence};
 ///
 /// De lengte lekt wel: een MAC of tag heeft een vaste, publieke lengte, dus
 /// daar zit geen geheim in. De inhoud wordt altijd helemaal doorlopen.
-pub(crate) fn eq(a: &[u8], b: &[u8]) -> bool {
+pub fn eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
     }
@@ -33,7 +33,7 @@ pub(crate) fn eq(a: &[u8], b: &[u8]) -> bool {
     unsafe_code,
     reason = "vluchtig schrijven is de enige manier om een wis te garanderen"
 )]
-pub(crate) fn wipe<T: Copy + Default>(buf: &mut [T]) {
+pub fn wipe<T: Copy + Default>(buf: &mut [T]) {
     for b in buf.iter_mut() {
         // SAFETY: `b` is een geldige, uitgelijnde, exclusieve verwijzing naar
         // één element uit `buf`; een vluchtige write daarheen kan niet buiten
@@ -46,11 +46,11 @@ pub(crate) fn wipe<T: Copy + Default>(buf: &mut [T]) {
 
 /// Een geheim van `N` bytes dat zichzelf bij `Drop` wist (via [`wipe`]); de
 /// vervanger van `zeroize::Zeroizing` zonder externe crate.
-pub(crate) struct Secret<const N: usize>([u8; N]);
+pub struct Secret<const N: usize>([u8; N]);
 
 impl<const N: usize> Secret<N> {
     /// Neemt `bytes` in bewaring.
-    pub(crate) fn new(bytes: [u8; N]) -> Self {
+    pub fn new(bytes: [u8; N]) -> Self {
         Self(bytes)
     }
 }

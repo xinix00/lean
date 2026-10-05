@@ -6,7 +6,7 @@
 //! hier loopt over publieke data.
 
 /// Lengte van een SHA-512-digest in bytes.
-pub(crate) const LEN: usize = 64;
+pub const LEN: usize = 64;
 
 /// Blokgrootte van SHA-512.
 const BLOCK: usize = 128;
@@ -121,10 +121,10 @@ const H0_384: [u64; 8] = [
 ];
 
 /// Lengte van een SHA-384-digest in bytes: de eerste 48 van [`Sha512::finish`].
-pub(crate) const LEN384: usize = 48;
+pub const LEN384: usize = 48;
 
 /// Een lopende SHA-512 (of SHA-384, zie [`Sha512::new384`]).
-pub(crate) struct Sha512 {
+pub struct Sha512 {
     /// De kettingwaarde.
     h: [u64; 8],
     /// Het nog onvolledige blok.
@@ -137,9 +137,15 @@ pub(crate) struct Sha512 {
     total: u64,
 }
 
+impl Default for Sha512 {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Sha512 {
     /// Begint een nieuwe hash.
-    pub(crate) const fn new() -> Self {
+    pub const fn new() -> Self {
         Self {
             h: H0,
             buf: [0; BLOCK],
@@ -150,7 +156,7 @@ impl Sha512 {
 
     /// Begint een SHA-384: dezelfde compressie, een andere begintoestand. De
     /// digest is dan de eerste [`LEN384`] bytes van [`Sha512::finish`].
-    pub(crate) const fn new384() -> Self {
+    pub const fn new384() -> Self {
         Self {
             h: H0_384,
             buf: [0; BLOCK],
@@ -160,7 +166,7 @@ impl Sha512 {
     }
 
     /// Voegt `data` toe.
-    pub(crate) fn update(&mut self, mut data: &[u8]) {
+    pub fn update(&mut self, mut data: &[u8]) {
         self.total = self.total.wrapping_add(data.len() as u64);
         while !data.is_empty() {
             let take = (BLOCK - self.fill).min(data.len());
@@ -176,7 +182,7 @@ impl Sha512 {
     }
 
     /// Sluit af en geeft de digest.
-    pub(crate) fn finish(mut self) -> [u8; LEN] {
+    pub fn finish(mut self) -> [u8; LEN] {
         let bits = u128::from(self.total).wrapping_mul(8);
         self.buf[self.fill] = 0x80;
         self.fill += 1;
@@ -239,7 +245,7 @@ fn compress(h: &mut [u64; 8], block: &[u8; BLOCK]) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::crypto::testutil::unhex;
+    use crate::testutil::unhex;
 
     fn digest(data: &[u8]) -> Vec<u8> {
         let mut h = Sha512::new();

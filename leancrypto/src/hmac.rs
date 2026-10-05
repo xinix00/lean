@@ -5,12 +5,12 @@
 //! `info` in stukken, zodat HKDF-Expand-Label zijn label niet eerst in een
 //! buffer hoeft te bouwen.
 
-use super::ct::wipe;
-use super::sha256::{BLOCK, LEN, Sha256};
+use crate::ct::wipe;
+use crate::sha256::{BLOCK, LEN, Sha256};
 
 /// Een lopende HMAC-SHA256.
 #[derive(Clone)]
-pub(crate) struct HmacSha256 {
+pub struct HmacSha256 {
     /// De hash over `K ^ ipad || tekst`.
     inner: Sha256,
     /// De hash over `K ^ opad`, nog zonder de binnenste digest.
@@ -20,7 +20,7 @@ pub(crate) struct HmacSha256 {
 impl HmacSha256 {
     /// Begint een HMAC met `key`; een sleutel langer dan een blok wordt eerst
     /// gehasht (RFC 2104 §2).
-    pub(crate) fn new(key: &[u8]) -> Self {
+    pub fn new(key: &[u8]) -> Self {
         let mut k0 = [0u8; BLOCK];
         if key.len() > BLOCK {
             let mut d = Sha256::digest(key);
@@ -46,12 +46,12 @@ impl HmacSha256 {
     }
 
     /// Voegt tekst toe.
-    pub(crate) fn update(&mut self, data: &[u8]) {
+    pub fn update(&mut self, data: &[u8]) {
         self.inner.update(data);
     }
 
     /// Geeft de MAC.
-    pub(crate) fn finish(self) -> [u8; LEN] {
+    pub fn finish(self) -> [u8; LEN] {
         let Self { inner, mut outer } = self;
         let mut d = inner.finish();
         outer.update(&d);
@@ -60,7 +60,7 @@ impl HmacSha256 {
     }
 
     /// HMAC in één keer.
-    pub(crate) fn mac(key: &[u8], data: &[u8]) -> [u8; LEN] {
+    pub fn mac(key: &[u8], data: &[u8]) -> [u8; LEN] {
         let mut m = Self::new(key);
         m.update(data);
         m.finish()
@@ -69,7 +69,7 @@ impl HmacSha256 {
 
 /// HKDF-Extract: `PRK = HMAC(salt, IKM)`. Een leeg zout is gelijk aan 32
 /// nullen, omdat HMAC een korte sleutel toch met nullen aanvult.
-pub(crate) fn extract(salt: &[u8], ikm: &[u8]) -> [u8; LEN] {
+pub fn extract(salt: &[u8], ikm: &[u8]) -> [u8; LEN] {
     HmacSha256::mac(salt, ikm)
 }
 
@@ -78,7 +78,7 @@ pub(crate) fn extract(salt: &[u8], ikm: &[u8]) -> [u8; LEN] {
 /// Geeft `false` als `out` langer is dan 255 blokken; RFC 5869 §2.3 verbiedt
 /// dat, en de TLS-schema's vragen nooit meer dan 32 bytes.
 #[must_use]
-pub(crate) fn expand(prk: &[u8], info_parts: &[&[u8]], out: &mut [u8]) -> bool {
+pub fn expand(prk: &[u8], info_parts: &[&[u8]], out: &mut [u8]) -> bool {
     if out.len() > 255 * LEN {
         return false;
     }
@@ -104,7 +104,7 @@ pub(crate) fn expand(prk: &[u8], info_parts: &[&[u8]], out: &mut [u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::crypto::testutil::unhex;
+    use crate::testutil::unhex;
 
     /// RFC 4231 §4.2 tot en met §4.8, testgevallen 1 tot en met 7.
     #[test]

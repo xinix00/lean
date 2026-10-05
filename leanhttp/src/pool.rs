@@ -84,7 +84,25 @@ impl<C: Conn> Pool<C> {
     /// Geweigerd wordt: een gegroeide verbinding (zie
     /// [`Close::has_grown`](crate::Close::has_grown)), een verbinding die zijn
     /// termijnen niet kan wissen, en alles boven de grenzen.
-    pub async fn put(&mut self, addr: &str, mut conn: C, now: Duration) -> bool {
+    pub async fn put(&mut self, addr: &str, conn: C, now: Duration) -> bool {
+        match self.admit(addr, conn, now) {
+            Ok(()) => true,
+            Err(mut conn) => {
+                let _ = close(&mut conn).await;
+                false
+            }
+        }
+    }
+
+    /// Als [`Pool::put`] zonder te wachten: een verbinding die niet past,
+    /// valt zonder nette afsluiting. Voor wie geen async heeft op het moment
+    /// dat een body ophoudt, zoals een `AsyncRead` die een antwoord stroomt.
+    pub fn put_now(&mut self, addr: &str, conn: C, now: Duration) -> bool {
+        self.admit(addr, conn, now).is_ok()
+    }
+
+    /// Neemt `conn` op, of geeft hem terug als hij er niet in mag.
+    fn admit(&mut self, addr: &str, mut conn: C, now: Duration) -> core::result::Result<(), C> {
         // Een termijn van het vorige verzoek mag nooit in het volgende lekken;
         // een verbinding die hem niet kan wissen, is niet herbruikbaar.
         let fresh = conn.set_read_timeout(None).is_ok() && conn.set_write_timeout(None).is_ok();
@@ -93,17 +111,14 @@ impl<C: Conn> Pool<C> {
             && self.idle.try_reserve(1).is_ok();
         let addr = match try_string(addr) {
             Ok(a) if fresh && room && !conn.has_grown() => a,
-            _ => {
-                let _ = close(&mut conn).await;
-                return false;
-            }
+            _ => return Err(conn),
         };
         self.idle.push(Idle {
             addr,
             conn,
             since: now,
         });
-        true
+        Ok(())
     }
 
     /// Sluit alle verbindingen die langer rusten dan `idle_timeout`, voor elke
@@ -148,6 +163,16 @@ impl<C: Conn> Pool<C> {
                 return;
             }
             self.put(&addr, conn, now).await;
+        }
+    }
+
+    /// Als [`Pool::finish`] zonder te wachten: een herbruikbaar antwoord
+    /// komt terug in de pool, de rest valt.
+    pub fn finish_now(&mut self, resp: Response<C>, now: Duration) {
+        if let Some((addr, conn)) = resp.into_reusable()
+            && !addr.is_empty()
+        {
+            self.put_now(&addr, conn, now);
         }
     }
 

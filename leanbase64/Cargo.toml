@@ -1,14 +1,13 @@
 [package]
-name = "leans3"
+name = "leanbase64"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "S3: SigV4-ondertekening plus de object-operaties die echt gebruikt worden."
+description = "Base64 (RFC 4648): het standaardalfabet met padding en het URL-alfabet zonder, strikt gedecodeerd."
 
 [dependencies]
-leancrypto = { path = "../leancrypto" }
 
 [lints]
 workspace = true

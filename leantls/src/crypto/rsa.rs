@@ -112,7 +112,7 @@ impl PublicKey {
             HashAlg::Sha384 => &DIGEST_INFO_SHA384,
             HashAlg::Sha512 => &DIGEST_INFO_SHA512,
         };
-        if digest.len() != hash.len() {
+        if digest.len() != hash.digest_len() {
             return false;
         }
         let mut buf = [0u8; MAX_BYTES];
@@ -153,7 +153,7 @@ impl PublicKey {
 /// EMSA-PSS-VERIFY (RFC 8017 §9.1.2) op het geopende getal `m` van `k`
 /// bytes, met `em_bits = modBits - 1`.
 fn pss_check(m: &[u8], em_bits: usize, hash: HashAlg, digest: &[u8]) -> Option<bool> {
-    let h_len = hash.len();
+    let h_len = hash.digest_len();
     let s_len = h_len;
     if digest.len() != h_len {
         return Some(false);
@@ -192,7 +192,7 @@ fn pss_check(m: &[u8], em_bits: usize, hash: HashAlg, digest: &[u8]) -> Option<b
 
 /// `out ^= MGF1(seed)` over de lengte van `out`.
 fn mgf1_xor(hash: HashAlg, seed: &[u8], out: &mut [u8]) {
-    for (counter, chunk) in (0u32..).zip(out.chunks_mut(hash.len())) {
+    for (counter, chunk) in (0u32..).zip(out.chunks_mut(hash.digest_len())) {
         let mask = hash.digest(&[seed, &counter.to_be_bytes()]);
         for (o, m) in chunk.iter_mut().zip(mask.as_slice()) {
             *o ^= m;

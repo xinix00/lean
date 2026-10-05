@@ -5,10 +5,10 @@
 //! transcript zonder het transcript zelf te bewaren.
 
 /// Lengte van een SHA-256-digest in bytes.
-pub(crate) const LEN: usize = 32;
+pub const LEN: usize = 32;
 
 /// Blokgrootte van SHA-256, nodig voor HMAC.
-pub(crate) const BLOCK: usize = 64;
+pub const BLOCK: usize = 64;
 
 /// De ronde-constanten: de eerste 32 bits van de breukdelen van de
 /// derdemachtswortels van de eerste 64 priemgetallen.
@@ -31,7 +31,7 @@ const H0: [u32; 8] = [
 
 /// Een lopende SHA-256.
 #[derive(Clone)]
-pub(crate) struct Sha256 {
+pub struct Sha256 {
     /// De kettingwaarde.
     h: [u32; 8],
     /// Het nog onvolledige blok.
@@ -42,9 +42,15 @@ pub(crate) struct Sha256 {
     total: u64,
 }
 
+impl Default for Sha256 {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Sha256 {
     /// Begint een nieuwe hash.
-    pub(crate) const fn new() -> Self {
+    pub const fn new() -> Self {
         Self {
             h: H0,
             buf: [0; BLOCK],
@@ -54,7 +60,7 @@ impl Sha256 {
     }
 
     /// Voegt `data` toe.
-    pub(crate) fn update(&mut self, mut data: &[u8]) {
+    pub fn update(&mut self, mut data: &[u8]) {
         self.total = self.total.wrapping_add(data.len() as u64);
         while !data.is_empty() {
             let take = (BLOCK - self.fill).min(data.len());
@@ -70,7 +76,7 @@ impl Sha256 {
     }
 
     /// Sluit af met padding en lengte en geeft de digest.
-    pub(crate) fn finish(mut self) -> [u8; LEN] {
+    pub fn finish(mut self) -> [u8; LEN] {
         let bits = self.total.wrapping_mul(8);
         self.buf[self.fill] = 0x80;
         self.fill += 1;
@@ -90,7 +96,7 @@ impl Sha256 {
     }
 
     /// Hasht `data` in één keer.
-    pub(crate) fn digest(data: &[u8]) -> [u8; LEN] {
+    pub fn digest(data: &[u8]) -> [u8; LEN] {
         let mut h = Self::new();
         h.update(data);
         h.finish()
@@ -100,8 +106,8 @@ impl Sha256 {
 impl Drop for Sha256 {
     fn drop(&mut self) {
         // Een HMAC-toestand bevat de afgeleide sleutel; wis altijd.
-        super::ct::wipe(&mut self.h);
-        super::ct::wipe(&mut self.buf);
+        crate::ct::wipe(&mut self.h);
+        crate::ct::wipe(&mut self.buf);
     }
 }
 
@@ -148,7 +154,7 @@ fn compress(h: &mut [u32; 8], block: &[u8; BLOCK]) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::crypto::testutil::unhex;
+    use crate::testutil::unhex;
 
     /// RFC 6234 §8.5 (TEST1, TEST2_1, TEST3) voor SHA-256.
     #[test]

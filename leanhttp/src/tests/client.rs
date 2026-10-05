@@ -5,6 +5,7 @@
 //! de gevallen future zijn verbinding of dial meeneemt.
 
 use std::cell::{Cell, RefCell};
+use std::future::Future;
 use std::rc::Rc;
 use std::task::{Context, Poll};
 use std::time::Duration;
@@ -1632,4 +1633,69 @@ fn pool_dial_valt_onder_de_totaaltermijn() {
         assert!(now() < Duration::from_secs(3));
     });
     assert!(dropped.get(), "de totaaltermijn mist het pool-pad");
+}
+
+/// Een verbinding die afwisselend `Pending` en één byte geeft.
+struct Trickle {
+    answer: &'static [u8],
+    at: usize,
+    wait: bool,
+}
+
+impl AsyncRead for Trickle {
+    fn poll_read(&mut self, cx: &mut Context<'_>, buf: &mut [u8]) -> Poll<Result<usize, IoError>> {
+        self.wait = !self.wait;
+        if self.wait {
+            cx.waker().wake_by_ref();
+            return Poll::Pending;
+        }
+        let Some(&b) = self.answer.get(self.at) else {
+            return Poll::Ready(Ok(0));
+        };
+        buf[0] = b;
+        self.at += 1;
+        Poll::Ready(Ok(1))
+    }
+}
+
+impl crate::AsyncWrite for Trickle {
+    fn poll_write(&mut self, _: &mut Context<'_>, buf: &[u8]) -> Poll<Result<usize, IoError>> {
+        Poll::Ready(Ok(buf.len()))
+    }
+}
+
+impl crate::Close for Trickle {
+    fn poll_close(&mut self, _: &mut Context<'_>) -> Poll<Result<(), IoError>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
+#[test]
+fn gechunkte_body_overleeft_loslaten_na_elke_pending() {
+    let conn = Trickle {
+        answer: b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhallo\r\n7\r\n wereld\r\n0\r\nX-Sum: 1\r\n\r\n",
+        at: 0,
+        wait: false,
+    };
+    let mut cx = Context::from_waker(std::task::Waker::noop());
+    let mut head = std::pin::pin!(send(conn, call("http://srv/")));
+    let mut resp = (0..10_000)
+        .find_map(|_| match head.as_mut().poll(&mut cx) {
+            Poll::Ready(r) => Some(r.unwrap()),
+            Poll::Pending => None,
+        })
+        .expect("de kop komt binnen");
+    // Geen future die blijft staan: elke poll is een nieuwe aanroep.
+    let mut body = Vec::new();
+    let mut buf = [0u8; 4];
+    for _ in 0..1000 {
+        match resp.poll_read(&mut cx, &mut buf) {
+            Poll::Ready(Ok(0)) => break,
+            Poll::Ready(Ok(n)) => body.extend_from_slice(&buf[..n]),
+            Poll::Ready(Err(e)) => panic!("{e:?}"),
+            Poll::Pending => {}
+        }
+    }
+    assert_eq!(body, b"hallo wereld");
+    assert!(resp.is_complete());
 }

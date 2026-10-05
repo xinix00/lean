@@ -312,7 +312,8 @@ fn hex_sum(data: &[u8]) -> String {
 }
 
 // De Go-test keek naar de importgraaf: geen net/http, geen crypto/tls. Hier is
-// dat de afhankelijkhedenlijst, die leeg moet blijven.
+// dat de afhankelijkhedenlijst: alleen de primitieven van leancrypto (SHA-256
+// en HMAC voor SigV4), geen HTTP- of TLS-stack.
 #[test]
 fn geen_net_http() {
     let manifest = include_str!("../Cargo.toml");
@@ -323,8 +324,14 @@ fn geen_net_http() {
         .split('[')
         .next()
         .unwrap();
-    assert!(
-        deps.trim().is_empty(),
+    let names: Vec<&str> = deps
+        .lines()
+        .filter_map(|l| l.split('=').next().map(str::trim))
+        .filter(|n| !n.is_empty() && !n.starts_with('#'))
+        .collect();
+    assert_eq!(
+        names,
+        ["leancrypto"],
         "leans3 heeft afhankelijkheden: {deps}"
     );
 }

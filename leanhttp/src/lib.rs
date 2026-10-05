@@ -49,10 +49,14 @@
 #![forbid(unsafe_code)]
 
 extern crate alloc;
+#[cfg(all(feature = "std", not(test)))]
+extern crate std;
 
 mod client;
 mod error;
 mod header;
+#[cfg(feature = "std")]
+pub mod host;
 mod io;
 mod mux;
 mod pool;

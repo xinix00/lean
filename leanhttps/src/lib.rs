@@ -76,6 +76,12 @@ pub enum Error {
     /// Ketenverificatie tegen een kaal IP-adres: er is geen naam om de keten
     /// tegen te toetsen. Gebruik een hostnaam, of pin de sleutel.
     ChainWithoutName,
+    /// Er is geen wandklok om een keten op te toetsen (geen SNTP of RTC).
+    NoClock,
+    /// Er is geen willekeur voor de handshake.
+    NoEntropy,
+    /// De wortelset is onleesbaar.
+    Roots,
     /// Het transport onder TLS faalde.
     Transport(IoError),
     /// De handshake of een record faalde.
@@ -89,6 +95,11 @@ impl fmt::Display for Error {
                 "leanhttps: the host is an IP address, so there is no name to verify a chain \
                  against; use a hostname, or pin the peer's key",
             ),
+            Self::NoClock => f.write_str(
+                "leanhttps: no wall clock to verify a certificate chain against (SNTP or RTC)",
+            ),
+            Self::NoEntropy => f.write_str("leanhttps: no entropy for the handshake"),
+            Self::Roots => f.write_str("leanhttps: the root certificates do not parse"),
             Self::Transport(e) => write!(f, "leanhttps: transport: {e}"),
             Self::Tls(e) => write!(f, "leanhttps: {e}"),
         }

@@ -46,9 +46,7 @@
 
 extern crate alloc;
 
-mod hmac;
 mod listparse;
-mod sha256;
 mod sigv4;
 #[cfg(test)]
 mod tests;

@@ -11,6 +11,11 @@ echo "== host: leannet met de feature ipv6"
 # De IPv6-baan staat standaard uit; zijn toetsen en clippy draaien hier.
 cargo test --quiet -p leannet --features ipv6
 cargo clippy --all-targets --quiet -p leannet --features ipv6 -- -D warnings
+echo "== host: leanhttp met de feature std"
+# De TCP van een host (leanhttp::host) staat standaard uit; zijn toetsen
+# praten echte TCP op localhost.
+cargo test --quiet -p leanhttp --features std
+cargo clippy --all-targets --quiet -p leanhttp --features std -- -D warnings
 echo "== rustfmt"
 cargo fmt --check
 echo "== target: no_std (aarch64)"

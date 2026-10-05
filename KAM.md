@@ -342,10 +342,25 @@ number of transports the caller supplies.
 ### leans3http
 
 `leans3http` is the default `leans3::Transport` over `leanhttp`: one
-keep-alive connection per transport, never a redirect, a bounded in-memory
-body (32 MiB by default), a total deadline per attempt (60 s; header 30 s) on a
-caller `Clock`, and an optional per-target byte observer. Streamed PUT bodies
-go through `Expect: 100-continue` as in `leanhttp`.
+keep-alive connection per transport, never a redirect, a total deadline per
+attempt up to and including the response header (60 s; header 30 s) on a
+caller `Clock`, and an optional per-target byte observer that counts bytes as
+they arrive. The body streams: `Reply` reads it from the connection while the
+caller reads, re-arming a progress timeout (30 s) after every read, so a
+transfer may last as long as it keeps moving (the S3 policy above). After the
+last byte the connection returns to the pool without an await; a reply
+dropped early closes its connection. A retried GET reads at most a 64 KiB
+error body. Streamed PUT bodies go through `Expect: 100-continue` as in
+`leanhttp`.
+
+`leanhttp::Response::poll_read` is the one body decoder: the framing state
+(length, chunk header, chunk data, the CRLF after a chunk, trailers) lives in
+the response, not in a future, so a reader may drop between polls without
+losing its place. `Response::into_reusable` and `Pool::put_now` hand a fully
+read connection back synchronously. `leanhttp::host` (feature `std`) is the
+host TCP dial: name lookup, up to 16 addresses with a connect timeout each, a
+blocking socket with phase deadlines or a non-blocking one that reports
+interest to the caller's reactor, and the failing step in `last_error`.
 
 ### Change rule, filled in: GET retry and parallel streams
 

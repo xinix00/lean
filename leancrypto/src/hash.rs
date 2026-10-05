@@ -4,12 +4,12 @@
 //! kiest hem hier. Geen trait-object: drie varianten en een vaste buffer van
 //! 64 bytes, zodat er niets gealloceerd wordt.
 
-use super::sha256::Sha256;
-use super::sha512::{LEN384, Sha512};
+use crate::sha256::Sha256;
+use crate::sha512::{LEN384, Sha512};
 
 /// Een hashfunctie uit de SHA-2-familie.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum HashAlg {
+pub enum HashAlg {
     /// SHA-256.
     Sha256,
     /// SHA-384.
@@ -19,11 +19,11 @@ pub(crate) enum HashAlg {
 }
 
 /// Grootste digest in bytes (SHA-512).
-pub(crate) const MAX_DIGEST: usize = 64;
+pub const MAX_DIGEST: usize = 64;
 
 /// Een digest van hooguit [`MAX_DIGEST`] bytes.
 #[derive(Clone, Copy)]
-pub(crate) struct Digest {
+pub struct Digest {
     /// De bytes; alleen de eerste `len` tellen.
     bytes: [u8; MAX_DIGEST],
     /// De lengte van deze digest.
@@ -32,7 +32,7 @@ pub(crate) struct Digest {
 
 impl Digest {
     /// De digest als slice.
-    pub(crate) fn as_slice(&self) -> &[u8] {
+    pub fn as_slice(&self) -> &[u8] {
         self.bytes.get(..self.len).unwrap_or(&[])
     }
 }
@@ -47,7 +47,7 @@ enum Running {
 
 impl HashAlg {
     /// De lengte van de digest in bytes.
-    pub(crate) const fn len(self) -> usize {
+    pub const fn digest_len(self) -> usize {
         match self {
             HashAlg::Sha256 => 32,
             HashAlg::Sha384 => LEN384,
@@ -57,7 +57,7 @@ impl HashAlg {
 
     /// Hasht de aaneenschakeling van `parts`; zo hoeft PSS en MGF1 niets aan
     /// elkaar te plakken in een buffer.
-    pub(crate) fn digest(self, parts: &[&[u8]]) -> Digest {
+    pub fn digest(self, parts: &[&[u8]]) -> Digest {
         let mut h = match self {
             HashAlg::Sha256 => Running::S256(Sha256::new()),
             HashAlg::Sha384 => Running::S512(Sha512::new384()),
@@ -79,7 +79,7 @@ impl HashAlg {
         }
         Digest {
             bytes,
-            len: self.len(),
+            len: self.digest_len(),
         }
     }
 }

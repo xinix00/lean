@@ -27,7 +27,8 @@ pub enum Link<C> {
 /// `http://` gaat kaal over `inner`; `https://` krijgt TLS met
 /// ketenverificatie tegen `roots` (bijvoorbeeld `leantls::MOZILLA_ROOTS`)
 /// op de wandklok van `unix_seconds`, met verse `entropy` per handshake.
-/// Zonder klok of entropie faalt de dial; nooit een handshake met een
+/// Zonder klok of entropie faalt de dial vóór er een verbinding opengaat,
+/// met de reden in [`WebDial::last_error`]; nooit een handshake met een
 /// verzonnen tijd of nul-entropie.
 pub struct WebDial<D, N, R> {
     pub(crate) inner: D,
@@ -58,9 +59,16 @@ where
         }
     }
 
-    /// De reden van de laatst mislukte TLS-handshake, als die er is.
+    /// Waarom de laatste https-dial mislukte, als dat zo was: een weigering
+    /// vooraf (geen klok, geen entropie, geen wortels) of de handshake.
     pub fn last_error(&self) -> Option<Error> {
         self.last_error
+    }
+
+    /// Een weigering vóór er een verbinding opengaat.
+    fn refuse(&mut self, why: Error) -> leanhttp::Error {
+        self.last_error = Some(why);
+        leanhttp::Error::Connect
     }
 }
 
@@ -82,10 +90,15 @@ where
             self.last_error = Some(Error::ChainWithoutName);
             return Err(leanhttp::Error::NoHost);
         }
-        let roots =
-            Roots::from_concatenated_der(self.roots).map_err(|_| leanhttp::Error::Connect)?;
-        let now = (self.unix_seconds)().ok_or(leanhttp::Error::Connect)?;
-        let entropy = (self.entropy)().ok_or(leanhttp::Error::Connect)?;
+        let Ok(roots) = Roots::from_concatenated_der(self.roots) else {
+            return Err(self.refuse(Error::Roots));
+        };
+        let Some(now) = (self.unix_seconds)() else {
+            return Err(self.refuse(Error::NoClock));
+        };
+        let Some(entropy) = (self.entropy)() else {
+            return Err(self.refuse(Error::NoEntropy));
+        };
         let verifier = ChainVerifier::new(roots, now);
         let mut raw = self.inner.dial(target).await?;
         raw.set_read_timeout(Some(self.handshake))?;

@@ -1,14 +1,13 @@
 [package]
-name = "leans3"
+name = "leancrypto"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "S3: SigV4-ondertekening plus de object-operaties die echt gebruikt worden."
+description = "De primitieven die meer dan één crate nodig heeft: SHA-256/512, HMAC en HKDF, AES-128-GCM en constant-time."
 
 [dependencies]
-leancrypto = { path = "../leancrypto" }
 
 [lints]
 workspace = true

@@ -555,3 +555,25 @@ fn pool_totaalcap() {
         assert!(pool.idle_count() <= 8);
     });
 }
+
+#[test]
+fn finish_now_poolt_alleen_een_hele_body() {
+    let n = net(
+        "srv:80",
+        raw("HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhallo"),
+    );
+    block_on(async {
+        let mut cl = Client::new(n.clone());
+        let mut resp = cl.send(call("http://srv/"), now()).await.unwrap();
+        let mut buf = [0u8; 16];
+        assert_eq!(resp.read(&mut buf).await, Ok(5));
+        assert_eq!(resp.read(&mut buf).await, Ok(0));
+        cl.pool.finish_now(resp, now());
+        assert_eq!(cl.pool.idle_count(), 1);
+        // Half gelezen: de verbinding valt, de pool krijgt hem niet.
+        let mut resp = cl.send(call("http://srv/"), now()).await.unwrap();
+        assert_eq!(resp.read(&mut buf[..2]).await, Ok(2));
+        cl.pool.finish_now(resp, now());
+        assert_eq!(cl.pool.idle_count(), 0);
+    });
+}

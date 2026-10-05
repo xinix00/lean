@@ -8,6 +8,7 @@ repository.workspace = true
 description = "TLS 1.3 voor een netwerk dat je bezit: een versie, een suite, een gepinde Ed25519-peer of een echte keten."
 
 [dependencies]
+leancrypto = { path = "../leancrypto" }
 
 [features]
 # De Mozilla NSS-wortels (`MOZILLA_ROOTS`) meelinken.

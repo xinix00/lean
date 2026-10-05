@@ -12,9 +12,9 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use crate::hmac::hmac_sha256;
-use crate::sha256;
 use crate::{Error, Header, Result, UNSIGNED_PAYLOAD, Url, push_str};
+use leancrypto::hmac::HmacSha256;
+use leancrypto::sha256::Sha256;
 
 /// Het algoritme in de Authorization-kop.
 const ALGORITHM: &str = "AWS4-HMAC-SHA256";
@@ -76,7 +76,7 @@ pub(crate) fn sign_request(
         push_str(&mut scope, part)?;
     }
     let mut to_sign = String::new();
-    let canonical_hash = hex(&sha256::digest(canonical.as_bytes()));
+    let canonical_hash = hex(&Sha256::digest(canonical.as_bytes()));
     for part in [
         ALGORITHM,
         "\n",
@@ -89,7 +89,7 @@ pub(crate) fn sign_request(
         push_str(&mut to_sign, part)?;
     }
     let key = derive_signing_key(creds.secret_access_key, date, creds.region);
-    let signature = hex(&hmac_sha256(&key, to_sign.as_bytes()));
+    let signature = hex(&HmacSha256::mac(&key, to_sign.as_bytes()));
 
     let mut auth = String::new();
     for part in [
@@ -274,9 +274,9 @@ pub(crate) fn derive_signing_key(secret: &str, date: &str, region: &str) -> [u8;
     // De eerste sleutel is "AWS4" + geheim, op de stack samengesteld zodat
     // het geheim niet in een heapbuffer achterblijft.
     let k_date = hmac_with_prefixed_key(b"AWS4", secret.as_bytes(), date.as_bytes());
-    let k_region = hmac_sha256(&k_date, region.as_bytes());
-    let k_service = hmac_sha256(&k_region, SERVICE.as_bytes());
-    hmac_sha256(&k_service, TERMINATOR.as_bytes())
+    let k_region = HmacSha256::mac(&k_date, region.as_bytes());
+    let k_service = HmacSha256::mac(&k_region, SERVICE.as_bytes());
+    HmacSha256::mac(&k_service, TERMINATOR.as_bytes())
 }
 
 /// HMAC met sleutel `prefix + secret`. Een geheim dat samen met het voorvoegsel
@@ -290,14 +290,14 @@ fn hmac_with_prefixed_key(prefix: &[u8], secret: &[u8], data: &[u8]) -> [u8; 32]
             let (a, b) = dst.split_at_mut(prefix.len());
             a.copy_from_slice(prefix);
             b.copy_from_slice(secret);
-            hmac_sha256(dst, data)
+            HmacSha256::mac(dst, data)
         }
         None => {
             // Langer dan 128 bytes: hash eerst, zoals RFC 2104 toch voorschrijft.
-            let mut h = sha256::Sha256::new();
+            let mut h = Sha256::new();
             h.update(prefix);
             h.update(secret);
-            hmac_sha256(&h.finish(), data)
+            HmacSha256::mac(&h.finish(), data)
         }
     }
 }
@@ -325,7 +325,7 @@ fn set_header_owned(headers: &mut Vec<Header>, name: &'static str, value: String
 
 /// De hexadecimale SHA-256 van `data` in kleine letters, S3's payload-vorm.
 pub(crate) fn hex_sha256(data: &[u8]) -> [u8; 64] {
-    hex(&sha256::digest(data))
+    hex(&Sha256::digest(data))
 }
 
 /// Hex in kleine letters van een digest.

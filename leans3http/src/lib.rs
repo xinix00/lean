@@ -5,8 +5,15 @@
 //! keep-alive-verbinding per [`Http`] (een verbinding draagt één verzoek
 //! tegelijk; wie tegelijk wil, neemt er meer en gebruikt
 //! [`leans3::Client::get_to_all`]), nooit een redirect (de handtekening dekt
-//! host en pad), een begrensde body, een totaaltermijn per poging, en voor
-//! GET en HEAD een paar herkansingen met een oplopende wachttijd.
+//! host en pad), en voor GET en HEAD een paar herkansingen met een
+//! oplopende wachttijd.
+//!
+//! De body stroomt: [`Reply`] leest hem van de verbinding terwijl de
+//! aanroeper leest, dus een object van honderden MB kost niet meer geheugen
+//! dan de buffer van wie het wegschrijft. Na de laatste byte gaat de
+//! verbinding terug in de pool. De termijnen volgen KAM: één totaaltermijn
+//! voor het verzoek tot en met de kop, daarna een voortgangstermijn per read,
+//! zodat een lange download zo lang mag duren als hij vordert.
 //!
 //! De klok is van de aanroeper ([`Clock`]): de pool rekent er de leeftijd van
 //! verbindingen mee, en de termijn en de herkansing wachten erop.
@@ -26,8 +33,10 @@
 extern crate alloc;
 
 use alloc::boxed::Box;
+use alloc::rc::Rc;
 use alloc::string::String;
 use alloc::vec::Vec;
+use core::cell::RefCell;
 use core::future::{Future, poll_fn};
 use core::pin::{Pin, pin};
 use core::task::{Context, Poll};
@@ -47,43 +56,60 @@ pub trait Clock {
 /// De grenzen van één [`Http`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Limits {
-    /// Totaaltermijn van één poging: verbinden, verzoek en hele body.
+    /// Totaaltermijn van één poging tot en met de antwoordkop: verbinden,
+    /// TLS, het verzoek met zijn body, en wachten op de kop.
     pub deadline: Duration,
-    /// Termijn op de antwoordkop.
+    /// Termijn op de antwoordkop zelf.
     pub header: Duration,
-    /// De grootste body die in het geheugen komt.
-    pub body: usize,
+    /// Voortgangstermijn van de body: zo lang mag één read zonder bytes
+    /// duren.
+    pub progress: Duration,
     /// Pogingen voor GET en HEAD, de eerste meegeteld; nooit minder dan één.
     pub attempts: u32,
+    /// De grootste foutbody die bij een herkansing gelezen wordt.
+    pub error_body: usize,
 }
 
 impl Default for Limits {
-    /// 60 s per poging, 30 s op de kop, 32 MiB body, vier pogingen.
+    /// 60 s tot de kop, 30 s op de kop, 30 s voortgang, vier pogingen.
     fn default() -> Self {
         Self {
             deadline: Duration::from_secs(60),
             header: Duration::from_secs(30),
-            body: 32 << 20,
+            progress: Duration::from_secs(30),
             attempts: 4,
+            error_body: 64 << 10,
         }
     }
 }
 
-/// Telt ontvangen bodybytes per request-target, bijvoorbeeld voor een
-/// voortgangsbalk tijdens een herstel.
+/// Telt ontvangen bodybytes per request-target, terwijl ze binnenkomen;
+/// bijvoorbeeld voor een voortgangsbalk tijdens een herstel.
 pub type Observer = Box<dyn FnMut(&str, usize)>;
+
+/// Een verbinding die een [`Reply`] na zijn laatste byte teruggeeft.
+struct Back<C> {
+    addr: String,
+    conn: C,
+    at: Duration,
+}
+
+/// Het bakje tussen een [`Reply`] en zijn [`Http`]: zo leent niemand de
+/// client over een `await`.
+type Returned<C> = Rc<RefCell<Vec<Back<C>>>>;
 
 /// Een [`leans3::Transport`] over één keep-alive-verbinding van `D`.
 pub struct Http<D: Dial, K> {
     client: leanhttp::Client<D>,
+    returned: Returned<D::Conn>,
     clock: K,
     /// De grenzen; aan te passen na [`Http::new`].
     pub limits: Limits,
-    observer: Option<Observer>,
+    observer: Option<Rc<RefCell<Observer>>>,
     last_error: Option<leanhttp::Error>,
 }
 
-impl<D: Dial, K: Clock> Http<D, K> {
+impl<D: Dial, K: Clock + Clone> Http<D, K> {
     /// Een transport over `dialer` met [`Limits::default`] en één verbinding
     /// in de pool.
     pub fn new(dialer: D, clock: K) -> Self {
@@ -92,6 +118,7 @@ impl<D: Dial, K: Clock> Http<D, K> {
         client.pool.max_idle_total = 1;
         Self {
             client,
+            returned: Rc::default(),
             clock,
             limits: Limits::default(),
             observer: None,
@@ -99,10 +126,10 @@ impl<D: Dial, K: Clock> Http<D, K> {
         }
     }
 
-    /// Meldt iedere ontvangen body met zijn request-target.
+    /// Meldt ontvangen bodybytes met hun request-target, per stuk.
     #[must_use]
     pub fn observe(mut self, observer: impl FnMut(&str, usize) + 'static) -> Self {
-        self.observer = Some(Box::new(observer));
+        self.observer = Some(Rc::new(RefCell::new(Box::new(observer))));
         self
     }
 
@@ -112,23 +139,52 @@ impl<D: Dial, K: Clock> Http<D, K> {
         self.last_error
     }
 
-    /// Eén poging binnen [`Limits::deadline`].
+    /// De dialer, bijvoorbeeld voor `WebDial::last_error`: de reden van een
+    /// mislukte TLS-handshake.
+    pub fn dialer(&self) -> &D {
+        &self.client.dialer
+    }
+
+    /// Neemt de verbindingen terug die antwoorden na hun laatste byte
+    /// teruglegden.
+    fn reclaim(&mut self) {
+        let back = match self.returned.try_borrow_mut() {
+            Ok(mut returned) => core::mem::take(&mut *returned),
+            Err(_) => return,
+        };
+        for b in back {
+            self.client.pool.put_now(&b.addr, b.conn, b.at);
+        }
+    }
+
+    /// Eén poging tot en met de kop, binnen [`Limits::deadline`].
     async fn attempt(
         &mut self,
         request: &Parts<'_>,
         upload: Option<(&mut Upload<'_>, u64)>,
-    ) -> leanhttp::Result<Reply> {
-        let deadline = self.limits.deadline;
-        let sleep = self.clock.sleep(deadline);
+    ) -> leanhttp::Result<leanhttp::Response<D::Conn>> {
+        self.reclaim();
+        let sleep = self.clock.sleep(self.limits.deadline);
         let mut sleep = pin!(sleep);
-        let attempt = exchange(
-            &mut self.client,
-            &self.clock,
-            &self.limits,
-            &mut self.observer,
-            request,
-            upload,
-        );
+        let mut header = Header::new();
+        for item in request.headers {
+            header.set(item.name, &item.value)?;
+        }
+        let (body_reader, body_len) = match upload {
+            Some((upload, len)) => (Some(upload as &mut dyn leanhttp::AsyncRead), len),
+            None => (None, 0),
+        };
+        let call = Call {
+            method: request.method,
+            url: request.url,
+            header,
+            body: request.bytes,
+            body_reader,
+            body_len,
+            header_timeout: Some(self.limits.header),
+            no_follow: true,
+        };
+        let attempt = self.client.send(call, self.clock.now());
         let mut attempt = pin!(attempt);
         poll_fn(|cx| {
             if let Poll::Ready(result) = attempt.as_mut().poll(cx) {
@@ -144,58 +200,22 @@ impl<D: Dial, K: Clock> Http<D, K> {
         })
         .await
     }
+
+    /// Leest een korte foutbody en geeft de verbinding terug, vóór een
+    /// herkansing.
+    async fn drain(&mut self, mut response: leanhttp::Response<D::Conn>) {
+        if response.read_to_end(self.limits.error_body).await.is_ok() {
+            self.client.finish(response, self.clock.now()).await;
+        }
+    }
 }
 
 /// Wat van een [`Request`] over is zonder zijn gestroomde body.
 struct Parts<'a> {
     method: &'static str,
-    target: &'a str,
     url: &'a str,
     headers: &'a [leans3::Header],
     bytes: Option<&'a [u8]>,
-}
-
-/// Verzoek, hele body en de verbinding terug naar de pool.
-async fn exchange<D: Dial, K: Clock>(
-    client: &mut leanhttp::Client<D>,
-    clock: &K,
-    limits: &Limits,
-    observer: &mut Option<Observer>,
-    request: &Parts<'_>,
-    upload: Option<(&mut Upload<'_>, u64)>,
-) -> leanhttp::Result<Reply> {
-    let mut header = Header::new();
-    for item in request.headers {
-        header.set(item.name, &item.value)?;
-    }
-    let (body_reader, body_len) = match upload {
-        Some((upload, len)) => (Some(upload as &mut dyn leanhttp::AsyncRead), len),
-        None => (None, 0),
-    };
-    let call = Call {
-        method: request.method,
-        url: request.url,
-        header,
-        body: request.bytes,
-        body_reader,
-        body_len,
-        header_timeout: Some(limits.header),
-        no_follow: true,
-    };
-    let mut response = client.send(call, clock.now()).await?;
-    let body = response.read_to_end(limits.body).await?;
-    if let Some(observe) = observer.as_mut() {
-        observe(request.target, body.len());
-    }
-    let reply = Reply {
-        status: response.status,
-        reason: core::mem::take(&mut response.reason),
-        header: core::mem::take(&mut response.header),
-        body,
-        offset: 0,
-    };
-    client.finish(response, clock.now()).await;
-    Ok(reply)
 }
 
 /// Statussen waarop een GET of HEAD het opnieuw mag proberen.
@@ -223,15 +243,14 @@ fn io(error: leanhttp::Error) -> IoError {
         }
         leanhttp::Error::UnexpectedEof | leanhttp::Error::Eof => IoError::UnexpectedEof,
         leanhttp::Error::Connect => IoError::Other("leans3http: connect failed"),
-        leanhttp::Error::BodyTooLarge { .. } => IoError::Other("leans3http: body too large"),
         _ => IoError::Other("leans3http: HTTP failed"),
     }
 }
 
-impl<D: Dial, K: Clock> leans3::Transport for Http<D, K> {
-    type Response = Reply;
+impl<D: Dial, K: Clock + Clone + Unpin> leans3::Transport for Http<D, K> {
+    type Response = Reply<D::Conn, K>;
 
-    async fn send(&mut self, request: Request<'_, '_>) -> Result<Reply, IoError> {
+    async fn send(&mut self, request: Request<'_, '_>) -> Result<Reply<D::Conn, K>, IoError> {
         let mut url = String::new();
         let scheme = if request.https { "https://" } else { "http://" };
         url.try_reserve_exact(scheme.len() + request.host.len() + request.target.len())
@@ -239,6 +258,11 @@ impl<D: Dial, K: Clock> leans3::Transport for Http<D, K> {
         url.push_str(scheme);
         url.push_str(request.host);
         url.push_str(request.target);
+        let mut target = String::new();
+        target
+            .try_reserve_exact(request.target.len())
+            .map_err(|_| IoError::Other("leans3http: out of memory"))?;
+        target.push_str(request.target);
         let replay = matches!(request.method, "GET" | "HEAD");
         let attempts = if replay {
             self.limits.attempts.max(1)
@@ -252,7 +276,6 @@ impl<D: Dial, K: Clock> leans3::Transport for Http<D, K> {
         };
         let parts = Parts {
             method: request.method,
-            target: request.target,
             url: &url,
             headers: request.headers,
             bytes,
@@ -261,25 +284,30 @@ impl<D: Dial, K: Clock> leans3::Transport for Http<D, K> {
         for attempt in 1..=attempts {
             let stream = upload.as_mut().map(|(source, len)| (source, *len));
             let result = self.attempt(&parts, stream).await;
-            let again = attempt < attempts
-                && match &result {
-                    Ok(reply) => busy(reply.status),
-                    Err(error) => broken(error),
-                };
-            if !again {
-                return match result {
-                    Ok(reply) => {
-                        self.last_error = None;
-                        Ok(reply)
-                    }
-                    Err(error) => {
-                        self.last_error = Some(error);
-                        Err(io(error))
-                    }
-                };
-            }
-            if let Err(error) = result {
-                self.last_error = Some(error);
+            let last = attempt == attempts;
+            match result {
+                Ok(response) if !last && busy(response.status) => self.drain(response).await,
+                Ok(mut response) => {
+                    self.last_error = None;
+                    let _ = response.set_read_timeout(Some(self.limits.progress));
+                    return Ok(Reply {
+                        status: response.status,
+                        reason: core::mem::take(&mut response.reason),
+                        header: core::mem::take(&mut response.header),
+                        length: response.length,
+                        body: Some(Box::new(response)),
+                        returned: self.returned.clone(),
+                        clock: self.clock.clone(),
+                        progress: self.limits.progress,
+                        target,
+                        observer: self.observer.clone(),
+                    });
+                }
+                Err(error) if !last && broken(&error) => self.last_error = Some(error),
+                Err(error) => {
+                    self.last_error = Some(error);
+                    return Err(io(error));
+                }
             }
             self.clock.sleep(wait).await;
             wait = wait.saturating_mul(2);
@@ -307,33 +335,66 @@ impl leanhttp::AsyncRead for Upload<'_> {
     }
 }
 
-/// Een S3-antwoord met de hele body in het geheugen.
-pub struct Reply {
+/// Een S3-antwoord waarvan de body nog op de verbinding staat.
+///
+/// Lezen haalt hem van de verbinding; na de laatste byte gaat de verbinding
+/// terug in de pool. Wie loslaat voor het einde, sluit hem.
+pub struct Reply<C, K> {
     status: u16,
     reason: String,
     header: Header,
-    body: Vec<u8>,
-    offset: usize,
+    length: Option<u64>,
+    body: Option<Box<leanhttp::Response<C>>>,
+    returned: Returned<C>,
+    clock: K,
+    progress: Duration,
+    target: String,
+    observer: Option<Rc<RefCell<Observer>>>,
 }
 
-impl leans3::AsyncRead for Reply {
+impl<C: leanhttp::Conn, K: Clock + Unpin> leans3::AsyncRead for Reply<C, K> {
     fn poll_read(
         self: Pin<&mut Self>,
-        _: &mut Context<'_>,
+        cx: &mut Context<'_>,
         buf: &mut [u8],
     ) -> Poll<Result<usize, IoError>> {
         let this = self.get_mut();
-        let rest = this.body.get(this.offset..).unwrap_or_default();
-        let n = buf.len().min(rest.len());
-        buf.get_mut(..n)
-            .unwrap_or_default()
-            .copy_from_slice(rest.get(..n).unwrap_or_default());
-        this.offset += n;
-        Poll::Ready(Ok(n))
+        let Some(body) = this.body.as_mut() else {
+            return Poll::Ready(Ok(0));
+        };
+        match body.poll_read(cx, buf) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Ok(0)) => {
+                if let Some(body) = this.body.take()
+                    && let Some((addr, conn)) = body.into_reusable()
+                    && !addr.is_empty()
+                    && let Ok(mut returned) = this.returned.try_borrow_mut()
+                {
+                    let at = this.clock.now();
+                    if returned.try_reserve(1).is_ok() {
+                        returned.push(Back { addr, conn, at });
+                    }
+                }
+                Poll::Ready(Ok(0))
+            }
+            Poll::Ready(Ok(n)) => {
+                let _ = body.set_read_timeout(Some(this.progress));
+                if let Some(observer) = &this.observer
+                    && let Ok(mut observe) = observer.try_borrow_mut()
+                {
+                    observe(&this.target, n);
+                }
+                Poll::Ready(Ok(n))
+            }
+            Poll::Ready(Err(error)) => {
+                this.body = None;
+                Poll::Ready(Err(io(error)))
+            }
+        }
     }
 }
 
-impl leans3::Response for Reply {
+impl<C: leanhttp::Conn, K: Clock + Unpin> leans3::Response for Reply<C, K> {
     fn status(&self) -> u16 {
         self.status
     }
@@ -344,7 +405,7 @@ impl leans3::Response for Reply {
         self.header.get(name)
     }
     fn content_length(&self) -> Option<u64> {
-        u64::try_from(self.body.len()).ok()
+        self.length
     }
 }
 

@@ -20,18 +20,12 @@
 //!   verifiëren en dus alleen publieke sleutels, digests en handtekeningen
 //!   zien.
 
-pub(crate) mod aes;
+pub(crate) use leancrypto::{ct, gcm, hash, hmac, sha256, sha512};
 pub(crate) mod bignum;
-pub(crate) mod ct;
 pub(crate) mod ecdsa;
 pub(crate) mod ed25519;
 pub(crate) mod field;
-pub(crate) mod gcm;
-pub(crate) mod hash;
-pub(crate) mod hmac;
 pub(crate) mod rsa;
-pub(crate) mod sha256;
-pub(crate) mod sha512;
 pub(crate) mod x25519;
 
 #[cfg(test)]

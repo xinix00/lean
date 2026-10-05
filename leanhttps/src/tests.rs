@@ -277,7 +277,7 @@ fn is_ip_randen() {
     }
 }
 
-/// Een lege, geldige wortelset: de keten faalt toch al op het einde van de stroom.
+/// Een lege wortelset: onleesbaar, dus de dial weigert vooraf.
 const NO_ROOTS: &[u8] = &[];
 
 #[test]
@@ -296,19 +296,25 @@ fn web_dial_is_plain_for_http_and_refuses_https_without_name_clock_or_entropy() 
         Err(leanhttp::Error::NoHost)
     ));
     assert_eq!(web.last_error(), Some(Error::ChainWithoutName));
-    let mut no_clock = WebDial::new(Tcp::default(), NO_ROOTS, || None, fresh);
+    let mut no_roots = WebDial::new(Tcp::default(), NO_ROOTS, clock, fresh);
+    assert!(block_on(no_roots.dial(target("s3.example.test"))).is_err());
+    assert_eq!(no_roots.last_error(), Some(Error::Roots));
+    let mut no_clock = WebDial::new(Tcp::default(), leantls::MOZILLA_ROOTS, || None, fresh);
     assert!(matches!(
         block_on(no_clock.dial(target("s3.example.test"))),
         Err(leanhttp::Error::Connect)
     ));
-    let mut no_entropy = WebDial::new(Tcp::default(), NO_ROOTS, clock, || None);
+    assert_eq!(no_clock.last_error(), Some(Error::NoClock));
+    let mut no_entropy = WebDial::new(Tcp::default(), leantls::MOZILLA_ROOTS, clock, || None);
     assert!(matches!(
         block_on(no_entropy.dial(target("s3.example.test"))),
         Err(leanhttp::Error::Connect)
     ));
+    assert_eq!(no_entropy.last_error(), Some(Error::NoEntropy));
     // Alleen de http-dial raakte de netstack.
     assert_eq!(web.inner.dials.len(), 1);
     assert!(no_clock.inner.dials.is_empty() && no_entropy.inner.dials.is_empty());
+    assert!(no_roots.inner.dials.is_empty());
 }
 
 #[test]

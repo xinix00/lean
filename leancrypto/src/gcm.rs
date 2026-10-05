@@ -10,14 +10,14 @@
 //! tellermodus versleutelt vier blokken per AES-aanroep. De tag wordt
 //! constant-time vergeleken, en bij een foute tag wordt niets ontsleuteld.
 
-use super::aes::{Aes128, Blocks};
-use super::ct;
+use crate::aes::{Aes128, Blocks};
+use crate::ct;
 
 /// Lengte van de tag.
-pub(crate) const TAG_LEN: usize = 16;
+pub const TAG_LEN: usize = 16;
 
 /// Een AES-128-GCM-sleutel.
-pub(crate) struct Gcm {
+pub struct Gcm {
     /// De blokcijfer.
     aes: Aes128,
     /// De hashsleutel H = E(K, 0^128), big-endian gelezen.
@@ -26,11 +26,11 @@ pub(crate) struct Gcm {
 
 /// De tag klopte niet; de data is onaangeroerd.
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) struct TagMismatch;
+pub struct TagMismatch;
 
 impl Gcm {
     /// Zet een sleutel op.
-    pub(crate) fn new(key: &[u8; 16]) -> Self {
+    pub fn new(key: &[u8; 16]) -> Self {
         let aes = Aes128::new(key);
         let mut h = [0u8; 16];
         aes.encrypt(&mut h);
@@ -40,13 +40,13 @@ impl Gcm {
     }
 
     /// Versleutelt `data` op zijn plek en geeft de tag.
-    pub(crate) fn seal(&self, nonce: &[u8; 12], aad: &[u8], data: &mut [u8]) -> [u8; TAG_LEN] {
+    pub fn seal(&self, nonce: &[u8; 12], aad: &[u8], data: &mut [u8]) -> [u8; TAG_LEN] {
         self.ctr(nonce, data);
         self.tag(nonce, aad, data)
     }
 
     /// Controleert de tag en ontsleutelt daarna `data` op zijn plek.
-    pub(crate) fn open(
+    pub fn open(
         &self,
         nonce: &[u8; 12],
         aad: &[u8],
@@ -240,7 +240,7 @@ mod tests {
             );
         }
     }
-    use crate::crypto::testutil::unhex;
+    use crate::testutil::unhex;
 
     fn key(hex: &str) -> [u8; 16] {
         let mut k = [0u8; 16];

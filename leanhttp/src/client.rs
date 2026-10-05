@@ -14,7 +14,8 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt::Write;
-use core::future::Future;
+use core::future::{Future, poll_fn};
+use core::task::{Context, Poll};
 use core::time::Duration;
 
 use crate::error::{Error, Result};
@@ -22,7 +23,7 @@ use crate::header::{
     Header, body_allowed, connection_has, parse_decimal, try_string, valid_field_value, valid_token,
 };
 use crate::io::{
-    AsyncRead, Conn, FmtBuf, IoError, ReadBuf, close, eof_is_unexpected, flush, next_chunk, read,
+    AsyncRead, ChunkHead, Conn, FmtBuf, IoError, ReadBuf, close, eof_is_unexpected, flush, read,
     try_extend, write_all,
 };
 use crate::pool::Pool;
@@ -57,6 +58,18 @@ pub trait Dial {
     /// poort 443, ook niet na een redirect van http naar https.
     fn is_encrypted(&self) -> bool {
         false
+    }
+}
+
+impl<D: Dial + ?Sized> Dial for &mut D {
+    type Conn = D::Conn;
+
+    fn dial(&mut self, target: Target<'_>) -> impl Future<Output = Result<Self::Conn>> {
+        (**self).dial(target)
+    }
+
+    fn is_encrypted(&self) -> bool {
+        (**self).is_encrypted()
     }
 }
 
@@ -116,10 +129,23 @@ enum Framing {
     Empty,
     /// Nog zoveel bytes.
     Length(u64),
-    /// Chunked: nog zoveel bytes in de huidige chunk.
-    Chunked { left: u64, finished: bool },
+    /// Chunked, met de plek van de decoder.
+    Chunked(Chunk),
     /// Tot de verbinding sluit; nooit herbruikbaar.
     Eof,
+}
+
+/// Waar een gechunkte body staat tussen twee polls.
+#[derive(Clone, Copy, Debug)]
+enum Chunk {
+    /// Een chunkkop (of de trailers na de nul-chunk).
+    Head(ChunkHead),
+    /// Nog zoveel databytes in deze chunk.
+    Data(u64),
+    /// De CRLF na de data van een chunk.
+    Tail,
+    /// Nul-chunk en trailers gelezen.
+    Done,
 }
 
 /// Een antwoord, met de verbinding waar de body nog op staat.
@@ -183,35 +209,114 @@ impl<C: Conn> Response<C> {
     /// Een verbinding die eindigt voor de lengte of voor de nul-chunk geeft
     /// [`Error::UnexpectedEof`].
     pub async fn read(&mut self, out: &mut [u8]) -> Result<usize> {
+        poll_fn(|cx| self.poll_read(cx, out)).await
+    }
+
+    /// Als [`Response::read`], per poll: de framing staat in het antwoord en
+    /// niet in een future, dus een lezer mag na `Pending` loslaten en later
+    /// verder lezen. Zo stroomt een body door een `AsyncRead` heen.
+    pub fn poll_read(&mut self, cx: &mut Context<'_>, out: &mut [u8]) -> Poll<Result<usize>> {
         if out.is_empty() {
-            return Ok(0);
+            return Poll::Ready(Ok(0));
         }
         match self.framing {
-            Framing::Empty => {
+            Framing::Empty | Framing::Length(0) => {
                 self.done = true;
-                Ok(0)
-            }
-            Framing::Length(0) => {
-                self.done = true;
-                Ok(0)
+                Poll::Ready(Ok(0))
             }
             Framing::Length(left) => {
                 let lim = out.len().min(usize::try_from(left).unwrap_or(usize::MAX));
                 let dst = out.get_mut(..lim).unwrap_or(&mut []);
-                let n = self.rbuf.read(&mut self.conn, dst).await?;
+                let n = match self.rbuf.poll_read(&mut self.conn, cx, dst) {
+                    Poll::Ready(r) => r?,
+                    Poll::Pending => return Poll::Pending,
+                };
                 if n == 0 {
-                    return Err(Error::UnexpectedEof);
+                    return Poll::Ready(Err(Error::UnexpectedEof));
                 }
                 let left = left.saturating_sub(u64::try_from(n).unwrap_or(u64::MAX));
                 self.framing = Framing::Length(left);
                 self.done = left == 0;
-                Ok(n)
+                Poll::Ready(Ok(n))
             }
-            Framing::Chunked { .. } => self.read_chunked(out).await,
+            Framing::Chunked(_) => self.poll_chunked(cx, out),
             Framing::Eof => {
-                let n = self.rbuf.read(&mut self.conn, out).await?;
+                let n = match self.rbuf.poll_read(&mut self.conn, cx, out) {
+                    Poll::Ready(r) => r?,
+                    Poll::Pending => return Poll::Pending,
+                };
                 self.done = n == 0;
-                Ok(n)
+                Poll::Ready(Ok(n))
+            }
+        }
+    }
+
+    /// De CRLF na de data van een chunk; EOF ervoor is afgekapt, ook als alle
+    /// databytes er waren.
+    fn poll_tail(&mut self, cx: &mut Context<'_>) -> Poll<Result> {
+        let mut budget = BUF_SIZE;
+        let crlf = match self.rbuf.poll_line(&mut self.conn, cx, &mut budget) {
+            Poll::Ready(r) => r.map_err(eof_is_unexpected)?,
+            Poll::Pending => return Poll::Pending,
+        };
+        if !crlf.is_empty() {
+            return Poll::Ready(Err(Error::ChunkNotCrlf));
+        }
+        self.framing = Framing::Chunked(Chunk::Head(ChunkHead::Size));
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_chunked(&mut self, cx: &mut Context<'_>, out: &mut [u8]) -> Poll<Result<usize>> {
+        loop {
+            let Framing::Chunked(chunk) = self.framing else {
+                return Poll::Ready(Ok(0));
+            };
+            match chunk {
+                Chunk::Head(mut head) => {
+                    let next = head.poll(&mut self.rbuf, &mut self.conn, cx);
+                    self.framing = Framing::Chunked(Chunk::Head(head));
+                    match next {
+                        Poll::Ready(Ok(Some(n))) => self.framing = Framing::Chunked(Chunk::Data(n)),
+                        Poll::Ready(Ok(None)) => {
+                            self.framing = Framing::Chunked(Chunk::Done);
+                            self.done = true;
+                            return Poll::Ready(Ok(0));
+                        }
+                        Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                        Poll::Pending => return Poll::Pending,
+                    }
+                }
+                Chunk::Data(left) => {
+                    let lim = out.len().min(usize::try_from(left).unwrap_or(usize::MAX));
+                    let dst = out.get_mut(..lim).unwrap_or(&mut []);
+                    let n = match self.rbuf.poll_read(&mut self.conn, cx, dst) {
+                        Poll::Ready(r) => r?,
+                        Poll::Pending => return Poll::Pending,
+                    };
+                    if n == 0 {
+                        // Elke EOF voor de nul-chunk is onvolledig (RFC 9112 §8).
+                        return Poll::Ready(Err(Error::UnexpectedEof));
+                    }
+                    let left = left.saturating_sub(u64::try_from(n).unwrap_or(u64::MAX));
+                    if left > 0 {
+                        self.framing = Framing::Chunked(Chunk::Data(left));
+                        return Poll::Ready(Ok(n));
+                    }
+                    // De CRLF na de chunk meteen, als hij er al is: een
+                    // afgekapte chunk faalt dan in dezelfde read. Anders bij de
+                    // volgende poll.
+                    self.framing = Framing::Chunked(Chunk::Tail);
+                    return match self.poll_tail(cx) {
+                        Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+                        _ => Poll::Ready(Ok(n)),
+                    };
+                }
+                Chunk::Tail => match self.poll_tail(cx) {
+                    Poll::Ready(Ok(())) => {}
+                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                    Poll::Pending => return Poll::Pending,
+                },
+                Chunk::Done => return Poll::Ready(Ok(0)),
             }
         }
     }
@@ -235,6 +340,25 @@ impl<C: Conn> Response<C> {
         }
     }
 
+    /// Als [`Response::release`] zonder te wachten: het pooladres en de
+    /// verbinding als die herbruikbaar is; anders valt hij zonder nette
+    /// afsluiting.
+    pub fn into_reusable(mut self) -> Option<(String, C)> {
+        if self.done && self.reuse && self.rbuf.buffered().is_empty() {
+            return Some((core::mem::take(&mut self.addr), self.conn));
+        }
+        None
+    }
+
+    /// Zet een leestermijn op de verbinding onder de body, bijvoorbeeld als
+    /// voortgangstermijn tussen twee reads van een lange download.
+    pub fn set_read_timeout(
+        &mut self,
+        timeout: Option<Duration>,
+    ) -> core::result::Result<(), IoError> {
+        self.conn.set_read_timeout(timeout)
+    }
+
     /// Geeft de verbinding terug als hij het volgende verzoek mag dragen, en
     /// sluit hem anders.
     ///
@@ -247,55 +371,6 @@ impl<C: Conn> Response<C> {
         }
         let _ = close(&mut self.conn).await;
         None
-    }
-
-    async fn read_chunked(&mut self, out: &mut [u8]) -> Result<usize> {
-        let Framing::Chunked { left, finished } = self.framing else {
-            return Ok(0);
-        };
-        if finished {
-            return Ok(0);
-        }
-        let left = match left {
-            0 => match next_chunk(&mut self.rbuf, &mut self.conn).await? {
-                None => {
-                    self.framing = Framing::Chunked {
-                        left: 0,
-                        finished: true,
-                    };
-                    self.done = true;
-                    return Ok(0);
-                }
-                Some(n) => n,
-            },
-            n => n,
-        };
-        let lim = out.len().min(usize::try_from(left).unwrap_or(usize::MAX));
-        let dst = out.get_mut(..lim).unwrap_or(&mut []);
-        let n = self.rbuf.read(&mut self.conn, dst).await?;
-        if n == 0 {
-            // Elke EOF voor de nul-chunk is onvolledig (RFC 9112 §8).
-            return Err(Error::UnexpectedEof);
-        }
-        let left = left.saturating_sub(u64::try_from(n).unwrap_or(u64::MAX));
-        self.framing = Framing::Chunked {
-            left,
-            finished: false,
-        };
-        if left == 0 {
-            // De CRLF na de chunk; EOF ervoor is afgekapt, ook als alle
-            // databytes er waren.
-            let mut budget = BUF_SIZE;
-            let crlf = self
-                .rbuf
-                .read_line(&mut self.conn, &mut budget)
-                .await
-                .map_err(eof_is_unexpected)?;
-            if !crlf.is_empty() {
-                return Err(Error::ChunkNotCrlf);
-            }
-        }
-        Ok(n)
     }
 }
 
@@ -739,10 +814,7 @@ async fn exchange<C: Conn>(
         Framing::Empty
     } else if chunked {
         length = None;
-        Framing::Chunked {
-            left: 0,
-            finished: false,
-        }
+        Framing::Chunked(Chunk::Head(ChunkHead::Size))
     } else if let Some(n) = length {
         Framing::Length(n)
     } else {

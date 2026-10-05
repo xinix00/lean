@@ -9,5 +9,9 @@ description = "HTTP/1.1 zonder TLS: client en server, sequentiele keep-alive, ch
 
 [dependencies]
 
+[features]
+# TCP van een host (src/host.rs): std-sockets met de termijnen van leanhttp.
+std = []
+
 [lints]
 workspace = true

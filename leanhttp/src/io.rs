@@ -232,7 +232,14 @@ impl ReadBuf {
     }
 
     /// Leest meer bytes achter de buffer; `Ok(0)` is einde van de stroom.
-    async fn fill<R: AsyncRead + ?Sized>(&mut self, r: &mut R) -> Result<usize> {
+    ///
+    /// Elke poll staat op zichzelf: wat binnenkwam, staat al in de buffer,
+    /// dus een future die na `Pending` valt, verliest niets.
+    fn poll_fill<R: AsyncRead + ?Sized>(
+        &mut self,
+        r: &mut R,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<usize>> {
         if self.end == self.buf.len() && self.start > 0 {
             // Schuif de ongelezen staart naar voren zodat er plek komt.
             self.buf.copy_within(self.start..self.end, 0);
@@ -241,30 +248,37 @@ impl ReadBuf {
         }
         let tail = self.buf.get_mut(self.end..).unwrap_or(&mut []);
         if tail.is_empty() {
-            return Err(Error::LineTooLong { limit: BUF_SIZE });
+            return Poll::Ready(Err(Error::LineTooLong { limit: BUF_SIZE }));
         }
-        let n = read(r, tail).await?;
+        let n = match r.poll_read(cx, tail) {
+            Poll::Ready(Ok(n)) => n,
+            Poll::Ready(Err(e)) => return Poll::Ready(Err(e.into())),
+            Poll::Pending => return Poll::Pending,
+        };
         // INVARIANT: de verbinding schreef hoogstens tail.len() bytes.
         self.end = self.end.saturating_add(n).min(self.buf.len());
-        Ok(n)
+        Poll::Ready(Ok(n))
     }
 
     /// Leest zoals `bufio.Reader.Read`: eerst uit de buffer, een grote vraag
     /// direct van de verbinding, anders één keer bijvullen.
-    pub(crate) async fn read<R: AsyncRead + ?Sized>(
+    pub(crate) fn poll_read<R: AsyncRead + ?Sized>(
         &mut self,
         r: &mut R,
+        cx: &mut Context<'_>,
         out: &mut [u8],
-    ) -> Result<usize> {
+    ) -> Poll<Result<usize>> {
         if out.is_empty() {
-            return Ok(0);
+            return Poll::Ready(Ok(0));
         }
         if self.start == self.end {
             if out.len() >= self.buf.len() {
-                return Ok(read(r, out).await?);
+                return r.poll_read(cx, out).map_err(Error::from);
             }
-            if self.fill(r).await? == 0 {
-                return Ok(0);
+            match self.poll_fill(r, cx) {
+                Poll::Ready(Ok(0)) => return Poll::Ready(Ok(0)),
+                Poll::Ready(Ok(_)) => {}
+                other => return other,
             }
         }
         let have = self.buffered();
@@ -273,7 +287,16 @@ impl ReadBuf {
             .unwrap_or(&mut [])
             .copy_from_slice(have.get(..n).unwrap_or(&[]));
         self.consume(n);
-        Ok(n)
+        Poll::Ready(Ok(n))
+    }
+
+    /// Als [`ReadBuf::poll_read`].
+    pub(crate) async fn read<R: AsyncRead + ?Sized>(
+        &mut self,
+        r: &mut R,
+        out: &mut [u8],
+    ) -> Result<usize> {
+        poll_fn(|cx| self.poll_read(r, cx, out)).await
     }
 
     /// Zorgt dat er iets gebufferd is; `Ok(false)` is einde van de stroom.
@@ -281,7 +304,7 @@ impl ReadBuf {
         if self.start < self.end {
             return Ok(true);
         }
-        Ok(self.fill(r).await? > 0)
+        Ok(poll_fn(|cx| self.poll_fill(r, cx)).await? > 0)
     }
 
     /// Leest één strikte CRLF-regel onder een cumulatief budget.
@@ -295,6 +318,17 @@ impl ReadBuf {
         r: &mut R,
         budget: &mut usize,
     ) -> Result<String> {
+        poll_fn(|cx| self.poll_line(r, cx, budget)).await
+    }
+
+    /// Als [`ReadBuf::read_line`], per poll: een halve regel blijft in de
+    /// buffer en het budget telt pas bij een hele.
+    pub(crate) fn poll_line<R: AsyncRead + ?Sized>(
+        &mut self,
+        r: &mut R,
+        cx: &mut Context<'_>,
+        budget: &mut usize,
+    ) -> Poll<Result<String>> {
         let mut scanned = 0;
         let len = loop {
             let have = self.buffered();
@@ -308,12 +342,20 @@ impl ReadBuf {
             }
             scanned = have.len();
             if scanned >= self.buf.len() {
-                return Err(Error::LineTooLong { limit: BUF_SIZE });
+                return Poll::Ready(Err(Error::LineTooLong { limit: BUF_SIZE }));
             }
-            if self.fill(r).await? == 0 {
-                return Err(Error::Eof);
+            match self.poll_fill(r, cx) {
+                Poll::Ready(Ok(0)) => return Poll::Ready(Err(Error::Eof)),
+                Poll::Ready(Ok(_)) => {}
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Pending => return Poll::Pending,
             }
         };
+        Poll::Ready(self.take_line(len, budget))
+    }
+
+    /// Verbruikt een gevonden regel van `len` bytes en toetst hem.
+    fn take_line(&mut self, len: usize, budget: &mut usize) -> Result<String> {
         let raw = self.buffered().get(..len).unwrap_or(&[]);
         let fits = len <= *budget;
         let crlf = len >= 2 && raw.get(len - 2) == Some(&b'\r');
@@ -416,44 +458,76 @@ const FORBIDDEN_TRAILERS: &[&str] = &[
 /// Lange stromen hebben onbegrensd veel chunks, dus alleen de regelgrens per
 /// kop geldt; het trailerblok is eindig en krijgt het cumulatieve budget.
 pub(crate) async fn next_chunk<C: Conn>(rbuf: &mut ReadBuf, conn: &mut C) -> Result<Option<u64>> {
-    let mut budget = BUF_SIZE;
-    let line = rbuf
-        .read_line(conn, &mut budget)
-        .await
-        .map_err(eof_is_unexpected)?;
-    let (size, ext) = match line.split_once(';') {
-        Some((s, _)) => (s, true),
-        None => (line.as_str(), false),
-    };
-    // RFC 9112 §7.1: precies 1*HEXDIG, zonder teken of OWS.
-    let n = parse_hex(size).ok_or(Error::MalformedChunkSize)?;
-    if ext {
-        // Bewuste afwijking van RFC 9112 §7.1.1: alle extensies weigeren. Ze
-        // veilig negeren vraagt een volledige quote-bewuste parser, en geen
-        // gemeten peer stuurt ze; half valideren schept framing-ambiguïteit.
-        return Err(Error::ChunkExtension);
-    }
-    if n > 0 {
-        return Ok(Some(n));
-    }
-    let mut budget = MAX_HEADER_BYTES;
-    loop {
-        let t = rbuf
-            .read_line(conn, &mut budget)
-            .await
-            .map_err(eof_is_unexpected)?;
-        if t.is_empty() {
-            return Ok(None);
-        }
-        let name = t.split_once(':').map(|(k, _)| k);
-        let Some(name) = name.filter(|k| valid_token(k)) else {
-            return Err(Error::MalformedTrailer);
-        };
-        if FORBIDDEN_TRAILERS
-            .iter()
-            .any(|f| f.eq_ignore_ascii_case(name))
-        {
-            return Err(Error::ForbiddenTrailer);
+    let mut head = ChunkHead::Size;
+    poll_fn(|cx| head.poll(rbuf, conn, cx)).await
+}
+
+/// Waar een chunkkop staat tussen twee polls: zo valt een future na
+/// `Pending` weg zonder dat de decoder zijn plek kwijt is.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum ChunkHead {
+    /// De regel met de grootte.
+    Size,
+    /// Na de nul-chunk: trailers tot de lege regel, met het resterende budget.
+    Trailers(usize),
+}
+
+impl ChunkHead {
+    /// Leest verder; `Some(n)` is een chunk van `n` bytes, `None` het einde.
+    pub(crate) fn poll<C: Conn>(
+        &mut self,
+        rbuf: &mut ReadBuf,
+        conn: &mut C,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<Option<u64>>> {
+        loop {
+            match *self {
+                ChunkHead::Size => {
+                    let mut budget = BUF_SIZE;
+                    let line = match rbuf.poll_line(conn, cx, &mut budget) {
+                        Poll::Ready(r) => r.map_err(eof_is_unexpected)?,
+                        Poll::Pending => return Poll::Pending,
+                    };
+                    let (size, ext) = match line.split_once(';') {
+                        Some((s, _)) => (s, true),
+                        None => (line.as_str(), false),
+                    };
+                    // RFC 9112 §7.1: precies 1*HEXDIG, zonder teken of OWS.
+                    let n = parse_hex(size).ok_or(Error::MalformedChunkSize)?;
+                    if ext {
+                        // Bewuste afwijking van RFC 9112 §7.1.1: alle extensies
+                        // weigeren. Ze veilig negeren vraagt een volledige
+                        // quote-bewuste parser, en geen gemeten peer stuurt ze;
+                        // half valideren schept framing-ambiguïteit.
+                        return Poll::Ready(Err(Error::ChunkExtension));
+                    }
+                    if n > 0 {
+                        return Poll::Ready(Ok(Some(n)));
+                    }
+                    *self = ChunkHead::Trailers(MAX_HEADER_BYTES);
+                }
+                ChunkHead::Trailers(mut budget) => {
+                    let t = match rbuf.poll_line(conn, cx, &mut budget) {
+                        Poll::Ready(r) => r.map_err(eof_is_unexpected)?,
+                        Poll::Pending => return Poll::Pending,
+                    };
+                    *self = ChunkHead::Trailers(budget);
+                    if t.is_empty() {
+                        *self = ChunkHead::Size;
+                        return Poll::Ready(Ok(None));
+                    }
+                    let name = t.split_once(':').map(|(k, _)| k);
+                    let Some(name) = name.filter(|k| valid_token(k)) else {
+                        return Poll::Ready(Err(Error::MalformedTrailer));
+                    };
+                    if FORBIDDEN_TRAILERS
+                        .iter()
+                        .any(|f| f.eq_ignore_ascii_case(name))
+                    {
+                        return Poll::Ready(Err(Error::ForbiddenTrailer));
+                    }
+                }
+            }
         }
     }
 }
