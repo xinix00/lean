@@ -111,8 +111,158 @@ impl Drop for Sha256 {
     }
 }
 
-/// Verwerkt één blok van 64 bytes.
+/// Verwerkt één blok van 64 bytes: met de SHA-256-instructies van de kern
+/// als die er zijn, anders in software.
 fn compress(h: &mut [u32; 8], block: &[u8; BLOCK]) {
+    #[cfg(target_arch = "aarch64")]
+    if hw::available() {
+        hw::compress(h, block);
+        return;
+    }
+    soft(h, block)
+}
+
+/// De SHA-256-instructies van ARMv8 (FEAT_SHA256). Eén blok kost zo ~20
+/// cycli in plaats van ~1000: GEMETEN 06-10 op een M4 onder HopOS, de
+/// software 112 MB/s, terwijl de schijf 700 MB/s doet. Niet elke ARMv8 heeft
+/// ze (de Cortex-A72 van de Pi 4 niet), dus de kern wordt één keer gevraagd.
+#[cfg(target_arch = "aarch64")]
+#[allow(unsafe_code)]
+mod hw {
+    use super::{BLOCK, K};
+    use core::sync::atomic::{AtomicU8, Ordering::Relaxed};
+
+    /// 0: nog niet gevraagd, 1: nee, 2: ja.
+    static STATE: AtomicU8 = AtomicU8::new(0);
+
+    pub(super) fn available() -> bool {
+        match STATE.load(Relaxed) {
+            1 => false,
+            2 => true,
+            _ => {
+                let yes = probe();
+                STATE.store(if yes { 2 } else { 1 }, Relaxed);
+                yes
+            }
+        }
+    }
+
+    /// Op een kale kern (HopOS: de app draait op EL1) zegt `ID_AA64ISAR0_EL1`
+    /// het: veld SHA2 (bits 12..16) is minstens 1.
+    #[cfg(target_os = "none")]
+    fn probe() -> bool {
+        let isar0: u64;
+        // SAFETY: Een leesbaar ID-register; geen geheugen, geen neveneffect.
+        unsafe {
+            core::arch::asm!(
+                "mrs {0}, ID_AA64ISAR0_EL1",
+                out(reg) isar0,
+                options(nomem, nostack, preserves_flags)
+            );
+        }
+        (isar0 >> 12) & 0xf >= 1
+    }
+
+    /// Elke Apple-silicon-kern heeft FEAT_SHA256; het ID-register is vanuit
+    /// een proces niet leesbaar.
+    #[cfg(all(not(target_os = "none"), target_vendor = "apple"))]
+    fn probe() -> bool {
+        true
+    }
+
+    /// Elders geen aanname: software.
+    #[cfg(not(any(target_os = "none", target_vendor = "apple")))]
+    fn probe() -> bool {
+        false
+    }
+
+    /// Vier ronden: de boodschapwoorden in `v$m`, de constanten van `x2`.
+    /// `v0` is abcd, `v1` efgh, `v5` de abcd van vóór de ronden; daarna
+    /// krijgt `v$m` de woorden voor vier ronden verderop.
+    macro_rules! rounds {
+        ($m:literal, $m1:literal, $m2:literal, $m3:literal) => {
+            concat!(
+                "ld1 {{v20.4s}}, [x2], #16\n",
+                "add v4.4s, v",
+                $m,
+                ".4s, v20.4s\n",
+                "mov v5.16b, v0.16b\n",
+                "sha256h q0, q1, v4.4s\n",
+                "sha256h2 q1, q5, v4.4s\n",
+                "sha256su0 v",
+                $m,
+                ".4s, v",
+                $m1,
+                ".4s\n",
+                "sha256su1 v",
+                $m,
+                ".4s, v",
+                $m2,
+                ".4s, v",
+                $m3,
+                ".4s\n",
+            )
+        };
+        ($m:literal) => {
+            concat!(
+                "ld1 {{v20.4s}}, [x2], #16\n",
+                "add v4.4s, v",
+                $m,
+                ".4s, v20.4s\n",
+                "mov v5.16b, v0.16b\n",
+                "sha256h q0, q1, v4.4s\n",
+                "sha256h2 q1, q5, v4.4s\n",
+            )
+        };
+    }
+
+    pub(super) fn compress(h: &mut [u32; 8], block: &[u8; BLOCK]) {
+        // SAFETY: Leest `block` en `K`, schrijft alleen `h`, alle via geldige
+        // verwijzingen van de juiste lengte; de gebruikte registers staan als
+        // clobber. De instructies bestaan: `available()` vroeg het de kern.
+        unsafe {
+            core::arch::asm!(
+                ".arch_extension sha2",
+                "ld1 {{v0.4s, v1.4s}}, [x0]",
+                "ld1 {{v16.4s, v17.4s, v18.4s, v19.4s}}, [x1]",
+                "rev32 v16.16b, v16.16b",
+                "rev32 v17.16b, v17.16b",
+                "rev32 v18.16b, v18.16b",
+                "rev32 v19.16b, v19.16b",
+                "mov v2.16b, v0.16b",
+                "mov v3.16b, v1.16b",
+                rounds!("16", "17", "18", "19"),
+                rounds!("17", "18", "19", "16"),
+                rounds!("18", "19", "16", "17"),
+                rounds!("19", "16", "17", "18"),
+                rounds!("16", "17", "18", "19"),
+                rounds!("17", "18", "19", "16"),
+                rounds!("18", "19", "16", "17"),
+                rounds!("19", "16", "17", "18"),
+                rounds!("16", "17", "18", "19"),
+                rounds!("17", "18", "19", "16"),
+                rounds!("18", "19", "16", "17"),
+                rounds!("19", "16", "17", "18"),
+                rounds!("16"),
+                rounds!("17"),
+                rounds!("18"),
+                rounds!("19"),
+                "add v0.4s, v0.4s, v2.4s",
+                "add v1.4s, v1.4s, v3.4s",
+                "st1 {{v0.4s, v1.4s}}, [x0]",
+                in("x0") h.as_mut_ptr(),
+                in("x1") block.as_ptr(),
+                inout("x2") K.as_ptr() => _,
+                out("v0") _, out("v1") _, out("v2") _, out("v3") _, out("v4") _, out("v5") _,
+                out("v16") _, out("v17") _, out("v18") _, out("v19") _, out("v20") _,
+                options(nostack)
+            );
+        }
+    }
+}
+
+/// Eén blok in software.
+fn soft(h: &mut [u32; 8], block: &[u8; BLOCK]) {
     let mut w = [0u32; 64];
     for (wi, c) in w.iter_mut().zip(block.chunks_exact(4)) {
         *wi = u32::from_be_bytes([c[0], c[1], c[2], c[3]]);
@@ -155,6 +305,33 @@ fn compress(h: &mut [u32; 8], block: &[u8; BLOCK]) {
 mod tests {
     use super::*;
     use crate::testutil::unhex;
+
+    /// De instructies van de kern geven blok voor blok hetzelfde als de software.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn hardware_matches_software() {
+        if !hw::available() {
+            return;
+        }
+        let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
+        for _ in 0..256 {
+            let mut block = [0u8; BLOCK];
+            let mut h = [0u32; 8];
+            for b in block.iter_mut() {
+                seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+                *b = (seed >> 56) as u8;
+            }
+            for x in h.iter_mut() {
+                seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+                *x = (seed >> 32) as u32;
+            }
+            let mut a = h;
+            let mut b = h;
+            hw::compress(&mut a, &block);
+            soft(&mut b, &block);
+            assert_eq!(a, b);
+        }
+    }
 
     /// RFC 6234 §8.5 (TEST1, TEST2_1, TEST3) voor SHA-256.
     #[test]
