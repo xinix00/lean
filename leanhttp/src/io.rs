@@ -181,31 +181,57 @@ impl fmt::Write for FmtBuf<'_> {
 /// De leesbuffer van één verbinding, `BUF_SIZE` groot.
 ///
 /// Hij is tegelijk de grens voor een headerregel: een regel die niet in de
-/// buffer past, is te lang.
+/// buffer past, is te lang. Met een `line_max` boven `BUF_SIZE` (de client,
+/// [`crate::CLIENT_LINE_MAX`]) groeit hij voor zo'n regel tot die grens en
+/// blijft hij zo groot voor de rest van de verbinding.
 ///
 /// # Invariants
 ///
-/// `start <= end <= buf.len() == BUF_SIZE`; `buf[start..end]` is gelezen maar
-/// nog niet verbruikt.
+/// `start <= end <= buf.len()`, `BUF_SIZE <= buf.len() <= line_max`;
+/// `buf[start..end]` is gelezen maar nog niet verbruikt.
 pub(crate) struct ReadBuf {
     buf: Vec<u8>,
     start: usize,
     end: usize,
+    line_max: usize,
 }
 
 impl ReadBuf {
-    /// Alloceert de buffer; faalt netjes als de heap op is.
+    /// Alloceert de buffer met de regelgrens van de server, `BUF_SIZE`;
+    /// faalt netjes als de heap op is.
     pub(crate) fn new() -> Result<Self> {
+        Self::with_line_max(BUF_SIZE)
+    }
+
+    /// Als [`ReadBuf::new`], met een regel tot `line_max` bytes.
+    pub(crate) fn with_line_max(line_max: usize) -> Result<Self> {
         let mut buf = Vec::new();
         buf.try_reserve_exact(BUF_SIZE)
             .map_err(|_| Error::Alloc { bytes: BUF_SIZE })?;
         buf.resize(BUF_SIZE, 0);
-        // INVARIANT: lege buffer van precies BUF_SIZE.
+        // INVARIANT: lege buffer van precies BUF_SIZE, en line_max niet kleiner.
         Ok(ReadBuf {
             buf,
             start: 0,
             end: 0,
+            line_max: line_max.max(BUF_SIZE),
         })
+    }
+
+    /// Maakt de buffer groter voor een regel die niet past: het dubbele,
+    /// hoogstens `line_max`. `Ok(false)` als hij al zo groot is.
+    fn grow(&mut self) -> Result<bool> {
+        let want = self.buf.len().saturating_mul(2).min(self.line_max);
+        let more = want.saturating_sub(self.buf.len());
+        if more == 0 {
+            return Ok(false);
+        }
+        self.buf
+            .try_reserve_exact(more)
+            .map_err(|_| Error::Alloc { bytes: more })?;
+        // INVARIANT: buf.len() blijft onder line_max; start en end blijven gelden.
+        self.buf.resize(want, 0);
+        Ok(true)
     }
 
     /// De gelezen, nog niet verbruikte bytes.
@@ -248,7 +274,9 @@ impl ReadBuf {
         }
         let tail = self.buf.get_mut(self.end..).unwrap_or(&mut []);
         if tail.is_empty() {
-            return Poll::Ready(Err(Error::LineTooLong { limit: BUF_SIZE }));
+            return Poll::Ready(Err(Error::LineTooLong {
+                limit: self.line_max,
+            }));
         }
         let n = match r.poll_read(cx, tail) {
             Poll::Ready(Ok(n)) => n,
@@ -342,7 +370,16 @@ impl ReadBuf {
             }
             scanned = have.len();
             if scanned >= self.buf.len() {
-                return Poll::Ready(Err(Error::LineTooLong { limit: BUF_SIZE }));
+                // De regel vult de buffer (dan is start 0): groter, of te lang.
+                match self.grow() {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        return Poll::Ready(Err(Error::LineTooLong {
+                            limit: self.line_max,
+                        }));
+                    }
+                    Err(e) => return Poll::Ready(Err(e)),
+                }
             }
             match self.poll_fill(r, cx) {
                 Poll::Ready(Ok(0)) => return Poll::Ready(Err(Error::Eof)),

@@ -196,8 +196,10 @@ slash redirects, or complete `net/http.ServeMux` algebra.
 The client MUST:
 
 - write HTTP/1.1 requests and understand HTTP/1.0 and HTTP/1.1 responses;
-- limit each response/status line to 8 KiB and all interim plus final headers
-  together to 64 KiB;
+- limit each response/status line to 64 KiB, the same as all interim plus
+  final headers together (a line beyond 8 KiB grows the read buffer of that
+  connection; real servers send them, such as the 9 KiB
+  `content-security-policy` on a GitHub redirect);
 - return every final status from `Do`, while `Get` requires exactly `200` and a
   known `Content-Length`;
 - bound bodies using `Content-Length`, chunked framing, or EOF, treating `HEAD`,

@@ -88,6 +88,15 @@ pub const BUF_SIZE: usize = 8 << 10;
 /// verbinding niet vasthouden.
 pub const MAX_HEADER_BYTES: usize = 64 << 10;
 
+/// Grens van één regel in een antwoord, voor de client.
+///
+/// KAM: het hele headerbudget, [`MAX_HEADER_BYTES`]. De leesbuffer begint op
+/// [`BUF_SIZE`] en groeit alleen voor een regel die niet past. De server
+/// houdt 8 KiB per regel; de client leest wat een echte server stuurt, en de
+/// 302 van een GitHub-release draagt een `content-security-policy` van
+/// 9243 bytes (24-10-2026). curl staat 100 KB per regel toe.
+pub const CLIENT_LINE_MAX: usize = MAX_HEADER_BYTES;
+
 /// Grootste request-body die de server aanneemt.
 ///
 /// KAM: 1 MiB. Deze server is er voor API's en kleine formulieren, niet voor

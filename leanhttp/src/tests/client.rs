@@ -356,18 +356,36 @@ fn kromge_statusregel_weigert() {
 }
 
 #[test]
+fn een_regel_boven_de_buffer_past_tot_de_clientgrens() {
+    // De 302 van een GitHub-release (24-10-2026): een
+    // content-security-policy van 9243 bytes, boven BUF_SIZE.
+    let answer: &'static str = Box::leak(
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Security-Policy: {}\r\nContent-Length: 1\r\n\r\nx",
+            "A".repeat(9243 - "Content-Security-Policy: ".len())
+        )
+        .into_boxed_str(),
+    );
+    let res = raw_get(answer).unwrap();
+    assert_eq!(
+        res.header.get("Content-Security-Policy").map(str::len),
+        Some(9243 - "Content-Security-Policy: ".len())
+    );
+}
+
+#[test]
 fn te_lange_headerregel_weigert() {
     let answer: &'static str = Box::leak(
         format!(
             "HTTP/1.1 200 OK\r\nX-Groot: {}\r\nContent-Length: 1\r\n\r\nx",
-            "A".repeat(crate::BUF_SIZE + 1)
+            "A".repeat(crate::CLIENT_LINE_MAX + 1)
         )
         .into_boxed_str(),
     );
     assert_eq!(
         raw_get(answer).unwrap_err(),
         Error::LineTooLong {
-            limit: crate::BUF_SIZE
+            limit: crate::CLIENT_LINE_MAX
         }
     );
 }

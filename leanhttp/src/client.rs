@@ -28,7 +28,7 @@ use crate::io::{
 };
 use crate::pool::Pool;
 use crate::url::{Url, resolve, same_origin};
-use crate::{BUF_SIZE, EXPECT_TIMEOUT, MAX_HEADER_BYTES, MAX_REDIRECTS};
+use crate::{BUF_SIZE, CLIENT_LINE_MAX, EXPECT_TIMEOUT, MAX_HEADER_BYTES, MAX_REDIRECTS};
 
 /// Waar een [`Dial`] heen moet.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -660,7 +660,7 @@ async fn hop<C: Conn>(
     keep_alive: bool,
     pooled: bool,
 ) -> core::result::Result<Response<C>, HopError> {
-    let mut rbuf = match ReadBuf::new() {
+    let mut rbuf = match ReadBuf::with_line_max(CLIENT_LINE_MAX) {
         Ok(r) => r,
         Err(e) => {
             let _ = close(&mut conn).await;
