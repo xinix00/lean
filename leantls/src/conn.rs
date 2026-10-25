@@ -76,6 +76,8 @@ pub struct Conn<T> {
     pub(crate) transcript: Sha256,
     /// De pin die de server bewees, in gepinde modus.
     pub(crate) peer_key: Option<PeerKey>,
+    /// Het protocol dat ALPN opleverde, als er een gekozen werd.
+    pub(crate) alpn: Option<Vec<u8>>,
 }
 
 /// Een nulgevulde buffer van `n` bytes, of [`Error::Alloc`].
@@ -110,12 +112,19 @@ impl<T> Conn<T> {
             hs: Vec::new(),
             transcript: Sha256::new(),
             peer_key: None,
+            alpn: None,
         })
     }
 
     /// De sleutel die de server bewees, in gepinde modus.
     pub fn peer_key(&self) -> Option<&PeerKey> {
         self.peer_key.as_ref()
+    }
+
+    /// Het protocol dat ALPN (RFC 7301) opleverde, zoals `b"h2"`. `None` als
+    /// er niets aangeboden werd of de peer niets koos.
+    pub fn alpn(&self) -> Option<&[u8]> {
+        self.alpn.as_deref()
     }
 
     /// Het transport, bijvoorbeeld om zijn bulk-classificatie te lezen (de

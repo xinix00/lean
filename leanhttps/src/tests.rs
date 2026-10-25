@@ -334,3 +334,180 @@ fn web_dial_sends_sni_under_a_handshake_deadline() {
         Some(&Some(Duration::from_secs(20)))
     );
 }
+
+/// De ALPN-extensie met precies `h2`: type 16, lengte 5, lijst 3, naam 2.
+const ALPN_H2: &[u8] = b"\x00\x10\x00\x05\x00\x03\x02h2";
+
+// Het aanbod reist mee door beide dialers, en zonder aanbod blijft de
+// ClientHello zoals hij was.
+#[test]
+fn alpn_offer_reaches_the_client_hello() {
+    let mut plain = TlsDial::new(Tcp::default(), pinned(), entropy);
+    let _ = block_on(plain.dial(target("api.push.apple.com")));
+    assert!(!contains(&plain.inner.written[0].borrow(), ALPN_H2));
+
+    let mut h2 = TlsDial::new(Tcp::default(), pinned(), entropy).with_alpn(&[b"h2"]);
+    let _ = block_on(h2.dial(target("api.push.apple.com")));
+    assert!(contains(&h2.inner.written[0].borrow(), ALPN_H2));
+
+    let mut web = WebDial::new(
+        Tcp::default(),
+        leantls::MOZILLA_ROOTS,
+        || Some(1_790_000_000),
+        || Some(entropy()),
+    );
+    let _ = block_on(web.dial(target("api.push.apple.com")));
+    assert!(!contains(&web.inner.written[0].borrow(), ALPN_H2));
+    web.alpn = &[b"h2"];
+    let _ = block_on(web.dial(target("api.push.apple.com")));
+    assert!(contains(&web.inner.written[1].borrow(), ALPN_H2));
+}
+
+/// Twee richtingen in het geheugen; leeg is `Pending`.
+#[derive(Default)]
+struct Wires {
+    up: std::collections::VecDeque<u8>,
+    down: std::collections::VecDeque<u8>,
+}
+
+/// De clientkant als kale leanhttp-verbinding.
+struct Near(Rc<RefCell<Wires>>);
+
+impl leanhttp::AsyncRead for Near {
+    fn poll_read(
+        &mut self,
+        _cx: &mut Context<'_>,
+        buf: &mut [u8],
+    ) -> Poll<core::result::Result<usize, IoError>> {
+        let mut w = self.0.borrow_mut();
+        if w.down.is_empty() {
+            return Poll::Pending;
+        }
+        let n = buf.len().min(w.down.len());
+        for (d, s) in buf.iter_mut().zip(w.down.drain(..n)) {
+            *d = s;
+        }
+        Poll::Ready(Ok(n))
+    }
+}
+
+impl leanhttp::AsyncWrite for Near {
+    fn poll_write(
+        &mut self,
+        _cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<core::result::Result<usize, IoError>> {
+        self.0.borrow_mut().up.extend(buf);
+        Poll::Ready(Ok(buf.len()))
+    }
+}
+
+impl Close for Near {
+    fn poll_close(&mut self, _cx: &mut Context<'_>) -> Poll<core::result::Result<(), IoError>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
+/// De serverkant, voor `leantls::server`.
+struct Far(Rc<RefCell<Wires>>);
+
+impl leantls::AsyncRead for Far {
+    type Error = ();
+    fn poll_read(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        buf: &mut [u8],
+    ) -> Poll<core::result::Result<usize, ()>> {
+        let mut w = self.0.borrow_mut();
+        if w.up.is_empty() {
+            return Poll::Pending;
+        }
+        let n = buf.len().min(w.up.len());
+        for (d, s) in buf.iter_mut().zip(w.up.drain(..n)) {
+            *d = s;
+        }
+        Poll::Ready(Ok(n))
+    }
+}
+
+impl leantls::AsyncWrite for Far {
+    type Error = ();
+    fn poll_write(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<core::result::Result<usize, ()>> {
+        self.0.borrow_mut().down.extend(buf);
+        Poll::Ready(Ok(buf.len()))
+    }
+}
+
+/// Eén dial naar een server in het geheugen.
+struct Memory(Rc<RefCell<Wires>>);
+
+impl Dial for Memory {
+    type Conn = Near;
+
+    async fn dial(&mut self, _target: Target<'_>) -> leanhttp::Result<Near> {
+        Ok(Near(self.0.clone()))
+    }
+}
+
+/// Een Ed25519-identiteit zonder sleutel: [`AnyChain`] keurt de handtekening
+/// goed, Finished bindt de handshake nog steeds.
+struct Unsigned(Vec<Vec<u8>>);
+
+impl leantls::server::Identity for Unsigned {
+    fn certificates(&self) -> &[Vec<u8>] {
+        &self.0
+    }
+    fn signature_scheme(&self) -> u16 {
+        0x0807
+    }
+    fn sign(&self, _: &[u8], _: [u8; 32]) -> leantls::Result<Vec<u8>> {
+        Ok(vec![0; 64])
+    }
+}
+
+// De keuze van de server is na de dial te lezen op de verbinding. De server
+// van leantls onderhandelt alleen HTTP/1.1, dus dat is wat hier gekozen wordt;
+// h2 tegen een server bewijst leantls zelf.
+#[test]
+fn alpn_choice_is_visible_on_the_connection() {
+    let wires = Rc::new(RefCell::new(Wires::default()));
+    let identity = Unsigned(vec![
+        include_bytes!("../../leantls/testdata/ed25519-cert.der").to_vec(),
+    ]);
+    let chain = AnyChain;
+    let mut tls = TlsDial::new(Memory(wires.clone()), Trust::Chain(&chain), entropy)
+        .with_alpn(&[b"h2", b"http/1.1"]);
+    let mut server = std::pin::pin!(leantls::server::accept(
+        Far(wires),
+        &identity,
+        Entropy::new([2; Entropy::LEN]),
+        true
+    ));
+    let mut client = std::pin::pin!(tls.dial(target("leantls.test")));
+    let mut cx = Context::from_waker(Waker::noop());
+    let (mut c, mut s) = (None, None);
+    for _ in 0..1000 {
+        if s.is_none()
+            && let Poll::Ready(r) = server.as_mut().poll(&mut cx)
+        {
+            s = Some(r);
+        }
+        if c.is_none()
+            && let Poll::Ready(r) = client.as_mut().poll(&mut cx)
+        {
+            c = Some(r);
+        }
+        if c.is_some() && s.is_some() {
+            break;
+        }
+    }
+    let conn = c.expect("de dial bleef hangen").unwrap();
+    assert!(s.expect("de server bleef hangen").is_ok());
+    assert_eq!(conn.alpn(), Some(b"http/1.1".as_slice()));
+    assert_eq!(Link::Tls(conn).alpn(), Some(b"http/1.1".as_slice()));
+    assert_eq!(Link::Plain(Near(Rc::default())).alpn(), None);
+}

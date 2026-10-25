@@ -1734,3 +1734,651 @@ fn adversarial_hpack_table_is_zero_after_settings_ack() {
     );
     p.assert_connection_error("table size");
 }
+
+// --- Clientrol ------------------------------------------------------------------
+
+/// De clientkant van dezelfde pijp: leest wat de server schreef. Leeg is
+/// `Pending`, tenzij de server sloot of het script op is (`peer_closed`).
+struct ClientEnd(Rc<RefCell<Pipe>>);
+
+impl AsyncRead for ClientEnd {
+    type Error = PipeError;
+    fn poll_read(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        buf: &mut [u8],
+    ) -> Poll<Result<usize, PipeError>> {
+        let mut p = self.0.borrow_mut();
+        if p.to_peer.is_empty() {
+            return if p.peer_closed || p.closes > 0 {
+                Poll::Ready(Ok(0))
+            } else {
+                Poll::Pending
+            };
+        }
+        let n = buf.len().min(p.to_peer.len());
+        for (dst, src) in buf.iter_mut().zip(p.to_peer.drain(..n)) {
+            *dst = src;
+        }
+        Poll::Ready(Ok(n))
+    }
+}
+
+impl AsyncWrite for ClientEnd {
+    type Error = PipeError;
+    fn poll_write(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<Result<usize, PipeError>> {
+        self.0.borrow_mut().to_server.extend(buf);
+        Poll::Ready(Ok(buf.len()))
+    }
+
+    fn poll_close(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), PipeError>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
+type Frame = (u8, u8, u32, Vec<u8>);
+type ClientOutcome = Result<client::Response, client::SendError<PipeError>>;
+
+/// Knipt een bytestroom in frames.
+fn split_frames(mut b: &[u8]) -> Vec<Frame> {
+    let mut out = Vec::new();
+    while b.len() >= 9 {
+        let len = usize::from(b[0]) << 16 | usize::from(b[1]) << 8 | usize::from(b[2]);
+        let stream = u32::from_be_bytes([b[5], b[6], b[7], b[8]]) & 0x7fff_ffff;
+        out.push((b[3], b[4], stream, b[9..9 + len].to_vec()));
+        b = &b[9 + len..];
+    }
+    assert!(b.is_empty(), "half frame van de client");
+    out
+}
+
+/// Speelt een script van serverframes af tegen `client::send`, met het einde
+/// van de stroom erachter. Geeft de uitkomst en de frames van de client.
+fn scripted(
+    script: &[Vec<u8>],
+    request: &client::Request<'_>,
+    limits: &client::Limits,
+) -> (ClientOutcome, Vec<Frame>) {
+    let pipe = Rc::new(RefCell::new(Pipe {
+        peer_closed: true,
+        ..Pipe::default()
+    }));
+    for f in script {
+        pipe.borrow_mut().to_peer.extend(f);
+    }
+    let mut io = ClientEnd(pipe.clone());
+    let outcome = {
+        let mut fut = std::pin::pin!(client::send(&mut io, request, limits));
+        match fut.as_mut().poll(&mut Context::from_waker(Waker::noop())) {
+            Poll::Ready(r) => r,
+            Poll::Pending => panic!("de client wacht op een script dat op is"),
+        }
+    };
+    let written: Vec<u8> = pipe.borrow().to_server.iter().copied().collect();
+    if written.is_empty() {
+        return (outcome, Vec::new());
+    }
+    assert_eq!(&written[..24], CLIENT_PREFACE);
+    (outcome, split_frames(&written[24..]))
+}
+
+/// Een push zoals APNs hem verwacht.
+const PUSH: client::Request<'static> = client::Request {
+    method: "POST",
+    authority: "api.push.apple.com",
+    path: "/3/device/00fc13adff785122",
+    header: &[
+        ("Apns-Topic", "nl.example.app"),
+        ("apns-push-type", "alert"),
+    ],
+    body: br#"{"aps":{"alert":"hallo"}}"#,
+};
+
+fn settings_frame(body: &[u8]) -> Vec<u8> {
+    frame_bytes(FRAME_SETTINGS, 0, 0, body)
+}
+
+fn status(code: &str) -> Vec<u8> {
+    encode_fields(&[f(":status", code)])
+}
+
+/// Een literal zonder indexering met Huffman-gecodeerde naam en waarde; onze
+/// eigen encoder maakt geen Huffman, een echte server wel.
+fn huffman_field(name: &str, value: &str) -> Vec<u8> {
+    let mut out = vec![0x00];
+    for s in [name, value] {
+        let h = crate::huffman::tests::encode(s.as_bytes());
+        append_int(&mut out, 0x80, 7, h.len());
+        out.extend(h);
+    }
+    out
+}
+
+fn goaway_frame(last: u32, code: u32, debug: &[u8]) -> Vec<u8> {
+    let mut body = last.to_be_bytes().to_vec();
+    body.extend(code.to_be_bytes());
+    body.extend(debug);
+    frame_bytes(FRAME_GOAWAY, 0, 0, &body)
+}
+
+// De client tegen de eigen server: verzoek met body en velden, een antwoord
+// groter dan het standaardvenster (dat kan alleen met ons krediet), en de
+// beleefde GOAWAY aan het eind.
+#[test]
+fn client_round_trip_with_own_server() {
+    type Seen = (String, String, String, String, Option<String>, Vec<u8>);
+    let seen: Rc<RefCell<Option<Seen>>> = Rc::default();
+    let s = seen.clone();
+    let answer: Vec<u8> = (0..100 << 10).map(|i| (i % 251) as u8).collect();
+    let reply = answer.clone();
+    let h = handler(move |mut req, mut res| {
+        let s = s.clone();
+        let reply = reply.clone();
+        Box::pin(async move {
+            let body = read_all(&mut req.body).await?;
+            *s.borrow_mut() = Some((
+                req.method.clone(),
+                req.scheme.clone(),
+                req.authority.clone(),
+                req.path.clone(),
+                req.get("apns-topic").map(str::to_owned),
+                body,
+            ));
+            res.write_header(200, &[("apns-id", "eabeae54-14a8-11e5-b60b-1697f925ec7b")])?;
+            res.write(&reply).await?;
+            Ok(())
+        })
+    });
+    let body: Vec<u8> = (0..20_000).map(|i| (i % 7) as u8).collect();
+    let header = [
+        ("apns-topic", "nl.example.app"),
+        ("content-length", "20000"),
+    ];
+    let request = client::Request {
+        body: &body,
+        header: &header,
+        ..PUSH
+    };
+    let limits = client::Limits {
+        body: 128 << 10,
+        ..client::Limits::default()
+    };
+
+    let pipe = Rc::new(RefCell::new(Pipe::default()));
+    let mut conn = Conn::new(ServerEnd(pipe.clone()), h);
+    let mut serve = std::pin::pin!(conn.serve(std::future::pending()));
+    let mut io = ClientEnd(pipe.clone());
+    let mut send = std::pin::pin!(client::send(&mut io, &request, &limits));
+    let mut cx = Context::from_waker(Waker::noop());
+    let mut served = None;
+    let mut sent = None;
+    for _ in 0..10_000 {
+        if served.is_none()
+            && let Poll::Ready(r) = serve.as_mut().poll(&mut cx)
+        {
+            served = Some(r);
+        }
+        if sent.is_none()
+            && let Poll::Ready(r) = send.as_mut().poll(&mut cx)
+        {
+            sent = Some(r);
+        }
+        if sent.is_some() && served.is_some() {
+            break;
+        }
+    }
+    let response = sent
+        .expect("de client bleef hangen")
+        .unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(response.status, 200);
+    assert_eq!(
+        response.get("apns-id"),
+        Some("eabeae54-14a8-11e5-b60b-1697f925ec7b")
+    );
+    assert!(response.body == answer, "antwoordbody verschilt");
+    let (method, scheme, authority, path, topic, got) = seen.borrow_mut().take().unwrap();
+    assert_eq!(
+        (method.as_str(), scheme.as_str(), authority.as_str()),
+        ("POST", "https", "api.push.apple.com")
+    );
+    assert_eq!(path, PUSH.path);
+    assert_eq!(topic.as_deref(), Some("nl.example.app"));
+    assert!(got == body, "verzoekbody verschilt");
+    // De server zag de GOAWAY van de client: zo eindigt een beleefde client.
+    let served = served.expect("de server stopte niet");
+    assert_eq!(
+        served,
+        Err(ServeError::Protocol(Error::PeerGoAway { code: 0 }))
+    );
+}
+
+// Huffman-literals, een blok over HEADERS en CONTINUATION, een 1xx vooraf,
+// opgevulde DATA, PING en SETTINGS: alles wat een echte server kan sturen.
+#[test]
+fn client_reads_huffman_continuation_and_interim() {
+    let mut block = status("200");
+    block.extend(huffman_field("apns-id", "eabeae54-14a8-11e5"));
+    block.extend(huffman_field("x-reden", "Gelukt, met spaties"));
+    let (first, rest) = block.split_at(5);
+    let script = [
+        settings_frame(&setting(SETTING_MAX_CONCURRENT, 1000)),
+        frame_bytes(FRAME_SETTINGS, FLAG_ACK, 0, &[]),
+        frame_bytes(FRAME_PING, 0, 0, &[1, 2, 3, 4, 5, 6, 7, 8]),
+        frame_bytes(FRAME_WINDOW_UPDATE, 0, 0, &1000u32.to_be_bytes()),
+        frame_bytes(FRAME_PRIORITY, 0, 1, &[0, 0, 0, 0, 15]),
+        frame_bytes(FRAME_HEADERS, FLAG_END_HEADERS, 1, &status("103")),
+        frame_bytes(FRAME_HEADERS, 0, 1, first),
+        frame_bytes(FRAME_CONTINUATION, FLAG_END_HEADERS, 1, rest),
+        frame_bytes(FRAME_DATA, FLAG_PADDED, 1, &[2, b'h', b'e', b'l', 0, 0]),
+        frame_bytes(FRAME_DATA, FLAG_END_STREAM, 1, b"lo"),
+    ];
+    let (outcome, written) = scripted(&script, &PUSH, &client::Limits::default());
+    let response = outcome.unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(response.status, 200);
+    assert_eq!(response.get("apns-id"), Some("eabeae54-14a8-11e5"));
+    assert_eq!(response.get("x-reden"), Some("Gelukt, met spaties"));
+    assert_eq!(response.body, b"hello");
+
+    let kinds: Vec<(u8, u8, u32)> = written.iter().map(|f| (f.0, f.1, f.2)).collect();
+    assert_eq!(
+        kinds,
+        [
+            (FRAME_SETTINGS, 0, 0),
+            (FRAME_SETTINGS, FLAG_ACK, 0),
+            (FRAME_HEADERS, FLAG_END_HEADERS, 1),
+            (FRAME_DATA, FLAG_END_STREAM, 1),
+            (FRAME_PING, FLAG_ACK, 0),
+            (FRAME_WINDOW_UPDATE, 0, 1),
+            (FRAME_WINDOW_UPDATE, 0, 0),
+            (FRAME_GOAWAY, 0, 0),
+        ]
+    );
+    // Onze SETTINGS: geen push, en de koplijstgrens.
+    assert_eq!(
+        written[0].3,
+        [
+            setting(SETTING_ENABLE_PUSH, 0),
+            setting(SETTING_MAX_HEADER_LIST_SIZE, 16 << 10)
+        ]
+        .concat()
+    );
+    assert_eq!(
+        decode(&written[2].3),
+        [
+            f(":method", "POST"),
+            f(":scheme", "https"),
+            f(":authority", "api.push.apple.com"),
+            f(":path", PUSH.path),
+            f("apns-topic", "nl.example.app"),
+            f("apns-push-type", "alert"),
+        ]
+    );
+    assert_eq!(written[3].3, PUSH.body);
+    assert_eq!(written[4].3, [1, 2, 3, 4, 5, 6, 7, 8]);
+    // Krediet voor de hele opgevulde inhoud: zes bytes.
+    assert_eq!(written[5].3, 6u32.to_be_bytes());
+    assert_eq!(written[7].3, [0; 8], "GOAWAY: stream 0, NO_ERROR");
+}
+
+#[test]
+fn client_reports_goaway_and_reset() {
+    let limits = client::Limits::default();
+    let settings = settings_frame(&[]);
+    // Stream 1 niet verwerkt: veilig opnieuw, en dat zegt `last_stream`.
+    let (outcome, _) = scripted(&[settings.clone(), goaway_frame(0, 0, b"")], &PUSH, &limits);
+    assert_eq!(
+        outcome.err(),
+        Some(client::SendError::GoAway {
+            code: 0,
+            last_stream: 0
+        })
+    );
+    let (outcome, _) = scripted(
+        &[
+            settings.clone(),
+            goaway_frame(1, 2, br#"{"reason":"Shutdown"}"#),
+        ],
+        &PUSH,
+        &limits,
+    );
+    assert_eq!(
+        outcome.err(),
+        Some(client::SendError::GoAway {
+            code: 2,
+            last_stream: 1
+        })
+    );
+    let (outcome, written) = scripted(
+        &[
+            settings.clone(),
+            frame_bytes(FRAME_RST_STREAM, 0, 1, &7u32.to_be_bytes()),
+        ],
+        &PUSH,
+        &limits,
+    );
+    assert_eq!(outcome.err(), Some(client::SendError::Reset { code: 7 }));
+    assert!(
+        written.iter().all(|f| f.0 != FRAME_GOAWAY),
+        "na een fout ging er toch nog iets uit"
+    );
+    // Een nette stop die stream 1 nog afmaakt, is geen fout.
+    let (outcome, _) = scripted(
+        &[
+            settings,
+            goaway_frame(1, 0, b""),
+            frame_bytes(
+                FRAME_HEADERS,
+                FLAG_END_HEADERS | FLAG_END_STREAM,
+                1,
+                &status("200"),
+            ),
+        ],
+        &PUSH,
+        &limits,
+    );
+    assert_eq!(outcome.unwrap().status, 200);
+}
+
+#[test]
+fn client_limits_overflow() {
+    let settings = settings_frame(&[]);
+    let headers = frame_bytes(FRAME_HEADERS, FLAG_END_HEADERS, 1, &status("400"));
+    let limits = client::Limits {
+        body: 4,
+        ..client::Limits::default()
+    };
+    let (outcome, _) = scripted(
+        &[
+            settings.clone(),
+            headers,
+            frame_bytes(FRAME_DATA, FLAG_END_STREAM, 1, br#"{"reason":"x"}"#),
+        ],
+        &PUSH,
+        &limits,
+    );
+    assert_eq!(
+        outcome.err(),
+        Some(client::SendError::BodyTooLarge { limit: 4 })
+    );
+
+    let mut block = status("200");
+    block.extend(encode_fields(&[f("x-lang", &"a".repeat(100))]));
+    let limits = client::Limits {
+        header_list: 64,
+        ..client::Limits::default()
+    };
+    let (outcome, _) = scripted(
+        &[
+            settings,
+            frame_bytes(FRAME_HEADERS, FLAG_END_HEADERS | FLAG_END_STREAM, 1, &block),
+        ],
+        &PUSH,
+        &limits,
+    );
+    assert_eq!(
+        outcome.err(),
+        Some(client::SendError::Protocol(Error::HeaderBlock {
+            stream: 1,
+            cause: HpackError::ListTooLarge { limit: 64 },
+        }))
+    );
+}
+
+// Een body groter dan het venster wacht niet: hij faalt vóór HEADERS.
+#[test]
+fn client_body_above_window_is_refused() {
+    let small = settings_frame(&setting(SETTING_INITIAL_WINDOW_SIZE, 10));
+    let (outcome, written) = scripted(&[small], &PUSH, &client::Limits::default());
+    assert_eq!(
+        outcome.err(),
+        Some(client::SendError::BodyAboveWindow {
+            len: PUSH.body.len(),
+            window: 10
+        })
+    );
+    assert!(
+        written
+            .iter()
+            .all(|f| f.0 != FRAME_HEADERS && f.0 != FRAME_DATA)
+    );
+
+    // Zonder instelling geldt het standaardvenster van de verbinding.
+    let body = vec![0u8; 65_536];
+    let request = client::Request {
+        body: &body,
+        ..PUSH
+    };
+    let (outcome, _) = scripted(
+        &[settings_frame(&setting(
+            SETTING_INITIAL_WINDOW_SIZE,
+            1 << 20,
+        ))],
+        &request,
+        &client::Limits::default(),
+    );
+    assert_eq!(
+        outcome.err(),
+        Some(client::SendError::BodyAboveWindow {
+            len: 65_536,
+            window: 65_535
+        })
+    );
+}
+
+#[test]
+fn client_refuses_malformed_responses() {
+    let ends = FLAG_END_HEADERS | FLAG_END_STREAM;
+    let headers = |fields: &[Field]| frame_bytes(FRAME_HEADERS, ends, 1, &encode_fields(fields));
+    let cases: Vec<(&str, Vec<Vec<u8>>, &str)> = vec![
+        (
+            "geen status",
+            vec![headers(&[f("server", "x")])],
+            "no :status",
+        ),
+        (
+            "pseudo na gewoon veld",
+            vec![headers(&[f("server", "x"), f(":status", "200")])],
+            "pseudo-header after",
+        ),
+        (
+            "verzoek-pseudo",
+            vec![headers(&[f(":status", "200"), f(":path", "/")])],
+            "other than :status",
+        ),
+        (
+            "hoofdletters",
+            vec![headers(&[f(":status", "200"), f("X-Up", "1")])],
+            "lowercase token",
+        ),
+        (
+            "verbindingsveld",
+            vec![headers(&[f(":status", "200"), f("connection", "close")])],
+            "connection-specific",
+        ),
+        ("status 101", vec![headers(&[f(":status", "101")])], "101"),
+        (
+            "tussenantwoord met END_STREAM",
+            vec![headers(&[f(":status", "100")])],
+            "interim",
+        ),
+        (
+            "DATA voor HEADERS",
+            vec![frame_bytes(FRAME_DATA, FLAG_END_STREAM, 1, b"x")],
+            "frame type 0x00 on stream 1",
+        ),
+        (
+            "HEADERS op een andere stream",
+            vec![frame_bytes(FRAME_HEADERS, ends, 3, &status("200"))],
+            "on stream 3",
+        ),
+        (
+            "PUSH_PROMISE",
+            vec![frame_bytes(
+                FRAME_PUSH_PROMISE,
+                FLAG_END_HEADERS,
+                1,
+                &[0, 0, 0, 2],
+            )],
+            "PUSH_PROMISE",
+        ),
+        (
+            "content-length klopt niet",
+            vec![
+                frame_bytes(
+                    FRAME_HEADERS,
+                    FLAG_END_HEADERS,
+                    1,
+                    &encode_fields(&[f(":status", "200"), f("content-length", "5")]),
+                ),
+                frame_bytes(FRAME_DATA, FLAG_END_STREAM, 1, b"abc"),
+            ],
+            "content-length does not match",
+        ),
+        (
+            "trailers zonder END_STREAM",
+            vec![
+                frame_bytes(FRAME_HEADERS, FLAG_END_HEADERS, 1, &status("200")),
+                frame_bytes(
+                    FRAME_HEADERS,
+                    FLAG_END_HEADERS,
+                    1,
+                    &encode_fields(&[f("x", "y")]),
+                ),
+            ],
+            "trailers without END_STREAM",
+        ),
+        (
+            "onderbroken blok",
+            vec![
+                frame_bytes(FRAME_HEADERS, 0, 1, &status("200")),
+                frame_bytes(FRAME_PING, 0, 0, &[0; 8]),
+            ],
+            "interrupted the header block",
+        ),
+        (
+            "einde voor het antwoord",
+            vec![frame_bytes(
+                FRAME_HEADERS,
+                FLAG_END_HEADERS,
+                1,
+                &status("200"),
+            )],
+            "closed the connection",
+        ),
+        (
+            "frame te groot",
+            vec![{
+                let mut big = frame_bytes(FRAME_DATA, 0, 1, &[]);
+                big[..3].copy_from_slice(&[0, 0x40, 0x01]);
+                big
+            }],
+            "16385 byte frame",
+        ),
+    ];
+    for (name, frames, want) in cases {
+        let mut script = vec![settings_frame(&[])];
+        script.extend(frames);
+        let (outcome, _) = scripted(&script, &PUSH, &client::Limits::default());
+        let err = outcome
+            .err()
+            .unwrap_or_else(|| panic!("{name}: geaccepteerd"));
+        assert!(err.to_string().contains(want), "{name}: {err}");
+    }
+    // De preface van de server is SETTINGS, niets anders.
+    let (outcome, _) = scripted(
+        &[frame_bytes(FRAME_PING, 0, 0, &[0; 8])],
+        &PUSH,
+        &client::Limits::default(),
+    );
+    assert_eq!(
+        outcome.err(),
+        Some(client::SendError::Protocol(Error::FirstFrameNotSettings))
+    );
+    // Trailers die netjes eindigen, worden gelezen en weggegooid.
+    let (outcome, _) = scripted(
+        &[
+            settings_frame(&[]),
+            frame_bytes(FRAME_HEADERS, FLAG_END_HEADERS, 1, &status("200")),
+            frame_bytes(FRAME_DATA, 0, 1, b"ok"),
+            frame_bytes(FRAME_HEADERS, ends, 1, &encode_fields(&[f("x-check", "1")])),
+        ],
+        &PUSH,
+        &client::Limits::default(),
+    );
+    let response = outcome.unwrap();
+    assert_eq!(
+        (response.status, response.body.as_slice()),
+        (200, &b"ok"[..])
+    );
+    assert_eq!(response.get("x-check"), None);
+}
+
+// Een verzoek dat zo niet de draad op kan, faalt vóór de eerste byte.
+#[test]
+fn client_refuses_bad_requests_before_writing() {
+    let cases: [(&str, client::Request<'static>); 8] = [
+        (
+            "CONNECT",
+            client::Request {
+                method: "CONNECT",
+                ..PUSH
+            },
+        ),
+        ("geen methode", client::Request { method: "", ..PUSH }),
+        (
+            "lege authority",
+            client::Request {
+                authority: "",
+                ..PUSH
+            },
+        ),
+        (
+            "pad zonder slash",
+            client::Request {
+                path: "3/device",
+                ..PUSH
+            },
+        ),
+        (
+            "verbindingsveld",
+            client::Request {
+                header: &[("Connection", "close")],
+                ..PUSH
+            },
+        ),
+        (
+            "host",
+            client::Request {
+                header: &[("host", "api.push.apple.com")],
+                ..PUSH
+            },
+        ),
+        (
+            "te",
+            client::Request {
+                header: &[("te", "gzip")],
+                ..PUSH
+            },
+        ),
+        (
+            "content-length",
+            client::Request {
+                header: &[("content-length", "3")],
+                ..PUSH
+            },
+        ),
+    ];
+    for (name, request) in cases {
+        let (outcome, written) =
+            scripted(&[settings_frame(&[])], &request, &client::Limits::default());
+        assert!(
+            matches!(outcome, Err(client::SendError::Request(_))),
+            "{name}: {outcome:?}"
+        );
+        assert!(written.is_empty(), "{name}: er ging iets de draad op");
+    }
+}

@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "HTTP/2 in de serverrol op een verbinding die de aanroeper al koos."
+description = "HTTP/2 in de serverrol op een verbinding die de aanroeper al koos, plus een minimale client: één verzoek per verbinding."
 
 [dependencies]
 

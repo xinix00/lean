@@ -1185,7 +1185,7 @@ impl State {
 }
 
 /// Haalt padlengte en opvulling van een opgevuld frame af.
-fn strip_padding(raw: &[u8], flags: u8) -> Result<&[u8]> {
+pub(crate) fn strip_padding(raw: &[u8], flags: u8) -> Result<&[u8]> {
     if flags & FLAG_PADDED == 0 {
         return Ok(raw);
     }
@@ -1198,7 +1198,7 @@ fn strip_padding(raw: &[u8], flags: u8) -> Result<&[u8]> {
 }
 
 /// Een framekop van negen bytes.
-fn push_head(out: &mut Vec<u8>, len: usize, typ: u8, flags: u8, stream: u32) {
+pub(crate) fn push_head(out: &mut Vec<u8>, len: usize, typ: u8, flags: u8, stream: u32) {
     let len = (len as u32).to_be_bytes();
     out.extend_from_slice(&len[1..]);
     out.push(typ);

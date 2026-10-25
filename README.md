@@ -23,11 +23,11 @@ applications share.
 | `leannet` | TCP/IP for bare metal: Ethernet, IPv4 ARP/ICMP/UDP/TCP; IPv6 UDP/NDP/SLAAC and Thread routes behind the feature `ipv6`, one bounded buffer budget. |
 | `leancookie` | A cookie jar (RFC 6265), host-only by default. |
 | `leanhttp` | HTTP/1.1 without TLS: client and server, sequential keep-alive, chunked responses and request bodies; host TCP behind the feature `std`. |
-| `leantls` | TLS 1.3 for a network you own: one version, one suite, a pinned Ed25519 peer or a real chain; client and server (the server leaves the private key with the caller); the Mozilla roots behind the feature `mozilla-roots`. |
+| `leantls` | TLS 1.3 for a network you own: one version, one suite, a pinned Ed25519 peer or a real chain; client and server (the server leaves the private key with the caller); client ALPN on request; the Mozilla roots behind the feature `mozilla-roots`. |
 | `leanhttps` | A composition: `leanhttp` over `leantls`, and nothing else; `WebDial` is the ordinary web client. |
 | `leans3` | S3: SigV4 signing plus the object operations that are actually used, one or several at once. |
 | `leans3http` | A composition: `leans3` over `leanhttp`, with streamed bodies, deadlines and GET retry, and nothing else. |
-| `leanh2` | HTTP/2 server role on a connection the caller already chose. |
+| `leanh2` | HTTP/2 server role on a connection the caller already chose, plus a minimal client: one request per connection (APNs). |
 
 How the code is written, for every crate here: the haas.software Rust
 handbook (`rustdoc/README.md` next to this repository).

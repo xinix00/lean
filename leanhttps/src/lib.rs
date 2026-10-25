@@ -59,7 +59,7 @@ use core::task::{Context, Poll};
 use core::time::Duration;
 
 use leanhttp::{Close, IoError, Target};
-use leantls::{ConnError, Entropy, Trust};
+use leantls::{ConnError, Entropy, Options, Trust};
 
 /// Hoe lang een close_notify mag duren voordat het transport toch dichtgaat.
 /// Een peer die niet meer leest, mag het sluiten niet gijzelen; de Go-versie
@@ -117,6 +117,8 @@ pub struct TlsDial<'t, D, R> {
     trust: Trust<'t>,
     /// De bron van handshake-willekeur.
     entropy: R,
+    /// Het ALPN-aanbod per handshake; leeg is geen aanbod.
+    alpn: &'t [&'t [u8]],
     /// De reden van de laatst mislukte dial, met meer detail dan leanhttp's
     /// fouttype heeft.
     last_error: Option<Error>,
@@ -134,8 +136,18 @@ where
             inner,
             trust,
             entropy,
+            alpn: &[],
             last_error: None,
         }
+    }
+
+    /// Biedt bij elke handshake `protocols` aan via ALPN (RFC 7301); wat de
+    /// server koos, staat in [`TlsConn::alpn`]. leanhttp spreekt alleen
+    /// HTTP/1.1: wie zelf `h2` aanbiedt, dialt zelf en geeft de verbinding
+    /// aan een HTTP/2-client zoals `leanh2::client`.
+    pub fn with_alpn(mut self, protocols: &'t [&'t [u8]]) -> Self {
+        self.alpn = protocols;
+        self
     }
 
     /// De reden van de laatst mislukte dial, als die er is.
@@ -162,7 +174,8 @@ where
             return Err(leanhttp::Error::NoHost);
         }
         let raw = self.inner.dial(target).await?;
-        match wrap(raw, &self.trust, host, (self.entropy)()).await {
+        let options = Options::new().alpn(self.alpn);
+        match wrap(raw, &self.trust, host, (self.entropy)(), &options).await {
             Ok(conn) => {
                 self.last_error = None;
                 Ok(conn)
@@ -263,6 +276,17 @@ enum State<C> {
 pub struct TlsConn<C> {
     /// Waar de verbinding in haar levensloop staat.
     state: State<C>,
+}
+
+impl<C> TlsConn<C> {
+    /// Het protocol dat ALPN opleverde, zoals `b"h2"`; `None` zonder aanbod,
+    /// zonder keuze van de server, of na het sluiten.
+    pub fn alpn(&self) -> Option<&[u8]> {
+        match &self.state {
+            State::Open(tls) => tls.alpn(),
+            _ => None,
+        }
+    }
 }
 
 impl<C: leanhttp::Conn + Unpin> leanhttp::AsyncRead for TlsConn<C> {
@@ -370,12 +394,13 @@ async fn wrap<C: leanhttp::Conn + Unpin>(
     trust: &Trust<'_>,
     host: &str,
     entropy: Entropy,
+    options: &Options<'_>,
 ) -> core::result::Result<TlsConn<C>, (Error, IoError)> {
     let wire = Wire {
         conn: raw,
         pending: Cell::new(Pending::default()),
     };
-    match leantls::connect(wire, trust, host, entropy).await {
+    match leantls::connect_with(wire, trust, host, entropy, options).await {
         Ok(tls) => Ok(TlsConn {
             state: State::Open(tls),
         }),

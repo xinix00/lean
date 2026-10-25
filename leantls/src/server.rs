@@ -101,7 +101,34 @@ impl Share {
 struct Hello<'a> {
     session: &'a [u8],
     share: Share,
-    http: bool,
+    /// Het protocol dat ALPN kiest, als er een is.
+    alpn: Option<&'a [u8]>,
+}
+
+/// Hoe de server een ALPN-protocol kiest.
+#[derive(Clone, Copy)]
+pub(crate) enum Select<'a> {
+    /// Het eerste protocol uit deze lijst dat de client aanbiedt. Leeg: ALPN
+    /// wordt genegeerd. Biedt de client ALPN zonder overlap, dan faalt de
+    /// handshake met alert 120.
+    First(&'a [&'a [u8]]),
+    /// Alleen voor tests: kies dit, wat de client ook aanbood; zo bewijst de
+    /// client dat hij een keuze buiten zijn aanbod weigert.
+    #[cfg(test)]
+    Force(&'a [u8]),
+}
+
+/// Wat `accept` met `http` onderhandelt.
+const HTTP11: &[&[u8]] = &[b"http/1.1"];
+
+/// Of de ALPN-lijst van de client `wanted` bevat; de lijst is al gecontroleerd.
+fn offers(mut names: Reader<'_>, wanted: &[u8]) -> bool {
+    while let Ok(name) = names.vec8() {
+        if name.rest() == wanted {
+            return true;
+        }
+    }
+    false
 }
 fn invalid(why: &'static str) -> Error {
     Error::PeerRejected(why)
@@ -116,7 +143,7 @@ fn list_has(mut list: Reader<'_>, wanted: u16) -> Result<bool> {
     }
     Ok(found)
 }
-fn hello(bytes: &[u8], scheme: u16, http: bool, p256: bool) -> Result<Hello<'_>> {
+fn hello<'a>(bytes: &'a [u8], scheme: u16, select: Select<'a>, p256: bool) -> Result<Hello<'a>> {
     let mut r = Reader::new(bytes);
     if r.u16()? != 0x0303 {
         return Err(Error::NotTls13);
@@ -139,7 +166,7 @@ fn hello(bytes: &[u8], scheme: u16, http: bool, p256: bool) -> Result<Hello<'_>>
     let mut seen = Vec::new();
     let (mut version, mut signature, mut group, mut p256_group) = (false, false, false, false);
     let mut share = None;
-    let mut selected_http = false;
+    let mut selected = None;
     while !extensions.is_empty() {
         let typ = extensions.u16()?;
         let mut ext = extensions.vec16()?;
@@ -183,22 +210,28 @@ fn hello(bytes: &[u8], scheme: u16, http: bool, p256: bool) -> Result<Hello<'_>>
                 }
             }
             16 => {
-                let mut names = ext.vec16()?;
-                if names.is_empty() {
+                let list = ext.vec16()?;
+                if list.is_empty() {
                     return Err(invalid("empty ALPN list"));
                 }
-                let mut offered_http = false;
+                let mut names = list;
                 while !names.is_empty() {
                     let name = names.vec8()?;
                     if name.is_empty() {
                         return Err(invalid("empty ALPN protocol"));
                     }
-                    offered_http |= name.rest() == b"http/1.1";
                 }
-                if http && !offered_http {
-                    return Err(invalid("no common ALPN protocol"));
+                match select {
+                    Select::First(ours) => {
+                        // De voorkeur van de server telt, niet de volgorde van de client.
+                        selected = ours.iter().copied().find(|p| offers(list, p));
+                        if selected.is_none() && !ours.is_empty() {
+                            return Err(invalid("no common ALPN protocol"));
+                        }
+                    }
+                    #[cfg(test)]
+                    Select::Force(_) => {}
                 }
-                selected_http = http && offered_http;
             }
             // No SNI-based virtual hosts or session resumption. Unknown offers do not select features.
             _ => {
@@ -222,10 +255,14 @@ fn hello(bytes: &[u8], scheme: u16, http: bool, p256: bool) -> Result<Hello<'_>>
     }) {
         return Err(Error::Group(share.group()));
     }
+    #[cfg(test)]
+    if let Select::Force(p) = select {
+        selected = Some(p);
+    }
     Ok(Hello {
         session,
         share,
-        http: selected_http,
+        alpn: selected,
     })
 }
 fn server_hello(h: &Hello<'_>, random: &[u8], share: &Share) -> Result<Vec<u8>> {
@@ -254,17 +291,20 @@ fn server_hello(h: &Hello<'_>, random: &[u8], share: &Share) -> Result<Vec<u8>> 
     b.close(body)?;
     Ok(b.finish())
 }
-fn encrypted_extensions(http: bool) -> Result<Vec<u8>> {
+fn encrypted_extensions(alpn: Option<&[u8]>) -> Result<Vec<u8>> {
     let mut b = Builder::new();
     b.u8(8)?;
     let body = b.open(3)?;
     let exts = b.open(2)?;
-    if http {
+    if let Some(p) = alpn {
         b.u16(16)?;
-        b.u16(11)?;
-        b.u16(9)?;
-        b.u8(8)?;
-        b.bytes(b"http/1.1")?;
+        let ext = b.open(2)?;
+        let list = b.open(2)?;
+        let name = b.open(1)?;
+        b.bytes(p)?;
+        b.close(name)?;
+        b.close(list)?;
+        b.close(ext)?;
     }
     b.close(exts)?;
     b.close(body)?;
@@ -325,8 +365,22 @@ pub async fn accept<T, E>(
 where
     T: AsyncRead<Error = E> + AsyncWrite<Error = E> + Unpin,
 {
+    let select = Select::First(if http { HTTP11 } else { &[] });
+    accept_with(io, identity, entropy, select).await
+}
+
+/// [`accept`] met een eigen ALPN-keuze; de tests draaien er een h2-server mee.
+pub(crate) async fn accept_with<T, E>(
+    io: T,
+    identity: &impl Identity,
+    entropy: Entropy,
+    select: Select<'_>,
+) -> Result<Conn<T>, ConnError<E>>
+where
+    T: AsyncRead<Error = E> + AsyncWrite<Error = E> + Unpin,
+{
     let mut conn = Conn::new(io)?;
-    if let Err(error) = handshake(&mut conn, identity, entropy, http).await {
+    if let Err(error) = handshake(&mut conn, identity, entropy, select).await {
         if let ConnError::Tls(tls) = &error {
             let code = match tls {
                 Error::Alert { .. } | Error::CloseNotify | Error::Eof => None,
@@ -364,7 +418,7 @@ async fn handshake<T, E>(
     conn: &mut Conn<T>,
     identity: &impl Identity,
     entropy: Entropy,
-    http: bool,
+    select: Select<'_>,
 ) -> Result<(), ConnError<E>>
 where
     T: AsyncRead<Error = E> + AsyncWrite<Error = E> + Unpin,
@@ -374,10 +428,15 @@ where
     let ch = hello(
         conn.body(len),
         identity.signature_scheme(),
-        http,
+        select,
         identity.offers_p256(),
     )?;
-    let http = ch.http;
+    let mut alpn = Vec::new();
+    if let Some(p) = ch.alpn {
+        alpn.try_reserve_exact(p.len()).map_err(|_| Error::Alloc)?;
+        alpn.extend_from_slice(p);
+    }
+    let alpn = ch.alpn.map(|_| alpn);
     let mut private = Secret::new([0u8; 32]);
     private.copy_from_slice(&entropy.bytes[..32]);
     let (share, shared) = ch.share.exchange(&private, identity)?;
@@ -400,7 +459,9 @@ where
     conn.read = Some(Direction::new(TrafficKeys::from_secret(c_hs)?));
     conn.write = Some(Direction::new(TrafficKeys::from_secret(s_hs)?));
     conn.queue_raw(&[20, 3, 3, 0, 1, 1])?;
-    conn.server_message(&encrypted_extensions(http)?).await?;
+    conn.server_message(&encrypted_extensions(alpn.as_deref())?)
+        .await?;
+    conn.alpn = alpn;
     conn.server_message(&certificate(identity)?).await?;
     let signature = identity.sign(
         &schedule::cert_verify_content(&conn.transcript.clone().finish()),

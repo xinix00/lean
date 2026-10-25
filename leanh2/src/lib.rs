@@ -1,4 +1,5 @@
-//! HTTP/2 in de serverrol op een verbinding die de aanroeper al koos.
+//! HTTP/2 in de serverrol op een verbinding die de aanroeper al koos, plus
+//! een minimale client: één verzoek per verbinding ([`client`]).
 //!
 //! Deze crate bezit één HTTP/2-verbinding: de framing, de streams, HPACK en
 //! beide niveaus van flow control. De verbinding zelf (TCP, TLS, deadlines)
@@ -10,16 +11,23 @@
 //! niet. Twee gelijke mains met één verbinding (`-ldflags="-s -w"`, CGO uit,
 //! 19-08-2026): 5,10 MB tegen 2,22 MB, 56% kleiner.
 //!
-//! # Alleen de serverrol
+//! # De serverrol, en een kleine client
 //!
-//! Geen listener, geen dialer, geen clienthelft, en geen onderhandeling over
-//! de protocolversie: de aanroeper heeft al gekozen. Dat is de vorm die de ene
-//! gemeten gebruiker nodig heeft: een Cloudflare Tunnel belt naar buiten, en de
-//! edge gedraagt zich daarna als HTTP/2-client op die uitgaande verbinding. Hij
+//! Geen listener, geen dialer en geen onderhandeling over de protocolversie:
+//! de aanroeper heeft al gekozen. De serverrol is de vorm die de eerste gemeten
+//! gebruiker nodig heeft: een Cloudflare Tunnel belt naar buiten, en de edge
+//! gedraagt zich daarna als HTTP/2-client op die uitgaande verbinding. Hij
 //! stuurt de preface, opent elke stream en verwacht nooit een verzoek van deze
 //! kant. Wie de keus heeft, gebruikt leanhttp; hier wordt niet gesnuffeld
 //! tussen versies, want vier bytes bewijzen geen preface (`PRI` is een geldige
 //! HTTP-methode).
+//!
+//! De clientrol is er alleen in zijn kleinste vorm, voor de tweede gebruiker:
+//! een push via APNs, dat uitsluitend HTTP/2 spreekt. [`client::send`] stuurt
+//! één verzoek op stream 1 van een verbinding die de aanroeper opende (TLS met
+//! ALPN `h2`, uit leantls) en leest één antwoord, begrensd. Geen pool, geen
+//! tweede stream, geen herhaling; een body die op flow control zou wachten,
+//! faalt vooraf.
 //!
 //! # Eén eigenaar
 //!
@@ -40,9 +48,10 @@
 //! te veel gecomprimeerde of gedecodeerde kopbytes, verkeerde pseudo-koppen,
 //! een veldnaam met hoofdletters, een verbindingsspecifiek veld, een
 //! WINDOW_UPDATE van nul of een die overloopt, en EOS in een Huffman-literal.
-//! Afwezig, met de toestandsruimte weggehaald: de clientrol, TLS, ALPN, h2c,
-//! push, CONNECT, trailers, 1xx, prioriteitstoestand en de dynamische tabel van
-//! de encoder (KAM.md, leanh2).
+//! Afwezig, met de toestandsruimte weggehaald: een client met meer dan één
+//! verzoek per verbinding, TLS en ALPN (die horen bij leantls), h2c, push,
+//! CONNECT, trailers in de serverrol, 1xx-antwoorden van de server,
+//! prioriteitstoestand en de dynamische tabel van de encoder (KAM.md, leanh2).
 
 #![cfg_attr(not(test), no_std)]
 #![cfg_attr(
@@ -58,6 +67,7 @@
 
 extern crate alloc;
 
+pub mod client;
 mod conn;
 mod hpack;
 mod huffman;
@@ -370,7 +380,7 @@ pub enum Error {
         /// De stream.
         stream: u32,
     },
-    /// PUSH_PROMISE van een client.
+    /// PUSH_PROMISE: van een client, of van een server nadat push uit stond.
     PushPromise,
     /// De peer stuurde GOAWAY.
     PeerGoAway {
@@ -535,7 +545,7 @@ impl fmt::Display for Error {
                 write!(f, "RST_STREAM of {len} bytes on stream {stream}")
             }
             Self::RstOnIdle { stream } => write!(f, "RST_STREAM on idle stream {stream}"),
-            Self::PushPromise => f.write_str("PUSH_PROMISE is not supported by this server"),
+            Self::PushPromise => f.write_str("PUSH_PROMISE is not supported"),
             Self::PeerGoAway { code } => write!(f, "the peer sent GOAWAY (code {code})"),
             Self::BadGoAway { len, stream } => {
                 write!(f, "GOAWAY of {len} bytes on stream {stream}")

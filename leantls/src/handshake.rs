@@ -7,7 +7,7 @@
 //!
 //! ```text
 //! ServerHello         -> TLS 1.3 en het sleuteldeel van de server
-//! EncryptedExtensions -> overslaan; niets gevraagd dat antwoord behoeft
+//! EncryptedExtensions -> alleen gelezen als de client ALPN aanbood
 //! Certificate         -> de identiteit van de peer
 //! CertificateVerify   -> de handtekening over het transcript
 //! Finished            -> de transcript-HMAC met het handshake-geheim
@@ -59,6 +59,8 @@ const EXT_SIGNATURE_ALGS: u16 = 13;
 const EXT_SUPPORTED_VERSIONS: u16 = 43;
 /// key_share.
 const EXT_KEY_SHARE: u16 = 51;
+/// application_layer_protocol_negotiation (RFC 7301).
+pub(crate) const EXT_ALPN: u16 = 16;
 
 /// TLS 1.3.
 const VERSION_TLS13: u16 = 0x0304;
@@ -136,10 +138,90 @@ pub async fn connect<T, E>(
 where
     T: AsyncRead<Error = E> + AsyncWrite<Error = E> + Unpin,
 {
+    connect_with(io, trust, server_name, entropy, &Options::new()).await
+}
+
+/// Wat een client naast vertrouwen en naam kan vragen. [`Options::new`] is
+/// precies [`connect`]: geen extensie meer of minder in de ClientHello.
+#[derive(Debug, Clone, Copy, Default)]
+#[non_exhaustive]
+pub struct Options<'a> {
+    /// De ALPN-protocollen (RFC 7301) in voorkeursvolgorde, bijvoorbeeld
+    /// `&[b"h2"]`. Leeg: geen ALPN-extensie, en de EncryptedExtensions van
+    /// de server worden niet gelezen, zoals altijd.
+    pub alpn: &'a [&'a [u8]],
+}
+
+impl<'a> Options<'a> {
+    /// Geen extra's.
+    pub const fn new() -> Self {
+        Self { alpn: &[] }
+    }
+
+    /// Biedt `protocols` aan via ALPN. Wat de server koos, staat na de
+    /// handshake in [`Conn::alpn`].
+    pub const fn alpn(mut self, protocols: &'a [&'a [u8]]) -> Self {
+        self.alpn = protocols;
+        self
+    }
+}
+
+/// [`connect`] met [`Options`], zoals een ALPN-aanbod.
+///
+/// Met ALPN geldt RFC 7301 §3.2 aan clientkant: kiest de server een protocol
+/// dat niet aangeboden werd, of iets anders dan precies één, dan faalt de
+/// handshake met [`Error::Alpn`]. Kiest hij niets, dan is [`Conn::alpn`]
+/// `None` en beslist de aanroeper: een gewone server zonder ALPN is geen
+/// protocolfout.
+///
+/// ```no_run
+/// # use leantls::{connect_with, AsyncRead, AsyncWrite, ConnError, Entropy, Options, Trust};
+/// # async fn demo<T, E>(tcp: T, trust: &Trust<'_>, seed: [u8; 96]) -> Result<(), ConnError<E>>
+/// # where T: AsyncRead<Error = E> + AsyncWrite<Error = E> + Unpin {
+/// let options = Options::new().alpn(&[b"h2"]);
+/// let conn = connect_with(tcp, trust, "api.push.apple.com", Entropy::new(seed), &options).await?;
+/// if conn.alpn() != Some(b"h2".as_slice()) {
+///     // Geen HTTP/2: deze peer is niet wat de aanroeper zocht.
+/// }
+/// # Ok(())
+/// # }
+/// ```
+pub async fn connect_with<T, E>(
+    io: T,
+    trust: &Trust<'_>,
+    server_name: &str,
+    entropy: Entropy,
+    options: &Options<'_>,
+) -> Result<Conn<T>, ConnError<E>>
+where
+    T: AsyncRead<Error = E> + AsyncWrite<Error = E> + Unpin,
+{
     check_config(trust, server_name)?;
+    check_alpn(options.alpn)?;
     let mut conn = Conn::new(io)?;
-    conn.handshake(trust, server_name, entropy).await?;
+    conn.handshake(trust, server_name, entropy, options.alpn)
+        .await?;
     Ok(conn)
+}
+
+/// Een ALPN-lijst die in de ClientHello past: elk protocol 1 tot 255 bytes
+/// (RFC 7301 §3.1), en samen ruim binnen één extensie.
+fn check_alpn(alpn: &[&[u8]]) -> Result {
+    let mut total = 0usize;
+    for p in alpn {
+        if p.is_empty() || p.len() > 255 {
+            return Err(Error::Alpn(
+                "an offered protocol is empty or above 255 bytes",
+            ));
+        }
+        total += 1 + p.len();
+    }
+    // Een paar namen zoals h2 en http/1.1; meer is een vergissing, en de
+    // ClientHello blijft zo ver onder zijn lengtevelden.
+    if alpn.len() > 16 || total > 1024 {
+        return Err(Error::Alpn("the offered protocol list is too long"));
+    }
+    Ok(())
 }
 
 /// Weigert een configuratie die niets bewijst, voordat er een byte over het
@@ -172,6 +254,7 @@ where
         trust: &Trust<'_>,
         server_name: &str,
         entropy: Entropy,
+        alpn: &[&[u8]],
     ) -> Result<(), ConnError<E>> {
         let mut private = crate::crypto::ct::Secret::new([0u8; 32]);
         let mut random = [0u8; 32];
@@ -183,7 +266,14 @@ where
         let share = x25519(&private, &BASEPOINT);
 
         // --- ClientHello ---------------------------------------------------
-        let ch = client_hello(&random, &session_id, &share, server_name, sig_algs(trust))?;
+        let ch = client_hello(
+            &random,
+            &session_id,
+            &share,
+            server_name,
+            sig_algs(trust),
+            alpn,
+        )?;
         self.transcript.update(&ch);
         self.queue_record(REC_HANDSHAKE, &ch)?;
         self.flush().await?;
@@ -216,7 +306,14 @@ where
 
         // --- Versleutelde vlucht van de server -----------------------------
         let len = self.expect(HS_ENCRYPTED_EXTENSIONS).await?;
+        // Zonder aanbod blijft dit bericht ongelezen, zoals voor ALPN bestond.
+        let chosen = if alpn.is_empty() {
+            Ok(None)
+        } else {
+            selected_alpn(self.body(len), alpn)
+        };
         self.consume(len);
+        self.alpn = chosen?;
 
         let (typ, len) = self.read_handshake().await?;
         if typ == HS_CERTIFICATE_REQUEST {
@@ -402,6 +499,7 @@ pub(crate) fn client_hello(
     share: &[u8; 32],
     server_name: &str,
     sig_algs: &[u16],
+    alpn: &[&[u8]],
 ) -> Result<Vec<u8>> {
     let mut b = Builder::new();
     b.u8(HS_CLIENT_HELLO)?;
@@ -425,6 +523,18 @@ pub(crate) fn client_hello(
         let name = b.open(2)?;
         b.bytes(server_name.as_bytes())?;
         b.close(name)?;
+        b.close(list)?;
+        b.close(ext)?;
+    }
+    if !alpn.is_empty() {
+        b.u16(EXT_ALPN)?;
+        let ext = b.open(2)?;
+        let list = b.open(2)?;
+        for p in alpn {
+            let name = b.open(1)?;
+            b.bytes(p)?;
+            b.close(name)?;
+        }
         b.close(list)?;
         b.close(ext)?;
     }
@@ -512,6 +622,43 @@ pub(crate) fn parse_server_hello(body: &[u8], session_id: &[u8; 32]) -> Result<[
         return Err(Error::NotTls13);
     }
     share.ok_or(Error::NoKeyShare)
+}
+
+/// Leest de ALPN-keuze uit de EncryptedExtensions (RFC 7301 §3.1): geen
+/// extensie is `None`, anders precies één protocol uit het aanbod.
+pub(crate) fn selected_alpn(body: &[u8], offered: &[&[u8]]) -> Result<Option<Vec<u8>>> {
+    let mut r = Reader::new(body);
+    let mut exts = r.vec16()?;
+    if !r.is_empty() {
+        return Err(Error::Alpn("malformed EncryptedExtensions"));
+    }
+    let mut chosen: Option<Vec<u8>> = None;
+    while !exts.is_empty() {
+        let typ = exts.u16()?;
+        let mut ext = exts.vec16()?;
+        if typ != EXT_ALPN {
+            continue;
+        }
+        if chosen.is_some() {
+            return Err(Error::Alpn("the server sent the extension twice"));
+        }
+        let mut list = ext.vec16()?;
+        let name = list.vec8()?.rest();
+        if name.is_empty() || !list.is_empty() || !ext.is_empty() {
+            return Err(Error::Alpn("the server must select exactly one protocol"));
+        }
+        if !offered.contains(&name) {
+            return Err(Error::Alpn(
+                "the server selected a protocol that was not offered",
+            ));
+        }
+        let mut own = Vec::new();
+        own.try_reserve_exact(name.len())
+            .map_err(|_| Error::Alloc)?;
+        own.extend_from_slice(name);
+        chosen = Some(own);
+    }
+    Ok(chosen)
 }
 
 /// Roept de verificatie aan met de §4.4.3-invoer over het transcript tot en

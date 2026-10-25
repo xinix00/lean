@@ -9,7 +9,7 @@ use core::task::{Context, Poll};
 use core::time::Duration;
 
 use leanhttp::{AsyncRead, AsyncWrite, Close, IoError, Target};
-use leantls::{ChainVerifier, Entropy, Roots, Trust};
+use leantls::{ChainVerifier, Entropy, Options, Roots, Trust};
 
 use crate::{Error, TlsConn, is_ip, wrap};
 
@@ -37,6 +37,10 @@ pub struct WebDial<D, N, R> {
     entropy: R,
     /// De termijn op het transport tijdens de handshake; daarna geen.
     pub handshake: Duration,
+    /// Het ALPN-aanbod (RFC 7301) voor `https://`, standaard leeg: geen
+    /// aanbod. De keuze staat in [`Link::alpn`]. leanhttp spreekt alleen
+    /// HTTP/1.1; `h2` is voor wie zelf dialt en een HTTP/2-client gebruikt.
+    pub alpn: &'static [&'static [u8]],
     last_error: Option<Error>,
 }
 
@@ -55,6 +59,7 @@ where
             unix_seconds,
             entropy,
             handshake: Duration::from_secs(20),
+            alpn: &[],
             last_error: None,
         }
     }
@@ -103,7 +108,8 @@ where
         let mut raw = self.inner.dial(target).await?;
         raw.set_read_timeout(Some(self.handshake))?;
         raw.set_write_timeout(Some(self.handshake))?;
-        let mut conn = match wrap(raw, &Trust::Chain(&verifier), host, entropy).await {
+        let options = Options::new().alpn(self.alpn);
+        let mut conn = match wrap(raw, &Trust::Chain(&verifier), host, entropy, &options).await {
             Ok(conn) => conn,
             Err((mine, theirs)) => {
                 self.last_error = Some(mine);
@@ -118,6 +124,16 @@ where
 
     fn is_encrypted(&self) -> bool {
         true
+    }
+}
+
+impl<C> Link<C> {
+    /// Het protocol dat ALPN opleverde; `None` voor `http://` en zonder keuze.
+    pub fn alpn(&self) -> Option<&[u8]> {
+        match self {
+            Self::Plain(_) => None,
+            Self::Tls(c) => c.alpn(),
+        }
     }
 }
 

@@ -373,7 +373,7 @@ pub(crate) struct RequestParts {
 
 /// De HTTP/1.1-velden die hier geen betekenis hebben en geweigerd worden
 /// (RFC 9113 §8.2.2).
-fn is_connection_field(name: &str) -> bool {
+pub(crate) fn is_connection_field(name: &str) -> bool {
     matches!(
         name,
         "connection" | "keep-alive" | "proxy-connection" | "transfer-encoding" | "upgrade"
@@ -496,7 +496,7 @@ fn join_cookies(header: &mut Vec<(String, String)>) -> Result<(), RequestError> 
 
 /// Accepteert één strikt decimale waarde. Afwezig is `None`: HTTP/2-DATA heeft
 /// zijn eigen streamgrens.
-fn content_length(header: &[(String, String)]) -> Result<Option<u64>, RequestError> {
+pub(crate) fn content_length(header: &[(String, String)]) -> Result<Option<u64>, RequestError> {
     let mut values = header.iter().filter(|(n, _)| n == "content-length");
     let Some((_, v)) = values.next() else {
         return Ok(None);
@@ -568,12 +568,12 @@ fn encode_response(status: u16, fields: &[(&str, &str)], head: bool) -> Result<(
 }
 
 /// Een HTTP-token in kleine letters.
-fn valid_lower_token(s: &str) -> bool {
+pub(crate) fn valid_lower_token(s: &str) -> bool {
     valid_token(s) && !s.bytes().any(|c| c.is_ascii_uppercase())
 }
 
 /// Een HTTP-token (RFC 9110 §5.6.2).
-fn valid_token(s: &str) -> bool {
+pub(crate) fn valid_token(s: &str) -> bool {
     !s.is_empty()
         && s.bytes().all(|c| {
             c.is_ascii_alphanumeric()
@@ -599,7 +599,7 @@ fn valid_token(s: &str) -> bool {
 
 /// Een geldige veldwaarde: geen witruimte aan de randen, geen controletekens
 /// behalve tab.
-fn valid_field_value(s: &str) -> bool {
+pub(crate) fn valid_field_value(s: &str) -> bool {
     let b = s.as_bytes();
     let edge = |c: Option<&u8>| matches!(c, Some(b' ' | b'\t'));
     if edge(b.first()) || edge(b.last()) {

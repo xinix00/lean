@@ -37,7 +37,10 @@ The stack supports this concrete chain:
   application transport for bare-metal nodes, with one bounded buffer pool;
 - an HTTP/2 server role on a connection the caller supplies and has already
   chosen, for one measured consumer: a Cloudflare Tunnel, where the far side
-  dials nothing and speaks HTTP/2 client over our outbound connection.
+  dials nothing and speaks HTTP/2 client over our outbound connection;
+- a minimal HTTP/2 client — one request per connection — for one measured
+  consumer: Stulp's push notifications through APNs, which speaks only
+  HTTP/2 and requires ALPN `h2`.
 
 For `leanhttp`, “multiple things over one channel” means **sequential requests
 and responses over a keep-alive connection**; speculative HTTP pipelining is not
@@ -51,10 +54,10 @@ not as a general capability of this stack. A caller that has a choice uses
 | Area | KEEP | ADAPT | MURDER |
 |---|---|---|---|
 | HTTP server | HTTP/1.1, sequential keep-alive, fixed and streamed responses, `HEAD`, `204`/`205`/`304`, `Done`, `Hijack` | origin-form only, request bodies with `Content-Length` or exactly `Transfer-Encoding: chunked`, WebSocket through raw takeover | HTTP/1.0, HTTP/2 in this package (it lives in `leanh2`), CONNECT, chunk extensions and trailer semantics in requests, server-side Expect state machine, general 1xx state machine |
-| leanh2 | HTTP/2 server role on a caller-supplied connection: the client preface then SETTINGS first; 32 streams; 16 KiB frames; 64 KiB compressed and decoded headers; 64 KiB receive window per stream; atomic two-level flow control; statuses 200–599 | request bodies with exact Content-Length integrity; exact static HPACK matches use their index, otherwise response fields are literals without indexing; syntactically valid PRIORITY accepted and ignored; `GOAWAY` with the highest accepted stream | client role, listener/dialer, TLS/ALPN, `h2c` upgrade, protocol sniffing, push, CONNECT, trailing header sections, 1xx, priority state or scheduling, dynamic response compression |
+| leanh2 | HTTP/2 server role on a caller-supplied connection: the client preface then SETTINGS first; 32 streams; 16 KiB frames; 64 KiB compressed and decoded headers; 64 KiB receive window per stream; atomic two-level flow control; statuses 200–599. Client: one request on stream 1 of a caller-supplied connection, bounded response | request bodies with exact Content-Length integrity; exact static HPACK matches use their index, otherwise fields are literals without indexing; syntactically valid PRIORITY accepted and ignored; `GOAWAY` with the highest accepted stream; a client request body must fit the server's initial window | client pooling or more than one request per connection, listener/dialer, TLS/ALPN in this package, `h2c` upgrade, protocol sniffing, push, CONNECT, trailing header sections with meaning, 1xx from the server role, priority state or scheduling, dynamic header compression |
 | Mux | method+path, exact/subtree, `{segment}`, `{rest...}`, `GET`→`HEAD`, `404`/`405`+`Allow` | canonical paths or rejection; immutable after start | host routing, `{$}`, escaped/dot routing, slash normalization, net/http compatibility work |
 | HTTP client | outbound HTTP/1.1, inbound 1.0/1.1, GET/HEAD redirects, response framing, deadlines, keep-alive pool | fixed-length streaming upload with a strict Expect decision; compression pass-through | request chunking, automatic decompression, CONNECT/upgrade, general retry state machine |
-| TLS/S3 | explicit trust model, SNI per connection, SigV4 and used object operations | TLS as a dialer composition; signed S3 calls never follow redirects | TLS server, silent skip-verify, multipart, streaming SigV4, SigV4a, presigned URLs, IMDS/IAM |
+| TLS/S3 | explicit trust model, SNI per connection, SigV4 and used object operations | TLS as a dialer composition; client ALPN only when the caller offers it; signed S3 calls never follow redirects | TLS server, silent skip-verify, multipart, streaming SigV4, SigV4a, presigned URLs, IMDS/IAM |
 | leannet | Ethernet; IPv4 ARP/ICMP/UDP/TCP with congestion control (slow start, congestion avoidance, fast retransmit) and link-local multicast; opt-in IPv6 UDP, ICMPv6/NDP, link-scoped multicast, one active SLAAC identity, and expiring PIO/RIO routing; dial deadlines, close, bounded memory | one IPv4 identity; one derived link-local plus one active SLAAC IPv6 identity; bounded simplified NDP and route state; fixed 1280-byte IPv6 packet ceiling | TCPv6, DHCPv6, extension headers, fragmentation, PMTUD, MLD/IGMP, wider multicast, dual-family sockets, per-socket I/O deadlines, connected UDP, full NUD and multi-address renumbering, timestamps, Nagle, SYN cookies, data-path logging |
 
 The table is a summary; the boundaries below are normative.
@@ -276,7 +279,10 @@ A nil config and certificate validation against a bare IP address fail loudly.
 `ServerName` is package-owned and must be empty in caller configuration:
 `Client` rejects a preset value, while standalone `DialerContext` safely
 overwrites it in a configuration copy with the current dial host. `leanhttps`
-has no server side and adds no HTTP or TLS protocol.
+has no server side and adds no HTTP or TLS protocol. An ALPN offer passes
+through unchanged and is empty by default; `leanhttp` itself speaks only
+HTTP/1.1, so `h2` is for a caller that dials and hands the connection to
+`leanh2::client`.
 
 TLS shutdown is best effort: `Close` attempts `close_notify`, but bounds that
 write to 250 milliseconds and always closes the transport. Before shutdown, any
@@ -578,8 +584,9 @@ return.
 
 `leanh2` is the one place in this repository where concurrent streams exist. It
 serves the HTTP/2 **server** role on a connection the caller supplies and has
-already chosen: no listener, no dialer, no client role, and no negotiation
-about which protocol version this is.
+already chosen: no listener, no dialer, and no negotiation about which
+protocol version this is. Its client role is a single request per connection
+(see the second change rule below), with no concurrency at all.
 
 The measured consumer is a Cloudflare Tunnel (`HopOS/apps/cloudflared-lean`).
 That consumer's shape is the whole reason for the profile below: the tunnel
@@ -686,7 +693,8 @@ The connection MUST:
 ### MURDER
 
 No measured consumer, removed with its state space, and refused loudly where
-input can reach it: the client role; a listener or dialer; TLS, ALPN, and `h2c`
+input can reach it: a client with a pool or more than one request per
+connection; a listener or dialer; TLS, ALPN, and `h2c`
 upgrade; protocol sniffing between HTTP/1.1 and HTTP/2 on one connection;
 `PUSH_PROMISE` and server push; `CONNECT` and extended CONNECT; request or
 response trailing header sections; 1xx responses; priority state and priority
@@ -733,6 +741,41 @@ chooses per listener, not per connection.
    the stream well framed and resets it only when cancellation is required.
    The recorded edge block proves the decoder handles the peer that actually
    calls.
+
+### Change rule, filled in: one request as a client
+
+1. **Consumer.** Stulp sends push notifications to its iOS app through APNs
+   (`api.push.apple.com:443`, `api.sandbox.push.apple.com:443`). APNs speaks
+   only HTTP/2 and requires ALPN `h2`; there is no HTTP/1.1 fallback. A push
+   is one POST with a body of at most 4 KiB and a short response.
+2. **Smallest contract.** `leantls::connect_with` offers ALPN only when the
+   caller asks and exposes the server's choice (`Conn::alpn`); a selection
+   outside the offer, or not exactly one protocol, fails the handshake, and
+   no selection is `None` for the caller to judge. `leanhttps` passes the
+   offer through (`TlsDial::with_alpn`, `WebDial::alpn`). `leanh2::client::send`
+   writes the preface and SETTINGS (`ENABLE_PUSH=0`), waits for the server's
+   SETTINGS, sends HEADERS and DATA on stream 1 at once, reads until stream 1
+   ends — acknowledging SETTINGS, answering PING, ignoring WINDOW_UPDATE and
+   PRIORITY, decoding HPACK including Huffman — returns status, bounded
+   headers and a bounded body, and sends `GOAWAY`. The caller owns the
+   connection, its deadline and its close.
+3. **Tests.** leantls: h2 against crypto/tls and against its own server, a
+   selection outside the offer, unchanged behaviour without an offer, and an
+   invalid offer refused before the first byte. leanhttps: the offer reaches
+   the ClientHello and the choice is visible on the connection. leanh2: a
+   round trip against `Conn::serve` with a response above the default window,
+   Huffman literals across HEADERS and CONTINUATION after a 1xx, GOAWAY and
+   RST_STREAM with their codes, both limits, malformed responses, and
+   malformed requests refused before any byte. The consumer test is a push
+   from Stulp against the APNs sandbox.
+4. **Decision.** The client role is KEEP in this single-request form; a pool,
+   a second stream, or a body that waits for flow-control credit stays
+   MURDER until a consumer measures the need.
+5. **Hard rejection.** A request body above the server's initial window fails
+   before HEADERS; a `GOAWAY` that does not promise to finish stream 1 and an
+   `RST_STREAM` on it are errors carrying the peer's code; a response or body
+   above its limit, a malformed response, `PUSH_PROMISE`, and frames on any
+   stream but 0 and 1 end the call with a named error.
 
 ## Consumer obligations
 

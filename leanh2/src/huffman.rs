@@ -147,11 +147,11 @@ pub(crate) fn decode(src: &[u8], out: &mut Vec<u8>) -> Result<(), HpackError> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// Codeert met de tabel, voor de rondgang hieronder.
-    fn encode(src: &[u8]) -> Vec<u8> {
+    pub(crate) fn encode(src: &[u8]) -> Vec<u8> {
         let mut out = Vec::new();
         let mut acc: u64 = 0;
         let mut n = 0u32;

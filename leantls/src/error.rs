@@ -131,6 +131,9 @@ pub enum Error {
     SequenceExhausted,
     /// De ketenverificatie van [`crate::ChainVerifier`] weigerde.
     X509(crate::x509::X509Error),
+    /// ALPN (RFC 7301): een ongeldig aanbod van de aanroeper, of een keuze
+    /// van de server die niet aangeboden werd of niet precies één protocol is.
+    Alpn(&'static str),
 }
 
 /// Een fout van de verbinding: van het transport of van TLS.
@@ -181,6 +184,7 @@ pub(crate) fn alert_name(code: u8) -> &'static str {
         70 => "protocol_version",
         71 => "insufficient_security",
         80 => "internal_error",
+        120 => "no_application_protocol",
         109 => "missing_extension",
         112 => "unrecognized_name",
         _ => "unnamed",
@@ -314,6 +318,7 @@ impl fmt::Display for Error {
             Error::WriteBacklog => f.write_str("write buffer full of unsent records"),
             Error::SequenceExhausted => f.write_str("record sequence number exhausted"),
             Error::X509(e) => write!(f, "x509: {e}"),
+            Error::Alpn(why) => write!(f, "ALPN: {why}"),
         }
     }
 }

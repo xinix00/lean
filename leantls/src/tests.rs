@@ -1058,6 +1058,7 @@ fn refuses_unproven_client(identity: &impl crate::server::Identity) {
         &x25519(&private, &BASEPOINT),
         "leantls.test",
         &[identity.signature_scheme()],
+        &[],
     )
     .unwrap();
     for attack in [0, 1, 2] {
@@ -1120,5 +1121,279 @@ fn refuses_unproven_client(identity: &impl crate::server::Identity) {
             1,
             "failed handshake leaked transport"
         );
+    }
+}
+
+// --- ALPN -------------------------------------------------------------------
+
+#[test]
+fn alpn_h2_against_stdlib_server() {
+    let Some(srv) = go_server("alpn13") else {
+        return;
+    };
+    let options = Options::new().alpn(&[b"h2"]);
+    let mut conn = block_on(connect_with(
+        dial(&srv),
+        &pinned(&srv),
+        "leantls.test",
+        entropy(),
+        &options,
+    ))
+    .unwrap_or_else(|e| panic!("handshake: {e}"));
+    assert_eq!(conn.alpn(), Some(b"h2".as_slice()));
+    let msg = b"h2 via crypto/tls";
+    block_on(write_all(&mut conn, msg)).unwrap();
+    let mut got = [0u8; 17];
+    block_on(read_exact(&mut conn, &mut got)).unwrap();
+    assert_eq!(&got, msg, "echo");
+
+    // Zonder aanbod blijft alles zoals het was: geen keuze, wel een verbinding.
+    let conn = block_on(connect(
+        dial(&srv),
+        &pinned(&srv),
+        "leantls.test",
+        entropy(),
+    ))
+    .unwrap();
+    assert_eq!(conn.alpn(), None);
+
+    // Geen overlap: crypto/tls weigert met no_application_protocol.
+    let options = Options::new().alpn(&[b"spdy/3"]);
+    let err = block_on(connect_with(
+        dial(&srv),
+        &pinned(&srv),
+        "leantls.test",
+        entropy(),
+        &options,
+    ))
+    .err()
+    .expect("een aanbod zonder overlap werd geaccepteerd");
+    assert!(
+        matches!(err, ConnError::Tls(Error::Alert { code: 120, .. })),
+        "{err}"
+    );
+}
+
+/// Een ketenverificatie die alles goedkeurt: de ALPN-tests gaan over de
+/// EncryptedExtensions, niet over vertrouwen. Finished bindt ze nog steeds.
+struct AcceptAll;
+
+impl VerifyPeer for AcceptAll {
+    fn signature_algorithms(&self) -> &[u16] {
+        &[0x0403]
+    }
+    fn verify_chain(&self, _: CertChain<'_>, _: &str) -> Result {
+        Ok(())
+    }
+    fn verify_signature(&self, _: &[u8], _: u16, _: &[u8], _: &[u8]) -> Result {
+        Ok(())
+    }
+}
+
+/// Twee richtingen in het geheugen; leeg is `Pending`, niet EOF.
+#[derive(Default)]
+struct Wires {
+    to_server: std::collections::VecDeque<u8>,
+    to_client: std::collections::VecDeque<u8>,
+}
+
+struct End {
+    wires: Rc<RefCell<Wires>>,
+    server: bool,
+}
+
+impl AsyncRead for End {
+    type Error = MockErr;
+    fn poll_read(
+        self: Pin<&mut Self>,
+        _: &mut Context<'_>,
+        buf: &mut [u8],
+    ) -> Poll<Result<usize, MockErr>> {
+        let mut w = self.wires.borrow_mut();
+        let src = if self.server {
+            &mut w.to_server
+        } else {
+            &mut w.to_client
+        };
+        if src.is_empty() {
+            return Poll::Pending;
+        }
+        let n = buf.len().min(src.len());
+        for (d, s) in buf.iter_mut().zip(src.drain(..n)) {
+            *d = s;
+        }
+        Poll::Ready(Ok(n))
+    }
+}
+
+impl AsyncWrite for End {
+    type Error = MockErr;
+    fn poll_write(
+        self: Pin<&mut Self>,
+        _: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<Result<usize, MockErr>> {
+        let mut w = self.wires.borrow_mut();
+        if self.server {
+            w.to_client.extend(buf);
+        } else {
+            w.to_server.extend(buf);
+        }
+        Poll::Ready(Ok(buf.len()))
+    }
+}
+
+type Side = Result<Conn<End>, ConnError<MockErr>>;
+
+/// Een leantls-client tegen de leantls-server, om beurten gepolld tot de
+/// client klaar is. De server blijft wachten als de client afhaakt.
+fn own_handshake(select: crate::server::Select<'_>, options: &Options<'_>) -> (Side, Option<Side>) {
+    let cert = std::fs::read(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("testdata/ecdsa-p256-cert.der"),
+    )
+    .unwrap();
+    let identity = Unsigned(vec![cert]);
+    let wires = Rc::new(RefCell::new(Wires::default()));
+    let client_end = End {
+        wires: wires.clone(),
+        server: false,
+    };
+    let server_end = End {
+        wires,
+        server: true,
+    };
+    let trust = Trust::Chain(&AcceptAll);
+    let mut client = pin!(connect_with(
+        client_end,
+        &trust,
+        "leantls.test",
+        entropy(),
+        options
+    ));
+    let mut server = pin!(crate::server::accept_with(
+        server_end,
+        &identity,
+        entropy(),
+        select
+    ));
+    let (mut c, mut s) = (None, None);
+    for _ in 0..1000 {
+        if s.is_none()
+            && let Poll::Ready(r) = poll_once(server.as_mut())
+        {
+            s = Some(r);
+        }
+        if c.is_none()
+            && let Poll::Ready(r) = poll_once(client.as_mut())
+        {
+            c = Some(r);
+        }
+        if c.is_some() && (s.is_some() || c.as_ref().is_some_and(|r| r.is_err())) {
+            break;
+        }
+    }
+    (c.expect("de client bleef hangen"), s)
+}
+
+#[test]
+fn alpn_h2_against_own_server() {
+    use crate::server::Select;
+    // De server kiest naar zijn eigen voorkeur, niet die van de client.
+    let options = Options::new().alpn(&[b"http/1.1", b"h2"]);
+    let (client, server) = own_handshake(Select::First(&[b"h2", b"http/1.1"]), &options);
+    let client = client.unwrap_or_else(|e| panic!("client: {e}"));
+    let server = server.expect("server niet klaar").unwrap();
+    assert_eq!(client.alpn(), Some(b"h2".as_slice()));
+    assert_eq!(server.alpn(), Some(b"h2".as_slice()));
+
+    // Een server die alleen HTTP/1.1 spreekt (wat `accept` met `http` doet)
+    // en een client die alleen h2 wil: alert 120, geen stille terugval.
+    let options = Options::new().alpn(&[b"h2"]);
+    let (client, _) = own_handshake(Select::First(&[b"http/1.1"]), &options);
+    let err = client
+        .err()
+        .expect("geen gemeenschappelijk protocol, toch verbonden");
+    assert!(
+        matches!(err, ConnError::Tls(Error::Alert { code: 120, .. })),
+        "{err}"
+    );
+}
+
+#[test]
+fn alpn_selection_outside_offer_fails() {
+    use crate::server::Select;
+    let options = Options::new().alpn(&[b"h2"]);
+    for (forced, want) in [
+        (b"spdy/1".as_slice(), "not offered"),
+        (b"".as_slice(), "exactly one"),
+    ] {
+        let (client, _) = own_handshake(Select::Force(forced), &options);
+        let err = client
+            .err()
+            .expect("een keuze buiten het aanbod werd geaccepteerd");
+        assert!(
+            matches!(err, ConnError::Tls(Error::Alpn(why)) if why.contains(want)),
+            "{err}"
+        );
+    }
+}
+
+#[test]
+fn no_alpn_is_unchanged() {
+    use crate::server::Select;
+    // Zonder aanbod: verbonden, niets gekozen, aan beide kanten.
+    let (client, server) = own_handshake(Select::First(&[b"h2"]), &Options::new());
+    let client = client.unwrap_or_else(|e| panic!("client: {e}"));
+    assert_eq!(client.alpn(), None);
+    assert_eq!(server.expect("server niet klaar").unwrap().alpn(), None);
+
+    // De EncryptedExtensions blijven zonder aanbod ongelezen, zoals voorheen:
+    // ook een server die toch iets kiest, breekt de verbinding niet.
+    let (client, _) = own_handshake(Select::Force(b"h2"), &Options::new());
+    assert_eq!(client.unwrap().alpn(), None);
+
+    // En de ClientHello draagt dan geen extensie 16.
+    let hello = |alpn: &[&[u8]]| {
+        crate::handshake::client_hello(&[1; 32], &[2; 32], &[3; 32], "a.test", &[0x0403], alpn)
+            .unwrap()
+    };
+    assert!(!extension_types(&hello(&[])).contains(&16));
+    assert!(extension_types(&hello(&[b"h2"])).contains(&16));
+}
+
+/// De extensietypes van een ClientHello, in volgorde.
+fn extension_types(ch: &[u8]) -> Vec<u16> {
+    let mut r = crate::wire::Reader::new(&ch[4..]);
+    r.take(2 + 32).unwrap();
+    r.vec8().unwrap();
+    r.vec16().unwrap();
+    r.vec8().unwrap();
+    let mut exts = r.vec16().unwrap();
+    let mut out = Vec::new();
+    while !exts.is_empty() {
+        out.push(exts.u16().unwrap());
+        exts.vec16().unwrap();
+    }
+    out
+}
+
+#[test]
+fn alpn_offer_is_checked_before_dial() {
+    let long = [b'x'; 256];
+    let many: Vec<&[u8]> = vec![b"h2"; 17];
+    for list in [&[b"".as_slice()][..], &[&long[..]][..], &many[..]] {
+        let (raw, state) = mock();
+        let options = Options::new().alpn(list);
+        let err = block_on(connect_with(
+            raw,
+            &Trust::Pinned(PeerKey::new([0; 32])),
+            "a.test",
+            entropy(),
+            &options,
+        ))
+        .err()
+        .expect("een ongeldig aanbod werd verstuurd");
+        assert!(matches!(err, ConnError::Tls(Error::Alpn(_))), "{err}");
+        assert!(!state.borrow().touched, "er ging iets over het transport");
     }
 }

@@ -6,6 +6,8 @@
 //! TLS 1.3, `TLS_AES_128_GCM_SHA256`, X25519, en in gepinde modus Ed25519.
 //! Geen downgrade, hervatting, PSK, 0-RTT, clientcertificaat,
 //! HelloRetryRequest of renegotiatie; wat de server anders kiest, faalt luid.
+//! ALPN biedt de client alleen aan als de aanroeper erom vraagt
+//! ([`connect_with`] met [`Options`]): HTTP/2-diensten zoals APNs eisen `h2`.
 //! Het weglaten van downgrade, compressie, CBC en RSA-PKCS#1v1.5 haalt de
 //! gebruikelijke gevaarlijke toestandsruimte van TLS weg.
 //!
@@ -101,7 +103,7 @@ mod tests;
 
 pub use conn::Conn;
 pub use error::{ConnError, Error, Result};
-pub use handshake::connect;
+pub use handshake::{Options, connect, connect_with};
 pub use io::{AsyncRead, AsyncWrite};
 pub use trust::{CertChain, CertIter, Entropy, PeerKey, Trust, VerifyPeer};
 pub use x509::{ChainVerifier, Roots, X509Error};
