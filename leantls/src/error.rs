@@ -53,7 +53,8 @@ pub enum Error {
         /// Het ontvangen type.
         got: u8,
     },
-    /// De server vraagt om een clientcertificaat.
+    /// De server vraagt om een clientcertificaat. Wordt niet meer gegeven:
+    /// de client antwoordt met een leeg certificaat en de server beslist.
     ClientAuthRequested,
     /// De server stuurde een HelloRetryRequest.
     HelloRetryRequest,

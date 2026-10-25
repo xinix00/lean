@@ -177,6 +177,50 @@ fn random_key() -> [u8; 32] {
 
 // --- Interop met crypto/tls -------------------------------------------------
 
+/// Een optionele vraag om een clientcertificaat (APNs) krijgt een leeg
+/// Certificate; de server rekent dat mee in de Finished en echoot gewoon.
+#[test]
+fn client_answers_an_optional_certificate_request_without_a_certificate() {
+    let Some(srv) = go_server("auth13") else {
+        return;
+    };
+    let mut conn = block_on(connect(
+        dial(&srv),
+        &pinned(&srv),
+        "leantls.test",
+        entropy(),
+    ))
+    .unwrap_or_else(|e| panic!("handshake: {e}"));
+    block_on(write_all(&mut conn, b"zonder certificaat")).unwrap();
+    let mut got = [0u8; 18];
+    block_on(read_exact(&mut conn, &mut got)).unwrap();
+    assert_eq!(&got, b"zonder certificaat", "echo");
+}
+
+/// Eist de server een certificaat, dan weigert hij het lege antwoord met
+/// certificate_required (116); de client verzint er geen.
+#[test]
+fn a_required_client_certificate_ends_in_the_servers_alert() {
+    let Some(srv) = go_server("needauth13") else {
+        return;
+    };
+    let mut conn = block_on(connect(
+        dial(&srv),
+        &pinned(&srv),
+        "leantls.test",
+        entropy(),
+    ))
+    .unwrap_or_else(|e| panic!("handshake: {e}"));
+    let _ = block_on(write_all(&mut conn, b"x"));
+    let mut got = [0u8; 1];
+    let err =
+        block_on(read_exact(&mut conn, &mut got)).expect_err("server accepted no certificate");
+    assert!(
+        matches!(err, ConnError::Tls(Error::Alert { code: 116, .. })),
+        "{err}"
+    );
+}
+
 #[test]
 fn client_against_stdlib_server() {
     let Some(srv) = go_server("echo13") else {
@@ -1396,4 +1440,17 @@ fn alpn_offer_is_checked_before_dial() {
         assert!(matches!(err, ConnError::Tls(Error::Alpn(_))), "{err}");
         assert!(!state.borrow().touched, "er ging iets over het transport");
     }
+}
+
+/// Een CertificateRequest geeft zijn context terug voor het lege antwoord;
+/// een afgekapt of te lang bericht wordt geweigerd.
+#[test]
+fn certificate_request_context_is_read_and_checked() {
+    let (context, n) =
+        crate::handshake::certificate_request_context(&[2, 7, 9, 0, 4, 0, 13, 0, 0]).unwrap();
+    assert_eq!(&context[..n], &[7, 9]);
+    let (_, n) = crate::handshake::certificate_request_context(&[0, 0, 0]).unwrap();
+    assert_eq!(n, 0);
+    assert!(crate::handshake::certificate_request_context(&[3, 1]).is_err());
+    assert!(crate::handshake::certificate_request_context(&[0, 0, 0, 1]).is_err());
 }

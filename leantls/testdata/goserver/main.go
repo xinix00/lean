@@ -5,6 +5,8 @@
 //
 //	echo13     TLS 1.3 only, Ed25519 self-signed, echo
 //	alpn13     as echo13, with ALPN: h2, then http/1.1
+//	auth13     as echo13, asks for an optional client certificate (like APNs)
+//	needauth13 as echo13, requires a client certificate
 //	echo12     TLS 1.2 only, Ed25519 self-signed, echo
 //	discard13  TLS 1.3, reads until EOF, then prints "result: <err|EOF>"
 //	chain13    TLS 1.3, Ed25519 leaf for leantls.test signed by an Ed25519 CA
@@ -69,7 +71,7 @@ func main() {
 	minV, maxV := uint16(tls.VersionTLS13), uint16(tls.VersionTLS13)
 
 	switch mode {
-	case "echo13", "echo12", "discard13", "alpn13":
+	case "echo13", "echo12", "discard13", "alpn13", "auth13", "needauth13":
 		pub, k, _ := ed25519.GenerateKey(rand.Reader)
 		t := template(1, "leantls-test", false)
 		chain, priv, shown = [][]byte{cert(t, t, pub, k)}, k, pub
@@ -120,6 +122,12 @@ func main() {
 	}
 	if mode == "alpn13" {
 		config.NextProtos = []string{"h2", "http/1.1"}
+	}
+	if mode == "auth13" {
+		config.ClientAuth = tls.RequestClientCert
+	}
+	if mode == "needauth13" {
+		config.ClientAuth = tls.RequireAnyClientCert
 	}
 	ln, err := tls.Listen("tcp", "127.0.0.1:0", config)
 	if err != nil {

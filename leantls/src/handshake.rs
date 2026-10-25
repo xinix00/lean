@@ -315,9 +315,16 @@ where
         self.consume(len);
         self.alpn = chosen?;
 
-        let (typ, len) = self.read_handshake().await?;
+        let (mut typ, mut len) = self.read_handshake().await?;
+        // Een optionele vraag om een clientcertificaat (APNs stelt die) krijgt
+        // een leeg Certificate na de Finished van de server (§4.4.2); of de
+        // server zonder certificaat verder wil, beslist de server.
+        let mut request_context = None;
         if typ == HS_CERTIFICATE_REQUEST {
-            return Err(Error::ClientAuthRequested.into());
+            let context = certificate_request_context(self.body(len));
+            self.consume(len);
+            request_context = Some(context?);
+            (typ, len) = self.read_handshake().await?;
         }
         if typ != HS_CERTIFICATE {
             return Err(Error::UnexpectedMessage {
@@ -363,13 +370,28 @@ where
         let after_fin = self.transcript.clone().finish();
         // Middleboxes verwachten nog steeds change_cipher_spec.
         self.queue_raw(&CCS_RECORD)?;
+        let mut before_client_fin = after_fin;
+        if let Some((context, n)) = request_context {
+            let context = context.get(..n).unwrap_or(&[]);
+            // Context, dan een lege certificate_list (u24 nul).
+            let mut msg = [0u8; 4 + 1 + 255 + 3];
+            let body = 1 + context.len() + 3;
+            let [_, _, hi, lo] = (body as u32).to_be_bytes();
+            msg[..4].copy_from_slice(&[HS_CERTIFICATE, 0, hi, lo]);
+            msg[4] = context.len() as u8;
+            msg[5..5 + context.len()].copy_from_slice(context);
+            let msg = msg.get(..4 + body).unwrap_or(&[]);
+            self.transcript.update(msg);
+            self.queue_record(REC_HANDSHAKE, msg)?;
+            before_client_fin = self.transcript.clone().finish();
+        }
         let c_secret = &self
             .write
             .as_ref()
             .ok_or(Error::Internal("no write keys"))?
             .keys
             .secret;
-        let fin = finished_data(c_secret, &after_fin)?;
+        let fin = finished_data(c_secret, &before_client_fin)?;
         let mut msg = [0u8; 4 + HASH_LEN];
         msg[..4].copy_from_slice(&[HS_FINISHED, 0, 0, HASH_LEN as u8]);
         msg[4..].copy_from_slice(&fin);
@@ -490,6 +512,25 @@ fn sig_algs<'a>(trust: &Trust<'a>) -> &'a [u16] {
         Trust::Chain(v) if !v.signature_algorithms().is_empty() => v.signature_algorithms(),
         _ => &[SIG_ED25519],
     }
+}
+
+/// De `certificate_request_context` uit een CertificateRequest, met lengte;
+/// de extensies worden alleen op vorm gelezen.
+pub(crate) fn certificate_request_context(body: &[u8]) -> Result<([u8; 255], usize)> {
+    let mut r = Reader::new(body);
+    let context = r.vec8()?.rest();
+    r.vec16()?;
+    if !r.is_empty() {
+        return Err(Error::UnexpectedMessage {
+            want: HS_CERTIFICATE_REQUEST,
+            got: HS_CERTIFICATE_REQUEST,
+        });
+    }
+    let mut out = [0u8; 255];
+    out.get_mut(..context.len())
+        .ok_or(Error::Truncated)?
+        .copy_from_slice(context);
+    Ok((out, context.len()))
 }
 
 /// Bouwt de vaste ClientHello rond zijn drie willekeurige velden.
